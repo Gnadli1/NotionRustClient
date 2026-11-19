@@ -1,0 +1,218 @@
+//! Flattened, read-only outline of a cached page. No iced types here.
+
+use notion_core::markdown::is_markdown_editable;
+use notion_core::model::{BlockKind, RichText};
+use notion_core::store::Store;
+use notion_core::Result;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Marker {
+    None,
+    Bullet,
+    /// Running number among consecutive numbered siblings.
+    Number(usize),
+    Todo(bool),
+    Toggle,
+    /// 1..=3
+    Heading(u8),
+    Quote,
+    Callout,
+    Code(String),
+    Divider,
+    ChildPage(String),
+    ChildDatabase(String),
+    /// Any other block type, shown as a grey `[type]`.
+    Unsupported(String),
+}
+
+impl Marker {
+    /// Text shown before the row's content ("" for none).
+    pub fn label(&self) -> String {
+        match self {
+            Marker::None | Marker::Heading(_) => String::new(),
+            Marker::Bullet => "•".into(),
+            Marker::Number(n) => format!("{n}."),
+            Marker::Todo(false) => "☐".into(),
+            Marker::Todo(true) => "☑".into(),
+            Marker::Toggle => "▸".into(),
+            Marker::Quote => "│".into(),
+            Marker::Callout => "!".into(),
+            Marker::Code(lang) => format!("```{lang}"),
+            Marker::Divider => "───".into(),
+            Marker::ChildPage(t) => format!("[page: {t}]"),
+            Marker::ChildDatabase(t) => format!("[database: {t}]"),
+            Marker::Unsupported(t) => format!("[{t}]"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Row {
+    pub block_id: String,
+    pub depth: usize,
+    pub marker: Marker,
+    pub rich_text: Vec<RichText>,
+    /// Text block whose rich text survives a Markdown round trip.
+    pub editable: bool,
+}
+
+/// Every cached block under `page_id`, depth-first in order. Child pages and
+/// databases are leaves.
+pub fn flatten(store: &Store, page_id: &str) -> Result<Vec<Row>> {
+    let mut rows = Vec::new();
+    walk(store, page_id, 0, &mut rows)?;
+    Ok(rows)
+}
+
+fn walk(store: &Store, parent: &str, depth: usize, rows: &mut Vec<Row>) -> Result<()> {
+    let mut number = 0;
+    for b in store.children(parent)? {
+        number = match b.kind {
+            BlockKind::NumberedListItem(_) => number + 1,
+            _ => 0,
+        };
+        let marker = match &b.kind {
+            BlockKind::Paragraph(_) => Marker::None,
+            BlockKind::Heading1(_) => Marker::Heading(1),
+            BlockKind::Heading2(_) => Marker::Heading(2),
+            BlockKind::Heading3(_) => Marker::Heading(3),
+            BlockKind::BulletedListItem(_) => Marker::Bullet,
+            BlockKind::NumberedListItem(_) => Marker::Number(number),
+            BlockKind::ToDo { checked, .. } => Marker::Todo(*checked),
+            BlockKind::Toggle(_) => Marker::Toggle,
+            BlockKind::Quote(_) => Marker::Quote,
+            BlockKind::Callout(_) => Marker::Callout,
+            BlockKind::Code { language, .. } => Marker::Code(language.clone()),
+            BlockKind::Divider => Marker::Divider,
+            BlockKind::ChildPage { title } => Marker::ChildPage(title.clone()),
+            BlockKind::ChildDatabase { title } => Marker::ChildDatabase(title.clone()),
+            BlockKind::Unsupported { .. } => Marker::Unsupported(b.kind.type_name().into()),
+        };
+        let rich_text = b
+            .kind
+            .text()
+            .map(|t| t.rich_text.clone())
+            .unwrap_or_default();
+        let editable = b.kind.text().is_some() && is_markdown_editable(&rich_text);
+        let leaf = matches!(
+            b.kind,
+            BlockKind::ChildPage { .. } | BlockKind::ChildDatabase { .. }
+        );
+        rows.push(Row {
+            block_id: b.id.clone(),
+            depth,
+            marker,
+            rich_text,
+            editable,
+        });
+        if !leaf {
+            walk(store, &b.id, depth + 1, rows)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notion_core::model::Block;
+    use serde_json::{json, Value};
+
+    const PID: &str = "p";
+    const T: &str = "2025-01-01T00:00:00.000Z";
+
+    fn rt(s: &str) -> Value {
+        json!([{ "type": "text", "text": { "content": s }, "plain_text": s, "annotations": {} }])
+    }
+
+    pub(crate) fn blk(id: &str, parent: &str, t: &str, payload: Value) -> Block {
+        serde_json::from_value(json!({
+            "object": "block", "id": id, "parent": { "type": "block_id", "block_id": parent },
+            "type": t, t: payload, "has_children": false, "in_trash": false,
+            "created_time": T, "last_edited_time": T,
+        }))
+        .unwrap()
+    }
+
+    fn num(id: &str, parent: &str) -> Block {
+        blk(
+            id,
+            parent,
+            "numbered_list_item",
+            json!({ "rich_text": rt(id) }),
+        )
+    }
+
+    #[test]
+    fn flattens_with_depth_numbering_and_markers() {
+        let store = Store::open_in_memory().unwrap();
+        let mention = json!([{ "type": "mention", "mention": { "type": "date", "date": { "start": "2025-01-01" } },
+            "plain_text": "2025-01-01", "annotations": {} }]);
+        store
+            .replace_children(
+                PID,
+                PID,
+                &[
+                    num("n1", PID),
+                    num("n2", PID),
+                    blk(
+                        "b",
+                        PID,
+                        "bulleted_list_item",
+                        json!({ "rich_text": rt("b") }),
+                    ),
+                    num("n3", PID),
+                    blk("m", PID, "paragraph", json!({ "rich_text": mention })),
+                    blk("img", PID, "image", json!({ "type": "external" })),
+                    blk("cp", PID, "child_page", json!({ "title": "Sub" })),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_children(
+                PID,
+                "n2",
+                &[
+                    num("c1", "n2"),
+                    blk(
+                        "t",
+                        "n2",
+                        "to_do",
+                        json!({ "rich_text": rt("t"), "checked": true }),
+                    ),
+                ],
+            )
+            .unwrap();
+        // under a child page: must not be descended into
+        store
+            .replace_children(PID, "cp", &[num("hidden", "cp")])
+            .unwrap();
+
+        let rows = flatten(&store, PID).unwrap();
+        let got: Vec<(&str, usize, Marker)> = rows
+            .iter()
+            .map(|r| (r.block_id.as_str(), r.depth, r.marker.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("n1", 0, Marker::Number(1)),
+                ("n2", 0, Marker::Number(2)),
+                ("c1", 1, Marker::Number(1)),
+                ("t", 1, Marker::Todo(true)),
+                ("b", 0, Marker::Bullet),
+                ("n3", 0, Marker::Number(1)),
+                ("m", 0, Marker::None),
+                ("img", 0, Marker::Unsupported("image".into())),
+                ("cp", 0, Marker::ChildPage("Sub".into())),
+            ]
+        );
+        let editable = |id: &str| rows.iter().find(|r| r.block_id == id).unwrap().editable;
+        assert!(editable("n1"));
+        assert!(!editable("m"), "mention is read-only");
+        assert!(!editable("img"));
+        assert!(!editable("cp"));
+        assert_eq!(rows[7].marker.label(), "[image]");
+        assert_eq!(rows[3].marker.label(), "☑");
+    }
+}

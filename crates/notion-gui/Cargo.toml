@@ -7,3 +7,7 @@ version.workspace = true
 notion-core = { path = "../notion-core" }
 iced.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+wiremock.workspace = true

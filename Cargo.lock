@@ -2272,7 +2272,9 @@ version = "0.1.0"
 dependencies = [
  "iced",
  "notion-core",
+ "serde_json",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
