@@ -86,6 +86,12 @@ pub const ITEMS: &[Item] = &[
         hint: "Separate blocks",
         aliases: &["hr", "---", "line"],
     },
+    Item {
+        kind: TargetKind::Equation,
+        name: "Equation",
+        hint: "Display TeX formula",
+        aliases: &["math", "tex", "katex", "$$"],
+    },
 ];
 
 /// Items whose name or an alias contains `query` (case-insensitive).
@@ -168,6 +174,20 @@ mod tests {
 
     fn names(q: &str) -> Vec<&str> {
         filter(q).iter().map(|i| i.name).collect()
+    }
+
+    #[test]
+    fn equation_entry() {
+        for q in ["equ", "math", "tex", "KaTeX", "$$"] {
+            assert!(
+                filter(q).iter().any(|i| i.kind == TargetKind::Equation),
+                "{q}"
+            );
+        }
+        assert_eq!(
+            shortcut("$$ x", 0, 3),
+            Some((TargetKind::Equation, "x".into()))
+        );
     }
 
     #[test]

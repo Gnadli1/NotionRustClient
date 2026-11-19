@@ -517,6 +517,28 @@ pub fn local_edit_rich(store: &Store, block_id: &str, rich_text: Vec<RichText>) 
     enqueue_update(store, &base, &block, body)
 }
 
+/// Sets a cached equation block's expression and queues
+/// `{"equation":{"expression":..}}`. Returns the op id.
+pub fn local_edit_equation(store: &Store, block_id: &str, expression: &str) -> Result<i64> {
+    let base = cached(store, block_id)?;
+    let mut block = base.clone();
+    match &mut block.kind {
+        BlockKind::Equation { expression: e } => *e = expression.to_string(),
+        k => {
+            return Err(Error::Invalid(format!(
+                "block type `{}` is not an equation",
+                k.type_name()
+            )))
+        }
+    }
+    enqueue_update(
+        store,
+        &base,
+        &block,
+        json!({ "equation": { "expression": expression } }),
+    )
+}
+
 /// Sets a cached to-do's checkbox and queues `{"to_do":{"checked":..}}`.
 pub fn local_set_checked(store: &Store, block_id: &str, checked: bool) -> Result<i64> {
     let base = cached(store, block_id)?;
@@ -811,10 +833,17 @@ pub fn local_change_type(
                 "cannot convert a block that has children".into(),
             ));
         }
-        let text = block.kind.text().cloned().unwrap_or(TextBlock {
-            rich_text: Vec::new(),
-            color: "default".into(),
-        });
+        let text = match &block.kind {
+            // the expression becomes plain text
+            BlockKind::Equation { expression } if !expression.is_empty() => TextBlock {
+                rich_text: vec![RichText::plain(expression)],
+                color: "default".into(),
+            },
+            k => k.text().cloned().unwrap_or(TextBlock {
+                rich_text: Vec::new(),
+                color: "default".into(),
+            }),
+        };
         let kind = target.block_kind(TextBlock {
             rich_text: split_runs(text.rich_text),
             ..text
@@ -2603,5 +2632,58 @@ mod tests {
             k => panic!("{k:?}"),
         }
         assert_eq!(queue(&store).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn equation_blocks_convert_and_edit() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        let expr = |store: &Store, id: &str| match store.get_block(id).unwrap().unwrap().kind {
+            BlockKind::Equation { expression } => expression,
+            k => panic!("{k:?}"),
+        };
+        // real paragraph → equation: new block, text becomes the expression
+        let ChangeOutcome::Replaced(new) =
+            local_change_type(&store, "a", TargetKind::Equation).unwrap()
+        else {
+            panic!("kept")
+        };
+        assert_eq!(expr(&store, &new), "a");
+        // editing the unpushed create rewrites it
+        local_edit_equation(&store, &new, "x^2").unwrap();
+        let OpKind::CreateBlock { block, .. } = &queue(&store)[0] else {
+            panic!()
+        };
+        assert_eq!(block["equation"]["expression"], "x^2");
+        assert!(local_edit_rich(&store, &new, vec![]).is_err());
+        assert!(local_edit_equation(&store, "p", "x").is_err());
+        // and back: the expression becomes plain text
+        assert_eq!(
+            local_change_type(&store, &new, TargetKind::Paragraph).unwrap(),
+            ChangeOutcome::Kept
+        );
+        assert_eq!(rich(&store, &new), [RichText::plain("x^2")]);
+    }
+
+    #[tokio::test]
+    async fn equation_edit_on_a_real_block_queues_an_update() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &[]).await;
+        let mut v = blk("e", pp("p"), "", T, false);
+        let o = v.as_object_mut().unwrap();
+        o.remove("paragraph");
+        o.insert("type".into(), json!("equation"));
+        o.insert("equation".into(), json!({ "expression": "a" }));
+        store
+            .replace_children("p", "p", &[serde_json::from_value(v).unwrap()])
+            .unwrap();
+        local_edit_equation(&store, "e", "b").unwrap();
+        let OpKind::UpdateBlock { block_id, body } = &queue(&store)[0] else {
+            panic!()
+        };
+        assert_eq!(block_id, "e");
+        assert_eq!(body, &json!({ "equation": { "expression": "b" } }));
     }
 }

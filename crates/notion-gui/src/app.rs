@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use iced::font::{Style, Weight};
+use iced::font::{Family, Style, Weight};
 use iced::keyboard::{self, Key};
 use iced::widget::text::Span;
 use iced::widget::{
@@ -15,7 +15,7 @@ use iced::widget::{
 use iced::{event, Color, Element, Fill, Font, Subscription, Task};
 use notion_core::markdown::from_markdown;
 use notion_core::model::{plain_text, TargetKind};
-use notion_core::model::{BlockKind, Parent, RichText, TextBlock};
+use notion_core::model::{BlockKind, Parent, RichText, RichTextKind, TextBlock};
 use notion_core::ops::OpStatus;
 use notion_core::store::Store;
 use notion_core::sync::{self, ChangeOutcome};
@@ -128,7 +128,11 @@ impl State {
         };
         // a push may have renamed a local-* block meanwhile
         let res = self.store.resolve_id(&e.block_id).and_then(|id| {
-            sync::local_edit_rich(&self.store, &id, rt)?;
+            if e.equation {
+                sync::local_edit_equation(&self.store, &id, &plain_text(&rt))?;
+            } else {
+                sync::local_edit_rich(&self.store, &id, rt)?;
+            }
             e.block_id = id;
             Ok(())
         });
@@ -426,8 +430,8 @@ fn convert(s: &mut State, kind: TargetKind, buf: &str, pos: (usize, usize)) -> T
     if kind == TargetKind::Divider && !buf.trim().is_empty() {
         return divider_after(s, buf, pos);
     }
-    // code is raw text: drop the Markdown marks
-    let (buf, pos) = if kind == TargetKind::Code {
+    // code and equations are raw text: drop the Markdown marks
+    let (buf, pos) = if matches!(kind, TargetKind::Code | TargetKind::Equation) {
         // ponytail: cursor to the start, mapping it through the stripped marks isn't worth it
         (plain_text(&from_markdown(buf)), (0, 0))
     } else {
@@ -710,6 +714,17 @@ const GREY: Color = Color::from_rgb(0.55, 0.55, 0.55);
 const LINK: Color = Color::from_rgb(0.25, 0.45, 0.9);
 
 fn styled(t: &RichText) -> Span<'_, ()> {
+    if let RichTextKind::Equation { expression } = &t.kind {
+        // Unicode pretty-print in italic serif; the TeX source in monospace if it can't
+        return match crate::tex::pretty_tex(expression) {
+            Some(p) => span(p).font(Font {
+                family: Family::Serif,
+                style: Style::Italic,
+                ..Font::DEFAULT
+            }),
+            None => span(expression.as_str()).font(Font::MONOSPACE),
+        };
+    }
     let a = &t.annotations;
     let mut font = if a.code {
         Font::MONOSPACE
@@ -734,6 +749,7 @@ fn row_view<'a>(r: &'a Row, editing: Option<&'a Editing>) -> Element<'a, Message
         Marker::Heading(1) => 28,
         Marker::Heading(2) => 22,
         Marker::Heading(3) => 18,
+        Marker::Equation => 20,
         _ => 15,
     };
     let grey = matches!(
@@ -786,7 +802,10 @@ fn row_view<'a>(r: &'a Row, editing: Option<&'a Editing>) -> Element<'a, Message
         Some(t) => row![t, rich_text(spans).size(size)].spacing(6).into(),
         None => rich_text(spans).size(size).into(),
     };
-    let body = container(content).padding(indent).width(Fill);
+    let mut body = container(content).padding(indent).width(Fill);
+    if r.marker == Marker::Equation {
+        body = body.center_x(Fill);
+    }
     if r.editable {
         mouse_area(body)
             .on_press(Message::Focus(r.block_id.clone()))
@@ -1631,5 +1650,55 @@ mod tests {
         assert_eq!(s.last_error, None);
         assert_eq!(marker(&s), Marker::None);
         assert_eq!(buffer(&s), "# a");
+    }
+
+    fn expression(s: &State, id: &str) -> String {
+        match s.store.get_block(id).unwrap().unwrap().kind {
+            BlockKind::Equation { expression } => expression,
+            k => panic!("{k:?}"),
+        }
+    }
+
+    #[test]
+    fn equation_blocks_via_menu_and_shortcut() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        up(&mut s, Message::EditKey(EditKey::Enter));
+        let local = editing(&s).unwrap().to_string();
+        type_text(&mut s, "/katex");
+        up(&mut s, Message::EditKey(EditKey::Enter));
+        assert_eq!(marker(&s), Marker::Equation);
+        assert!(s.editing.as_ref().unwrap().equation);
+        // `/` is TeX here, not the menu
+        type_text(&mut s, "a/b");
+        assert!(!menu_open(&s));
+        up(&mut s, Message::EditKey(EditKey::Escape));
+        assert_eq!(expression(&s, &local), "a/b");
+        // reopening shows the bare expression
+        up(&mut s, Message::Focus(local.clone()));
+        assert_eq!(buffer(&s), "a/b");
+
+        up(&mut s, Message::EditKey(EditKey::Enter));
+        let next = editing(&s).unwrap().to_string();
+        type_text(&mut s, "$$ ");
+        assert_eq!(marker(&s), Marker::Equation);
+        type_text(&mut s, "x^2");
+        up(&mut s, Message::EditKey(EditKey::Escape));
+        assert_eq!(expression(&s, &next), "x^2");
+    }
+
+    #[test]
+    fn inline_equations_edit_as_dollar_source() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        type_text(&mut s, " $x^2$ **y**");
+        up(&mut s, Message::EditKey(EditKey::Escape));
+        let b = s.rows.iter().find(|r| r.block_id == "b").unwrap();
+        assert!(b.editable);
+        assert!(
+            matches!(&b.rich_text[1].kind, RichTextKind::Equation { expression } if expression == "x^2")
+        );
+        up(&mut s, Message::Focus("b".into()));
+        assert_eq!(buffer(&s), "b $x^2$ **y**");
     }
 }

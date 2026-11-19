@@ -1,17 +1,20 @@
 //! Rich text <-> a small Markdown subset: `**bold**`, `*italic*`, `` `code` ``,
-//! `~~strike~~`, `[text](url)`.
+//! `~~strike~~`, `[text](url)`, `$equation$`.
 //!
-//! Limitations: underline and colour are dropped; mentions and equations are
-//! written as their plain text (callers should treat such text as read-only,
-//! see [`is_markdown_editable`]). Inside code spans only `\` and `` ` `` are
-//! escaped; in link URLs `(` and `)` are escaped too.
+//! Limitations: underline and colour are dropped; mentions are written as
+//! their plain text (callers should treat such text as read-only, see
+//! [`is_markdown_editable`]). Inside code spans only `\` and `` ` `` are
+//! escaped; in link URLs `(` and `)` are escaped too. An equation's TeX is
+//! written raw: `$` must be followed by a non-space and the closing `$`
+//! preceded by one, and `\$` inside it doesn't close it. Equations keep
+//! bold/italic/strike; link and code marks are dropped.
 
 use crate::model::{Annotations, RichText, RichTextKind, TargetKind};
 
 /// Notion's per-run character limit.
 const MAX_RUN: usize = 2000;
 /// Characters backslash-escaped in plain text.
-const ESCAPED: &[char] = &['\\', '*', '`', '~', '[', ']'];
+const ESCAPED: &[char] = &['\\', '*', '`', '~', '[', ']', '$'];
 const CODE_ESCAPED: &[char] = &['\\', '`'];
 const URL_ESCAPED: &[char] = &['\\', '*', '`', '~', '[', ']', '(', ')'];
 
@@ -22,6 +25,8 @@ struct Style {
     italic: bool,
     strike: bool,
     code: bool,
+    /// An inline equation; its text is the TeX expression. Never merged.
+    eq: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,9 +63,10 @@ impl Style {
 fn normalize(rt: &[RichText]) -> Vec<(String, Style)> {
     let mut out: Vec<(String, Style)> = Vec::new();
     for r in rt {
-        let (text, link) = match &r.kind {
-            RichTextKind::Text { content, link } => (content.clone(), link.clone()),
-            _ => (r.plain_text.clone(), r.href.clone()),
+        let (text, link, eq) = match &r.kind {
+            RichTextKind::Text { content, link } => (content.clone(), link.clone(), false),
+            RichTextKind::Equation { expression } => (expression.clone(), None, true),
+            _ => (r.plain_text.clone(), r.href.clone(), false),
         };
         if text.is_empty() {
             continue;
@@ -71,10 +77,11 @@ fn normalize(rt: &[RichText]) -> Vec<(String, Style)> {
             bold: a.bold,
             italic: a.italic,
             strike: a.strikethrough,
-            code: a.code,
+            code: a.code && !eq,
+            eq,
         };
         match out.last_mut() {
-            Some((t, s)) if *s == style => t.push_str(&text),
+            Some((t, s)) if *s == style && !eq => t.push_str(&text),
             _ => out.push((text, style)),
         }
     }
@@ -124,11 +131,17 @@ pub fn to_markdown(rt: &[RichText]) -> String {
             out.push_str(open_str(m));
             open.push(m.clone());
         }
-        push_escaped(
-            &mut out,
-            &text,
-            if style.code { CODE_ESCAPED } else { ESCAPED },
-        );
+        if style.eq {
+            out.push('$');
+            out.push_str(&text);
+            out.push('$');
+        } else {
+            push_escaped(
+                &mut out,
+                &text,
+                if style.code { CODE_ESCAPED } else { ESCAPED },
+            );
+        }
     }
     while let Some(m) = open.pop() {
         close(&mut out, &m);
@@ -140,6 +153,7 @@ enum Item {
     Ch(char),
     Lit(&'static str),
     Code(String),
+    Eq(String),
     Open(Mark),
     Close,
 }
@@ -190,6 +204,31 @@ fn scan(cs: &[char], mut i: usize, end: char, esc: &[char]) -> Option<(String, u
     None
 }
 
+/// An equation's TeX from `i` (just past the opening `$`) to its closing `$`;
+/// returns (tex, index past `$`). `\x` is kept as is and never closes.
+fn scan_eq(cs: &[char], mut i: usize) -> Option<(String, usize)> {
+    let start = i;
+    if cs.get(i).is_none_or(|c| c.is_whitespace()) {
+        return None;
+    }
+    while i < cs.len() {
+        match cs[i] {
+            '\\' => i += 2,
+            '$' if i > start && !cs[i - 1].is_whitespace() => {
+                return Some((cs[start..i].iter().collect(), i + 1));
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// True if `$tex$` parses back to exactly `tex`.
+fn eq_round_trips(tex: &str) -> bool {
+    let cs: Vec<char> = format!("${tex}$").chars().collect();
+    scan_eq(&cs, 1).is_some_and(|(t, end)| t == tex && end == cs.len())
+}
+
 pub fn from_markdown(s: &str) -> Vec<RichText> {
     let cs: Vec<char> = s.chars().collect();
     let mut items: Vec<Item> = Vec::new();
@@ -208,6 +247,14 @@ pub fn from_markdown(s: &str) -> Vec<RichText> {
             ('`', _) => {
                 if let Some((code, end)) = scan(&cs, i + 1, '`', CODE_ESCAPED) {
                     items.push(Item::Code(code));
+                    i = end;
+                    continue;
+                }
+                None
+            }
+            ('$', _) => {
+                if let Some((tex, end)) = scan_eq(&cs, i + 1) {
+                    items.push(Item::Eq(tex));
                     i = end;
                     continue;
                 }
@@ -257,13 +304,15 @@ pub fn from_markdown(s: &str) -> Vec<RichText> {
 
     let mut runs: Vec<(String, Style)> = Vec::new();
     let mut active: Vec<Mark> = Vec::new();
-    let mut push = |text: &str, code: bool, active: &[Mark]| {
+    let mut push = |text: &str, code: bool, eq: bool, active: &[Mark]| {
         let mut st = Style {
             code,
+            eq,
             ..Style::default()
         };
         for m in active {
             match m {
+                Mark::Link(_) if eq => {}
                 Mark::Link(u) => st.link = Some(u.clone()),
                 Mark::Bold => st.bold = true,
                 Mark::Italic => st.italic = true,
@@ -272,15 +321,16 @@ pub fn from_markdown(s: &str) -> Vec<RichText> {
             }
         }
         match runs.last_mut() {
-            Some((t, s)) if *s == st => t.push_str(text),
+            Some((t, s)) if *s == st && !eq => t.push_str(text),
             _ => runs.push((text.to_string(), st)),
         }
     };
     for it in items {
         match it {
-            Item::Ch(c) => push(c.encode_utf8(&mut [0; 4]), false, &active),
-            Item::Lit(s) => push(s, false, &active),
-            Item::Code(t) => push(&t, true, &active),
+            Item::Ch(c) => push(c.encode_utf8(&mut [0; 4]), false, false, &active),
+            Item::Lit(s) => push(s, false, false, &active),
+            Item::Code(t) => push(&t, true, false, &active),
+            Item::Eq(t) => push(&t, false, true, &active),
             Item::Open(m) => active.push(m),
             Item::Close => {
                 active.pop();
@@ -299,19 +349,27 @@ pub fn from_markdown(s: &str) -> Vec<RichText> {
                     code: st.code,
                     ..Annotations::default()
                 },
-                kind: RichTextKind::Text {
-                    content: t,
-                    link: st.link,
+                kind: if st.eq {
+                    RichTextKind::Equation { expression: t }
+                } else {
+                    RichTextKind::Text {
+                        content: t,
+                        link: st.link,
+                    }
                 },
             })
             .collect(),
     )
 }
 
-/// False if any run is a mention or equation (Markdown would flatten it).
+/// False if any run is a mention (Markdown would flatten it), or an equation
+/// whose TeX wouldn't survive `$…$` (e.g. a bare `$` or edge spaces).
 pub fn is_markdown_editable(rt: &[RichText]) -> bool {
-    rt.iter()
-        .all(|r| matches!(r.kind, RichTextKind::Text { .. }))
+    rt.iter().all(|r| match &r.kind {
+        RichTextKind::Text { .. } => true,
+        RichTextKind::Equation { expression } => eq_round_trips(expression),
+        RichTextKind::Mention(_) => false,
+    })
 }
 
 /// Splits text runs longer than Notion's 2000-char limit, keeping their style.
@@ -361,6 +419,7 @@ pub fn markdown_shortcut(text: &str) -> Option<(TargetKind, &str)> {
         ("[] ", ToDo),
         ("[ ] ", ToDo),
         ("> ", Quote),
+        ("$$ ", Equation),
     ];
     for (p, k) in prefixes {
         if let Some(rest) = text.strip_prefix(p) {
@@ -530,6 +589,8 @@ mod tests {
             "]][[",
             "\\",
             "a\nb **c\nd**",
+            "$a$$b$ $ $$ $c\\$ d$",
+            "**$x** $y$",
         ];
         for s in nasty {
             let m = to_markdown(&from_markdown(s));
@@ -553,11 +614,70 @@ mod tests {
         let mut m = p("@bob");
         m.kind = RichTextKind::Mention(serde_json::json!({ "type": "user" }));
         assert!(!is_markdown_editable(&[p("x"), m]));
-        let mut e = p("x^2");
-        e.kind = RichTextKind::Equation {
-            expression: "x^2".into(),
-        };
-        assert!(!is_markdown_editable(&[e]));
+        assert!(is_markdown_editable(&[p("x"), eq("x^2")]));
+        // TeX that `$…$` can't carry stays read-only
+        for bad in ["a$", " x", "x ", "x\\", ""] {
+            assert!(!is_markdown_editable(&[eq(bad)]), "{bad:?}");
+        }
+    }
+
+    fn eq(t: &str) -> RichText {
+        RichText {
+            plain_text: t.into(),
+            href: None,
+            annotations: Annotations::default(),
+            kind: RichTextKind::Equation {
+                expression: t.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn equations_round_trip() {
+        let mut beq = eq("y");
+        beq.annotations.bold = true;
+        let cases: Vec<Vec<RichText>> = vec![
+            vec![eq("x^2")],
+            vec![
+                p("so "),
+                eq("\\frac{a}{b}"),
+                p(" and "),
+                b("bold "),
+                beq.clone(),
+                b(" more"),
+            ],
+            vec![eq("a"), eq("b")],
+            vec![eq("e^{i\\pi}+1=0"), p("5 costs $5")],
+            vec![eq("\\$x\\$")],
+            vec![p("$"), eq("x"), p("$")],
+        ];
+        for c in cases {
+            let md = to_markdown(&c);
+            assert_eq!(from_markdown(&md), c, "markdown: {md}");
+        }
+        assert_eq!(to_markdown(&[p("$5"), eq("x")]), "\\$5$x$");
+        assert_eq!(to_markdown(&[p("a"), beq]), "a**$y$**");
+    }
+
+    #[test]
+    fn dollar_parsing() {
+        assert_eq!(from_markdown("$x$"), vec![eq("x")]);
+        assert_eq!(
+            from_markdown("a $x^2$ b"),
+            vec![p("a "), eq("x^2"), p(" b")]
+        );
+        assert_eq!(from_markdown(r"\$x\$"), vec![p("$x$")]);
+        // unmatched, empty, or space-padded `$` stay literal
+        for lit in ["$", "a $ b", "$$", "$ x$", "$x $", "$5 and $6", "$x"] {
+            assert_eq!(from_markdown(lit), vec![p(lit)], "{lit}");
+        }
+        // marks: bold/italic apply, a link doesn't, code spans keep `$`
+        let r = from_markdown("**$x$** [$y$](u) `$z$`");
+        assert!(r[0].annotations.bold && matches!(r[0].kind, RichTextKind::Equation { .. }));
+        assert_eq!(r[2], eq("y"));
+        assert_eq!(r[4], code("$z$"));
+        // TeX backslashes are kept raw
+        assert_eq!(from_markdown(r"$\alpha\$ x$"), vec![eq(r"\alpha\$ x")]);
     }
 
     #[test]
@@ -574,6 +694,8 @@ mod tests {
             ("[] a", Some((ToDo, "a"))),
             ("[ ] a", Some((ToDo, "a"))),
             ("> a", Some((Quote, "a"))),
+            ("$$ x", Some((Equation, "x"))),
+            ("$$", None),
             ("```", Some((Code, ""))),
             ("```x", Some((Code, "x"))),
             ("---", Some((Divider, ""))),

@@ -1,7 +1,7 @@
 //! Flattened, read-only outline of a cached page. No iced types here.
 
 use notion_core::markdown::is_markdown_editable;
-use notion_core::model::{BlockKind, RichText};
+use notion_core::model::{BlockKind, RichText, RichTextKind};
 use notion_core::store::Store;
 use notion_core::Result;
 
@@ -19,6 +19,7 @@ pub enum Marker {
     Callout,
     Code(String),
     Divider,
+    Equation,
     ChildPage(String),
     ChildDatabase(String),
     /// Any other block type, shown as a grey `[type]`.
@@ -29,7 +30,7 @@ impl Marker {
     /// Text shown before the row's content ("" for none).
     pub fn label(&self) -> String {
         match self {
-            Marker::None | Marker::Heading(_) => String::new(),
+            Marker::None | Marker::Heading(_) | Marker::Equation => String::new(),
             Marker::Bullet => "•".into(),
             Marker::Number(n) => format!("{n}."),
             Marker::Todo(false) => "☐".into(),
@@ -148,16 +149,30 @@ fn walk(store: &Store, parent: &str, depth: usize, rows: &mut Vec<Row>) -> Resul
             BlockKind::Callout(_) => Marker::Callout,
             BlockKind::Code { language, .. } => Marker::Code(language.clone()),
             BlockKind::Divider => Marker::Divider,
+            BlockKind::Equation { .. } => Marker::Equation,
             BlockKind::ChildPage { title } => Marker::ChildPage(title.clone()),
             BlockKind::ChildDatabase { title } => Marker::ChildDatabase(title.clone()),
             BlockKind::Unsupported { .. } => Marker::Unsupported(b.kind.type_name().into()),
         };
-        let rich_text = b
-            .kind
-            .text()
-            .map(|t| t.rich_text.clone())
-            .unwrap_or_default();
-        let editable = b.kind.text().is_some() && is_markdown_editable(&rich_text);
+        let (rich_text, editable) = match &b.kind {
+            // shown and edited as one equation run
+            BlockKind::Equation { expression } => (
+                vec![RichText {
+                    plain_text: expression.clone(),
+                    href: None,
+                    annotations: Default::default(),
+                    kind: RichTextKind::Equation {
+                        expression: expression.clone(),
+                    },
+                }],
+                true,
+            ),
+            k => {
+                let rt = k.text().map(|t| t.rich_text.clone()).unwrap_or_default();
+                let ok = k.text().is_some() && is_markdown_editable(&rt);
+                (rt, ok)
+            }
+        };
         let leaf = matches!(
             b.kind,
             BlockKind::ChildPage { .. } | BlockKind::ChildDatabase { .. }

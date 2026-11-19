@@ -131,6 +131,7 @@ fn render_block(b: &Block, depth: usize, out: &mut String) {
         // Code lines keep their own indentation, so continuation lines get only the block indent.
         BlockKind::Code { language, .. } => format!("```{language}\n{text}\n```"),
         BlockKind::Divider => "---".into(),
+        BlockKind::Equation { expression } => format!("$${expression}$$"),
         BlockKind::ChildPage { title } => format!("[page: {title}]"),
         BlockKind::ChildDatabase { title } => format!("[database: {title}]"),
         BlockKind::Unsupported { .. } => format!("[{}]", b.kind.type_name()),

@@ -314,6 +314,10 @@ pub enum BlockKind {
         language: String,
     },
     Divider,
+    /// A display (block) equation; `expression` is KaTeX source.
+    Equation {
+        expression: String,
+    },
     ChildPage {
         title: String,
     },
@@ -354,6 +358,7 @@ impl BlockKind {
             BlockKind::Callout(_) => "callout",
             BlockKind::Code { .. } => "code",
             BlockKind::Divider => "divider",
+            BlockKind::Equation { .. } => "equation",
             BlockKind::ChildPage { .. } => "child_page",
             BlockKind::ChildDatabase { .. } => "child_database",
             BlockKind::Unsupported { raw } => raw["type"].as_str().unwrap_or("unsupported"),
@@ -440,6 +445,7 @@ impl BlockKind {
                 json!({ "rich_text": t.rich_text, "language": language })
             }
             BlockKind::Divider => json!({}),
+            BlockKind::Equation { expression } => json!({ "expression": expression }),
             BlockKind::ChildPage { title } | BlockKind::ChildDatabase { title } => {
                 json!({ "title": title })
             }
@@ -476,6 +482,9 @@ impl BlockKind {
                 language: p["language"].as_str()?.to_string(),
             },
             "divider" => BlockKind::Divider,
+            "equation" => BlockKind::Equation {
+                expression: p["expression"].as_str()?.to_string(),
+            },
             "child_page" => BlockKind::ChildPage { title: title()? },
             "child_database" => BlockKind::ChildDatabase { title: title()? },
             _ => return None,
@@ -498,6 +507,7 @@ pub enum TargetKind {
     Callout,
     Code,
     Divider,
+    Equation,
 }
 
 impl TargetKind {
@@ -516,12 +526,13 @@ impl TargetKind {
             BlockKind::Callout(_) => Self::Callout,
             BlockKind::Code { .. } => Self::Code,
             BlockKind::Divider => Self::Divider,
+            BlockKind::Equation { .. } => Self::Equation,
             _ => return None,
         })
     }
 
     /// A block of this type carrying `text`. Divider drops it; Code keeps only
-    /// its plain text. `.to_request_json()` gives the Notion payload.
+    /// its plain text; Equation uses the plain text as its expression. `.to_request_json()` gives the Notion payload.
     pub fn block_kind(self, text: TextBlock) -> BlockKind {
         let heading = |text| Heading {
             text,
@@ -554,6 +565,9 @@ impl TargetKind {
                 }
             }
             Self::Divider => BlockKind::Divider,
+            Self::Equation => BlockKind::Equation {
+                expression: plain_text(&text.rich_text),
+            },
         }
     }
 }
@@ -970,6 +984,29 @@ mod tests {
         assert_eq!(
             parse_block(block_json("divider", json!({}))).kind,
             BlockKind::Divider
+        );
+        let v = block_json("equation", json!({ "expression": "e=mc^2" }));
+        let b = parse_block(v.clone());
+        assert_eq!(
+            b.kind,
+            BlockKind::Equation {
+                expression: "e=mc^2".into()
+            }
+        );
+        assert_eq!(serde_json::to_value(&b).unwrap(), v);
+        assert_eq!(
+            b.kind.to_request_json().unwrap(),
+            json!({ "type": "equation", "equation": { "expression": "e=mc^2" } })
+        );
+        assert_eq!(TargetKind::of(&b.kind), Some(TargetKind::Equation));
+        assert_eq!(
+            TargetKind::Equation.block_kind(TextBlock {
+                rich_text: vec![RichText::plain("x^2")],
+                color: "default".into(),
+            }),
+            BlockKind::Equation {
+                expression: "x^2".into()
+            }
         );
         assert_eq!(
             parse_block(block_json("child_page", json!({ "title": "Sub" }))).kind,

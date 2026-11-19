@@ -6,6 +6,7 @@ mod app;
 mod edit;
 mod outline;
 mod slash;
+mod tex;
 mod worker;
 
 use std::cell::Cell;

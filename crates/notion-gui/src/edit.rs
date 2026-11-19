@@ -114,8 +114,10 @@ pub fn key_action(k: EditKey, c: Caret) -> KeyAction {
 /// The focused row: its editor buffer and the source it started from.
 pub struct Editing {
     pub block_id: String,
-    /// Code rows are edited as raw text, not Markdown.
+    /// Code and equation rows are edited as raw text, not Markdown.
     pub code: bool,
+    /// An equation block: the buffer is its TeX expression.
+    pub equation: bool,
     pub original: String,
     pub content: text_editor::Content,
     /// The open `/` menu.
@@ -124,7 +126,8 @@ pub struct Editing {
 
 impl Editing {
     pub fn new(row: &Row) -> Self {
-        let code = matches!(row.marker, Marker::Code(_));
+        let equation = row.marker == Marker::Equation;
+        let code = equation || matches!(row.marker, Marker::Code(_));
         let original = if code {
             plain_text(&row.rich_text)
         } else {
@@ -135,6 +138,7 @@ impl Editing {
         Editing {
             block_id: row.block_id.clone(),
             code,
+            equation,
             content,
             original,
             menu: None,
