@@ -1,21 +1,16 @@
-//! App state, update and view. `update` only touches the store, the editor
+//! App state and update (rendering is in `view`). `update` only touches the store, the editor
 //! buffer and the worker channel (its Task is just widget focus), so it is
 //! testable without a window.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use iced::font::{Family, Style, Weight};
 use iced::keyboard::{self, Key};
-use iced::widget::text::Span;
-use iced::widget::{
-    button, column, container, mouse_area, operation, rich_text, row, scrollable, span, text,
-    text_editor, text_input,
-};
-use iced::{event, Color, Element, Fill, Font, Subscription, Task};
+use iced::widget::{operation, text_editor};
+use iced::{event, Subscription, Task};
 use notion_core::markdown::from_markdown;
 use notion_core::model::{plain_text, TargetKind};
-use notion_core::model::{BlockKind, Parent, RichText, RichTextKind, TextBlock};
+use notion_core::model::{BlockKind, Parent, RichText, TextBlock};
 use notion_core::ops::OpStatus;
 use notion_core::store::Store;
 use notion_core::sync::{self, ChangeOutcome};
@@ -23,8 +18,9 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::edit::{key_action, EditKey, Editing, KeyAction, EDITOR_ID};
 use crate::keys::{self, Chord, Command, Keymap};
-use crate::outline::{self, Marker, Row, Table};
+use crate::outline::{self, Marker, Row};
 use crate::slash::{self, Menu, MenuKey};
+use crate::view::untitled;
 use crate::worker::{Cmd, Event};
 
 #[derive(Debug, Clone)]
@@ -65,32 +61,36 @@ pub enum Message {
     FocusSearch,
     /// Esc anywhere: back from the search box to the outline.
     SearchEscape,
+    /// System light/dark mode, at startup and on change.
+    ThemeChanged(iced::theme::Mode),
 }
 
-const SEARCH_ID: &str = "search";
+pub(crate) const SEARCH_ID: &str = "search";
 
 pub struct State {
     store: Store,
     cmds: UnboundedSender<Cmd>,
-    pages: Vec<(String, String)>,
-    current: Option<String>,
-    title: String,
-    rows: Vec<Row>,
+    pub(crate) pages: Vec<(String, String)>,
+    pub(crate) current: Option<String>,
+    pub(crate) title: String,
+    pub(crate) rows: Vec<Row>,
     /// queued, conflict, failed
-    counts: [usize; 3],
-    last_error: Option<String>,
-    search: String,
-    results: Vec<(String, String)>,
+    pub(crate) counts: [usize; 3],
+    pub(crate) last_error: Option<String>,
+    pub(crate) search: String,
+    pub(crate) results: Vec<(String, String)>,
     /// Picked search result waiting for its pull.
     pending_open: Option<String>,
     /// Last database opened; its pull failing gets a friendlier error.
     pending_db: Option<String>,
     /// One entry per command sent and not yet answered (the worker answers
     /// each with one event, in order); true = Push.
-    sent: VecDeque<bool>,
+    pub(crate) sent: VecDeque<bool>,
     /// The focused row, if any.
-    editing: Option<Editing>,
-    keys: Keymap,
+    pub(crate) editing: Option<Editing>,
+    pub(crate) keys: Keymap,
+    /// System light/dark mode; `None` (no preference) renders light.
+    pub(crate) mode: iced::theme::Mode,
 }
 
 impl State {
@@ -111,6 +111,7 @@ impl State {
             sent: VecDeque::new(),
             editing: None,
             keys: Keymap::default(),
+            mode: iced::theme::Mode::None,
         };
         s.refresh();
         s
@@ -241,7 +242,7 @@ impl State {
 
     /// A push is queued or running: editing is paused, since the worker may
     /// already have sent the queued ops an edit would rewrite.
-    fn pushing(&self) -> bool {
+    pub(crate) fn pushing(&self) -> bool {
         self.sent.contains(&true)
     }
 
@@ -396,6 +397,7 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
                 )
             };
         }
+        Message::ThemeChanged(m) => s.mode = m,
         Message::Focus(id) => return s.focus(&id),
         Message::FocusCell(row, col) => return s.focus_cell(&row, col),
         Message::EditorAction(a) => return on_editor_action(s, a),
@@ -845,7 +847,25 @@ fn shortcut(ev: iced::Event, _: event::Status, _: iced::window::Id) -> Option<Me
 }
 
 pub fn subscription(_: &State) -> Subscription<Message> {
-    event::listen_with(shortcut)
+    Subscription::batch([
+        event::listen_with(shortcut),
+        iced::system::theme_changes().map(Message::ThemeChanged),
+    ])
+}
+
+impl State {
+    /// "Page title — notion-gui", or just the crate name with no page open.
+    pub fn window_title(&self) -> String {
+        let app = env!("CARGO_PKG_NAME");
+        match self.current {
+            Some(_) => format!("{} — {app}", untitled(&self.title)),
+            None => app.to_owned(),
+        }
+    }
+}
+
+pub fn theme(s: &State) -> iced::Theme {
+    crate::view::theme::theme(s.mode)
 }
 
 /// Only web links go to xdg-open (a file:// one could start a local
@@ -874,7 +894,7 @@ fn open_url(url: &str) -> Result<(), String> {
 }
 
 /// What clicking a read-only row does, if anything.
-fn click(r: &Row) -> Option<Message> {
+pub(crate) fn click(r: &Row) -> Option<Message> {
     Some(match &r.marker {
         Marker::LinkCard { url, .. } => Message::OpenLink(url.clone()),
         Marker::LinkToPage {
@@ -890,303 +910,10 @@ fn click(r: &Row) -> Option<Message> {
     })
 }
 
-fn untitled(t: &str) -> &str {
-    if t.is_empty() {
-        "Untitled"
-    } else {
-        t
-    }
-}
-
-const GREY: Color = Color::from_rgb(0.55, 0.55, 0.55);
-const LINK: Color = Color::from_rgb(0.25, 0.45, 0.9);
-
-fn styled(t: &RichText) -> Span<'_, ()> {
-    if let RichTextKind::Equation { expression } = &t.kind {
-        // Unicode pretty-print in italic serif; the TeX source in monospace if it can't
-        return match crate::tex::pretty_tex(expression) {
-            Some(p) => span(p).font(Font {
-                family: Family::Serif,
-                style: Style::Italic,
-                ..Font::DEFAULT
-            }),
-            None => span(expression.as_str()).font(Font::MONOSPACE),
-        };
-    }
-    let a = &t.annotations;
-    let mut font = if a.code {
-        Font::MONOSPACE
-    } else {
-        Font::DEFAULT
-    };
-    if a.bold {
-        font.weight = Weight::Bold;
-    }
-    if a.italic {
-        font.style = Style::Italic;
-    }
-    span(t.plain_text.as_str())
-        .font(font)
-        .strikethrough(a.strikethrough)
-        .underline(a.underline || t.href.is_some())
-        .color_maybe(t.href.as_ref().map(|_| LINK))
-}
-
-fn editor<'a>(e: &'a Editing, keys: &'a Keymap, size: u32) -> Element<'a, Message> {
-    text_editor(&e.content)
-        .id(EDITOR_ID)
-        .on_action(Message::EditorAction)
-        .key_binding(move |kp| crate::edit::binding(kp, keys))
-        .font(if e.code {
-            Font::MONOSPACE
-        } else {
-            Font::DEFAULT
-        })
-        .size(size)
-        .into()
-}
-
-/// A table as a grid; header row / column in bold, the edited cell as an editor.
-fn table_view<'a>(
-    t: &'a Table,
-    editing: Option<&'a Editing>,
-    keys: &'a Keymap,
-) -> Element<'a, Message> {
-    let rows = t.rows.iter().enumerate().map(|(i, tr)| {
-        let cells = tr.cells.iter().enumerate().map(|(j, c)| {
-            let bold = (t.column_header && i == 0) || (t.row_header && j == 0);
-            let edited = editing.filter(|e| {
-                e.cell
-                    .as_ref()
-                    .is_some_and(|(id, col)| *id == tr.id && *col == j)
-            });
-            let body: Element<_> = match edited {
-                Some(e) => editor(e, keys, 15),
-                None => {
-                    let spans: Vec<Span<'_, ()>> = c
-                        .rich_text
-                        .iter()
-                        .map(|rt| {
-                            let mut sp = styled(rt);
-                            if bold {
-                                sp.font = Some(Font {
-                                    weight: Weight::Bold,
-                                    ..sp.font.unwrap_or_default()
-                                });
-                            }
-                            sp
-                        })
-                        .collect();
-                    let cell = container(rich_text(spans).size(15)).width(Fill);
-                    if c.editable {
-                        mouse_area(cell)
-                            .on_press(Message::FocusCell(tr.id.clone(), j))
-                            .into()
-                    } else {
-                        cell.into()
-                    }
-                }
-            };
-            container(body)
-                .padding(4)
-                .width(Fill)
-                .style(container::bordered_box)
-                .into()
-        });
-        row(cells).into()
-    });
-    column(rows).into()
-}
-
-fn row_view<'a>(
-    r: &'a Row,
-    editing: Option<&'a Editing>,
-    keys: &'a Keymap,
-) -> Element<'a, Message> {
-    let size = match r.marker {
-        Marker::Heading(1) => 28,
-        Marker::Heading(2) => 22,
-        Marker::Heading(3) => 18,
-        Marker::Equation => 20,
-        _ => 15,
-    };
-    let grey = matches!(
-        r.marker,
-        Marker::Unsupported(_)
-            | Marker::Divider
-            | Marker::Synced
-            | Marker::ColumnList
-            | Marker::Column
-            | Marker::TableOfContents
-            | Marker::Breadcrumb
-    );
-    let link = click(r).is_some();
-    let indent = iced::Padding::ZERO.left(r.depth as f32 * 24.0);
-    if let Marker::Table(t) = &r.marker {
-        let editing = editing.filter(|e| e.block_id == r.block_id);
-        return container(table_view(t, editing, keys))
-            .padding(indent)
-            .into();
-    }
-    let label = r.marker.label();
-    if let Some(e) = editing.filter(|e| e.block_id == r.block_id) {
-        let editor = editor(e, keys, size);
-        let body: Element<_> = if label.is_empty() {
-            editor
-        } else {
-            let marker = mouse_area(text(label).size(size))
-                .on_press(Message::ToggleCheck(r.block_id.clone()));
-            row![marker, editor].spacing(6).into()
-        };
-        let body: Element<_> = match e.menu.as_ref() {
-            None => body,
-            Some(m) => column![body, slash_menu(e, m)].spacing(4).into(),
-        };
-        return container(body).padding(indent).into();
-    }
-    let mut spans: Vec<Span<'_, ()>> = Vec::new();
-    // to-do box is its own click target; it captures the press, so the
-    // row's Focus doesn't fire too
-    let todo = matches!(r.marker, Marker::Todo(_)).then(|| {
-        mouse_area(text(label.clone()).size(size))
-            .on_press(Message::ToggleCheck(r.block_id.clone()))
-    });
-    if todo.is_none() && !label.is_empty() {
-        let sep = if matches!(r.marker, Marker::Code(_) | Marker::TableOfContents) {
-            "\n"
-        } else {
-            " "
-        };
-        let color = if link {
-            Some(LINK)
-        } else {
-            grey.then_some(GREY)
-        };
-        spans.push(span(format!("{label}{sep}")).color_maybe(color));
-    }
-    spans.extend(r.rich_text.iter().map(styled));
-    let content: Element<_> = match todo {
-        Some(t) => row![t, rich_text(spans).size(size)].spacing(6).into(),
-        None => rich_text(spans).size(size).into(),
-    };
-    let mut body = container(content).padding(indent).width(Fill);
-    if r.marker == Marker::Equation {
-        body = body.center_x(Fill);
-    }
-    if r.editable {
-        mouse_area(body)
-            .on_press(Message::Focus(r.block_id.clone()))
-            .into()
-    } else if let Some(msg) = click(r) {
-        mouse_area(body)
-            .on_press(msg)
-            .interaction(iced::mouse::Interaction::Pointer)
-            .into()
-    } else {
-        body.into()
-    }
-}
-
-/// The `/` menu, drawn in the outline right under the edited row.
-fn slash_menu<'a>(e: &Editing, m: &Menu) -> Element<'a, Message> {
-    let (line, col) = e.pos();
-    let buf = e.content.text();
-    let q = m.query(&buf, line, col).unwrap_or_default();
-    let items = slash::filter(q).into_iter().enumerate().map(|(i, it)| {
-        let style = if i == m.selected {
-            button::primary
-        } else {
-            button::text
-        };
-        button(row![text(it.name).width(140), text(it.hint).size(12).color(GREY)].spacing(8))
-            .on_press(Message::SlashPick(i))
-            .style(style)
-            .width(Fill)
-            .into()
-    });
-    container(column(items).spacing(2))
-        .style(container::bordered_box)
-        .padding(4)
-        .max_width(360)
-        .into()
-}
-
-pub fn view(s: &State) -> Element<'_, Message> {
-    let mut side = column![text_input("Search Notion… (Ctrl+K)", &s.search)
-        .id(SEARCH_ID)
-        .on_input(Message::SearchInput)
-        .on_submit(Message::SearchSubmit)]
-    .spacing(4)
-    .width(240);
-    for (id, title) in &s.results {
-        side = side.push(
-            button(text(untitled(title)))
-                .on_press(Message::PickResult(id.clone()))
-                .style(button::text),
-        );
-    }
-    if !s.results.is_empty() {
-        side = side.push(text("Cached").color(GREY));
-    }
-    for (id, title) in &s.pages {
-        let style = if s.current.as_ref() == Some(id) {
-            button::secondary
-        } else {
-            button::text
-        };
-        side = side.push(
-            button(text(untitled(title)))
-                .on_press(Message::Open(id.clone()))
-                .style(style),
-        );
-    }
-
-    let main: Element<_> = match &s.current {
-        None => text("Pick a page on the left, or search.")
-            .color(GREY)
-            .into(),
-        Some(_) => column![
-            text(&s.title).size(32),
-            scrollable(
-                column(
-                    s.rows
-                        .iter()
-                        .map(|r| row_view(r, s.editing.as_ref(), &s.keys))
-                )
-                .spacing(6)
-            )
-            .height(Fill)
-        ]
-        .spacing(12)
-        .into(),
-    };
-
-    let [queued, conflicts, failed] = s.counts;
-    let mut status = format!("queued {queued} · conflicts {conflicts} · failed {failed}");
-    if s.pushing() {
-        status.push_str(" · pushing…");
-    } else if !s.sent.is_empty() {
-        status.push_str(" · syncing…");
-    }
-    if let Some(e) = &s.last_error {
-        status.push_str(&format!(" · error: {e}"));
-    }
-
-    column![
-        row![scrollable(side), container(main).width(Fill).height(Fill)]
-            .spacing(16)
-            .height(Fill),
-        text(status).size(13).color(GREY),
-    ]
-    .padding(12)
-    .spacing(8)
-    .into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notion_core::model::Page;
+    use notion_core::model::{Page, RichTextKind};
     use serde_json::json;
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 

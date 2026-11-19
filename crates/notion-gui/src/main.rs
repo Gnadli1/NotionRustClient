@@ -8,6 +8,7 @@ mod keys;
 mod outline;
 mod slash;
 mod tex;
+mod view;
 mod worker;
 
 use std::cell::Cell;
@@ -67,13 +68,17 @@ fn main() -> iced::Result {
         }
         (
             state,
-            Task::run(events, |e| app::Message::Worker(Arc::new(e)))
-                .chain(Task::done(app::Message::WorkerGone)),
+            Task::batch([
+                iced::system::theme().map(app::Message::ThemeChanged),
+                Task::run(events, |e| app::Message::Worker(Arc::new(e)))
+                    .chain(Task::done(app::Message::WorkerGone)),
+            ]),
         )
     };
-    let r = iced::application(boot, app::update, app::view)
-        .title("Notion")
+    let r = iced::application(boot, app::update, view::view)
+        .title(app::State::window_title)
         .subscription(app::subscription)
+        .theme(app::theme)
         .run();
     // State (and the command sender) is gone now, so this only waits for the
     // command in flight: a push killed mid-way would re-send applied ops.
