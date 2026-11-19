@@ -49,6 +49,8 @@ impl Marker {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub block_id: String,
+    /// Page or block the row sits under.
+    pub parent: String,
     pub depth: usize,
     pub marker: Marker,
     pub rich_text: Vec<RichText>,
@@ -100,6 +102,7 @@ fn walk(store: &Store, parent: &str, depth: usize, rows: &mut Vec<Row>) -> Resul
         );
         rows.push(Row {
             block_id: b.id.clone(),
+            parent: parent.to_string(),
             depth,
             marker,
             rich_text,
@@ -113,7 +116,7 @@ fn walk(store: &Store, parent: &str, depth: usize, rows: &mut Vec<Row>) -> Resul
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use notion_core::model::Block;
     use serde_json::{json, Value};
@@ -121,7 +124,7 @@ mod tests {
     const PID: &str = "p";
     const T: &str = "2025-01-01T00:00:00.000Z";
 
-    fn rt(s: &str) -> Value {
+    pub(crate) fn rt(s: &str) -> Value {
         json!([{ "type": "text", "text": { "content": s }, "plain_text": s, "annotations": {} }])
     }
 

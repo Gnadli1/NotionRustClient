@@ -116,3 +116,13 @@ sync worker thread: current-thread tokio runtime + Client + Store (connection #2
 7. **`Store::pages()` also returns data-source rows.** The sidebar may want to filter them out.
 8. **Run splitting counts Rust `char`s.** It's unverified whether Notion's 2000-character limit is counted in UTF-16 units.
 9. **UNVERIFIED live:** annotated rich text in PATCH and append bodies, and copy-then-delete moves with `after`.
+
+## Known gaps after G2 (reviewed, deferred)
+
+1. **No commit on blur.** Clicking the sidebar or search box doesn't commit the open row. The edit is committed at the next commit point (open, pull, push, focus or close), so nothing is lost.
+2. **Key repeat isn't filtered.** Holding Backspace or Enter deletes or creates rows one after another.
+3. **Enter doesn't split at the cursor.** It always adds an empty paragraph after the row, after its subtree if it has one. **Backspace on an empty row that has children does nothing.**
+4. **Up and Down use logical lines.** In a wrapped single-line paragraph they always jump to the neighbouring row.
+5. **Push is modal.** Editing is frozen until the push returns.
+6. **Remote delete during an edit.** If a pull finds the block being edited was deleted remotely, the typed text is discarded and the status bar shows a message about it.
+7. **A commit after a pull that lands mid-edit isn't checked for conflicts** against that pull.

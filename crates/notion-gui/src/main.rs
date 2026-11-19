@@ -3,6 +3,7 @@
 //! ~/.local/share/notion-client/cache.db (same cache as notion-cli).
 
 mod app;
+mod edit;
 mod outline;
 mod worker;
 
