@@ -22,6 +22,7 @@ use notion_core::sync::{self, ChangeOutcome};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::edit::{key_action, EditKey, Editing, KeyAction, EDITOR_ID};
+use crate::keys::{self, Chord, Command, Keymap};
 use crate::outline::{self, Marker, Row};
 use crate::slash::{self, Menu, MenuKey};
 use crate::worker::{Cmd, Event};
@@ -50,6 +51,10 @@ pub enum Message {
     ToggleCheck(String),
     /// `/` menu entry chosen (index into the filtered list).
     SlashPick(usize),
+    /// Any key press, seen window-wide: runs its global keymap command.
+    Chord(Chord),
+    /// A keymap command from the row editor (block type, mark, new block).
+    Command(Command),
     /// Ctrl+K
     FocusSearch,
     /// Esc anywhere: back from the search box to the outline.
@@ -77,6 +82,7 @@ pub struct State {
     sent: VecDeque<bool>,
     /// The focused row, if any.
     editing: Option<Editing>,
+    keys: Keymap,
 }
 
 impl State {
@@ -95,6 +101,7 @@ impl State {
             pending_open: None,
             sent: VecDeque::new(),
             editing: None,
+            keys: Keymap::default(),
         };
         s.refresh();
         s
@@ -241,6 +248,16 @@ impl Drop for State {
     }
 }
 
+impl State {
+    /// Installs the user's keymap; `problems` go to the status bar.
+    pub fn set_keys(&mut self, keys: Keymap, problems: Vec<String>) {
+        self.keys = keys;
+        if !problems.is_empty() {
+            self.last_error = Some(problems.join("; "));
+        }
+    }
+}
+
 pub fn update(s: &mut State, msg: Message) -> Task<Message> {
     match msg {
         // a push is modal: the worker may already have sent the ops an edit
@@ -250,6 +267,7 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         | Message::EditKey(_)
         | Message::ToggleCheck(_)
         | Message::SlashPick(_)
+        | Message::Command(_)
         | Message::FocusSearch
         | Message::SearchEscape
         | Message::Open(_)
@@ -314,6 +332,18 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         Message::Focus(id) => return s.focus(&id),
         Message::EditorAction(a) => return on_editor_action(s, a),
         Message::SlashPick(i) => return slash_pick(s, i),
+        // the message it maps to applies its own push rule
+        Message::Chord(c) => {
+            let msg = match s.keys.get(&c) {
+                Some(Command::Push) => Message::Push,
+                Some(Command::Pull) => Message::Pull { force: false },
+                Some(Command::ForcePull) => Message::Pull { force: true },
+                Some(Command::Search) => Message::FocusSearch,
+                _ => return Task::none(),
+            };
+            return update(s, msg);
+        }
+        Message::Command(c) => return on_command(s, c),
         Message::EditKey(k) => return on_edit_key(s, k),
         Message::WorkerGone => {
             s.sent.clear();
@@ -421,6 +451,28 @@ fn slash_pick(s: &mut State, i: usize) -> Task<Message> {
     convert(s, item.kind, &buf, (m.line, m.slash))
 }
 
+/// A keymap command for the row editor.
+fn on_command(s: &mut State, c: Command) -> Task<Message> {
+    let Some(e) = &mut s.editing else {
+        return Task::none();
+    };
+    e.menu = None;
+    match c {
+        // same path as a `/` pick, same refusals
+        Command::Block(kind) => {
+            let (buf, pos) = (e.content.text(), e.pos());
+            convert(s, kind, &buf, pos)
+        }
+        // raw-text rows have no Markdown
+        Command::Mark(m) if !e.code => {
+            keys::wrap(&mut e.content, m);
+            Task::none()
+        }
+        Command::NewBlock => on_edit_key(s, EditKey::Enter),
+        _ => Task::none(),
+    }
+}
+
 /// Converts the edited block to `kind` and continues editing it with `buf`
 /// (cursor at `pos`). On refusal the buffer is left as typed.
 fn convert(s: &mut State, kind: TargetKind, buf: &str, pos: (usize, usize)) -> Task<Message> {
@@ -430,8 +482,9 @@ fn convert(s: &mut State, kind: TargetKind, buf: &str, pos: (usize, usize)) -> T
     if kind == TargetKind::Divider && !buf.trim().is_empty() {
         return divider_after(s, buf, pos);
     }
-    // code and equations are raw text: drop the Markdown marks
-    let (buf, pos) = if matches!(kind, TargetKind::Code | TargetKind::Equation) {
+    // code is raw text: drop the Markdown marks (an equation's buffer is TeX
+    // already, `*` and `_` included)
+    let (buf, pos) = if kind == TargetKind::Code {
         // ponytail: cursor to the start, mapping it through the stripped marks isn't worth it
         (plain_text(&from_markdown(buf)), (0, 0))
     } else {
@@ -665,37 +718,30 @@ fn toggle_check(s: &mut State, id: &str) -> Task<Message> {
     }
 }
 
-/// Ctrl+R pull, Ctrl+Shift+R force pull, Ctrl+S push, Ctrl+K search, Esc
-/// back to the outline. Sees events even when a widget captured them (an Esc
-/// the editor also handles is harmless: it refocuses or unfocuses).
+/// Every key press as a [`Message::Chord`] (the keymap is resolved in
+/// `update`), plus a hard-wired Esc back to the outline. Sees events even when
+/// a widget captured them (an Esc the editor also handles is harmless: it
+/// refocuses or unfocuses).
 fn shortcut(ev: iced::Event, _: event::Status, _: iced::window::Id) -> Option<Message> {
     let iced::Event::Keyboard(keyboard::Event::KeyPressed {
         key,
+        physical_key,
         modifiers,
+        text,
         repeat: false,
         ..
     }) = ev
     else {
         return None;
     };
-    let c = match key.as_ref() {
-        Key::Named(keyboard::key::Named::Escape) if modifiers.is_empty() => {
-            return Some(Message::SearchEscape)
-        }
-        Key::Character(c) if modifiers.command() => c,
-        _ => return None,
-    };
-    if c.eq_ignore_ascii_case("k") {
-        Some(Message::FocusSearch)
-    } else if c.eq_ignore_ascii_case("r") {
-        Some(Message::Pull {
-            force: modifiers.shift(),
-        })
-    } else if c.eq_ignore_ascii_case("s") {
-        Some(Message::Push)
-    } else {
-        None
+    if key == Key::Named(keyboard::key::Named::Escape) && modifiers.is_empty() {
+        return Some(Message::SearchEscape);
     }
+    // plain typing: no message, no view rebuild
+    if text.is_some() && !(modifiers.control() || modifiers.alt() || modifiers.logo()) {
+        return None;
+    }
+    Chord::of(&key, physical_key, modifiers).map(Message::Chord)
 }
 
 pub fn subscription(_: &State) -> Subscription<Message> {
@@ -744,7 +790,11 @@ fn styled(t: &RichText) -> Span<'_, ()> {
         .color_maybe(t.href.as_ref().map(|_| LINK))
 }
 
-fn row_view<'a>(r: &'a Row, editing: Option<&'a Editing>) -> Element<'a, Message> {
+fn row_view<'a>(
+    r: &'a Row,
+    editing: Option<&'a Editing>,
+    keys: &'a Keymap,
+) -> Element<'a, Message> {
     let size = match r.marker {
         Marker::Heading(1) => 28,
         Marker::Heading(2) => 22,
@@ -762,7 +812,7 @@ fn row_view<'a>(r: &'a Row, editing: Option<&'a Editing>) -> Element<'a, Message
         let editor = text_editor(&e.content)
             .id(EDITOR_ID)
             .on_action(Message::EditorAction)
-            .key_binding(crate::edit::binding)
+            .key_binding(move |kp| crate::edit::binding(kp, keys))
             .font(if e.code {
                 Font::MONOSPACE
             } else {
@@ -875,8 +925,15 @@ pub fn view(s: &State) -> Element<'_, Message> {
             .into(),
         Some(_) => column![
             text(&s.title).size(32),
-            scrollable(column(s.rows.iter().map(|r| row_view(r, s.editing.as_ref()))).spacing(6))
-                .height(Fill)
+            scrollable(
+                column(
+                    s.rows
+                        .iter()
+                        .map(|r| row_view(r, s.editing.as_ref(), &s.keys))
+                )
+                .spacing(6)
+            )
+            .height(Fill)
         ]
         .spacing(12)
         .into(),
@@ -1410,23 +1467,64 @@ mod tests {
     fn shortcuts() {
         let id = iced::window::Id::unique();
         let st = event::Status::Captured;
-        let k = |c, ctrl, shift| shortcut(key(c, ctrl, shift), st, id);
-        assert!(matches!(
-            k("r", true, false),
-            Some(Message::Pull { force: false })
-        ));
-        assert!(matches!(
-            k("R", true, true),
-            Some(Message::Pull { force: true })
-        ));
-        assert!(matches!(k("s", true, false), Some(Message::Push)));
-        assert!(k("s", false, false).is_none());
-        assert!(matches!(k("k", true, false), Some(Message::FocusSearch)));
+        let (mut s, mut rx) = state();
+        s.current = Some("p".into());
+        let mut k = |c, ctrl, shift| {
+            if let Some(m) = shortcut(key(c, ctrl, shift), st, id) {
+                up(&mut s, m);
+            }
+        };
+        k("r", true, false);
+        k("R", true, true);
+        k("s", true, false);
+        k("s", false, false);
+        let mut got = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            got.push(c);
+        }
+        assert_eq!(
+            got,
+            [
+                Cmd::Pull {
+                    id: "p".into(),
+                    force: false
+                },
+                Cmd::Pull {
+                    id: "p".into(),
+                    force: true
+                },
+                Cmd::Push
+            ]
+        );
         let mut held = key("s", true, false);
         if let iced::Event::Keyboard(keyboard::Event::KeyPressed { repeat, .. }) = &mut held {
             *repeat = true;
         }
         assert!(shortcut(held, st, id).is_none(), "key repeat is ignored");
+        let with_text = |c: &str, ctrl: bool| {
+            let mut e = key(c, ctrl, false);
+            if let iced::Event::Keyboard(keyboard::Event::KeyPressed { text, .. }) = &mut e {
+                *text = Some(c.into());
+            }
+            shortcut(e, st, id)
+        };
+        assert!(
+            with_text("a", false).is_none(),
+            "plain typing sends nothing"
+        );
+        assert!(matches!(with_text("s", true), Some(Message::Chord(_))));
+        let f5 = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: Key::Named(keyboard::key::Named::F5),
+            modified_key: Key::Named(keyboard::key::Named::F5),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        assert!(matches!(shortcut(f5, st, id), Some(Message::Chord(_))));
     }
 
     #[test]
@@ -1700,5 +1798,115 @@ mod tests {
         );
         up(&mut s, Message::Focus("b".into()));
         assert_eq!(buffer(&s), "b $x^2$ **y**");
+    }
+
+    /// A key press in the focused editor; true if the keymap or the app took it.
+    fn press(s: &mut State, chord: &str, text: Option<&str>) -> bool {
+        use iced::widget::text_editor::{Binding, KeyPress, Status};
+        let (mods, k) = chord.rsplit_once('+').unwrap_or(("", chord));
+        let mut m = keyboard::Modifiers::empty();
+        m.set(keyboard::Modifiers::CTRL, mods.contains("ctrl"));
+        m.set(keyboard::Modifiers::ALT, mods.contains("alt"));
+        m.set(keyboard::Modifiers::SHIFT, mods.contains("shift"));
+        let key = match k {
+            "tab" => Key::Named(keyboard::key::Named::Tab),
+            c => Key::Character(c.into()),
+        };
+        let kp = KeyPress {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers: m,
+            text: text.map(Into::into),
+            status: Status::Focused { is_hovered: false },
+        };
+        match crate::edit::binding(kp, &s.keys) {
+            Some(Binding::Custom(msg)) => {
+                up(s, msg);
+                true
+            }
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    #[test]
+    fn keymap_block_commands_convert() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        // a real Ctrl+Alt+1 still carries text '1' (xkb's Control transform only affects @..~)
+        assert!(press(&mut s, "ctrl+alt+1", Some("1")));
+        assert_eq!(marker(&s), Marker::Heading(1));
+        assert_eq!(buffer(&s), "b");
+        assert!(editing(&s).unwrap().starts_with("local-"));
+        // refused like a `/` pick: "a" has children
+        up(&mut s, Message::Focus("a".into()));
+        press(&mut s, "ctrl+alt+9", None);
+        assert!(s.last_error.is_some());
+        assert_eq!(marker(&s), Marker::None);
+    }
+
+    #[test]
+    fn keymap_marks_wrap_the_selection() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        up(
+            &mut s,
+            Message::EditorAction(text_editor::Action::Select(text_editor::Motion::WordLeft)),
+        );
+        press(&mut s, "ctrl+b", None);
+        assert_eq!(buffer(&s), "**b**");
+        press(&mut s, "ctrl+e", None);
+        type_text(&mut s, "x");
+        assert_eq!(buffer(&s), "**b**`x`");
+        up(&mut s, Message::EditKey(EditKey::Escape));
+        let b = s.rows.iter().find(|r| r.block_id == "b").unwrap();
+        assert!(b.rich_text[0].annotations.bold && b.rich_text[1].annotations.code);
+    }
+
+    #[test]
+    fn keymap_routing_and_overrides() {
+        let (mut s, mut rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        // global commands are left to the window listener
+        assert!(press(&mut s, "ctrl+s", None));
+        assert!(rx.try_recv().is_err());
+        // a plain letter is the editor's
+        assert!(!press(&mut s, "q", Some("q")));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("keys.json"),
+            r#"{"ctrl+alt+1": "quote", "ctrl+q": "nope"}"#,
+        )
+        .unwrap();
+        let (k, p) = keys::load(dir.path());
+        s.set_keys(k, p);
+        assert!(s.last_error.as_deref().unwrap().contains("nope"));
+        press(&mut s, "ctrl+alt+1", None);
+        assert_eq!(marker(&s), Marker::Quote);
+
+        // mid-push, keymap commands are ignored like typing
+        s.sent.push_back(true);
+        press(&mut s, "ctrl+alt+2", None);
+        assert_eq!(marker(&s), Marker::Quote);
+    }
+
+    #[test]
+    fn equation_conversion_keeps_raw_tex() {
+        let (mut s, _rx) = editing_state();
+        for tex in ["x_1 * y", "a*b*c"] {
+            up(&mut s, Message::Focus("b".into()));
+            up(&mut s, Message::EditKey(EditKey::Enter));
+            let id = editing(&s).unwrap().to_string();
+            type_text(&mut s, tex);
+            type_text(&mut s, "/equation");
+            up(&mut s, Message::EditKey(EditKey::Enter));
+            assert_eq!(buffer(&s), tex);
+            up(&mut s, Message::EditKey(EditKey::Escape));
+            assert_eq!(expression(&s, &id), tex);
+        }
     }
 }

@@ -4,6 +4,7 @@
 
 mod app;
 mod edit;
+mod keys;
 mod outline;
 mod slash;
 mod tex;
@@ -25,6 +26,15 @@ fn db_path(arg: Option<PathBuf>) -> Option<PathBuf> {
         None => PathBuf::from(std::env::var_os("HOME")?).join(".local/share"),
     };
     Some(base.join("notion-client/cache.db"))
+}
+
+/// $XDG_CONFIG_HOME/notion-client, else ~/.config/notion-client.
+fn config_dir() -> Option<PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+    };
+    Some(base.join("notion-client"))
 }
 
 fn open_store(db: &Path) -> Result<Store, String> {
@@ -50,8 +60,13 @@ fn main() -> iced::Result {
     let init = Cell::new(Some((store, cmds, events)));
     let boot = move || {
         let (store, cmds, events) = init.take().expect("boot runs once");
+        let mut state = app::State::new(store, cmds);
+        if let Some(dir) = config_dir() {
+            let (keys, problems) = keys::load(&dir);
+            state.set_keys(keys, problems);
+        }
         (
-            app::State::new(store, cmds),
+            state,
             Task::run(events, |e| app::Message::Worker(Arc::new(e)))
                 .chain(Task::done(app::Message::WorkerGone)),
         )

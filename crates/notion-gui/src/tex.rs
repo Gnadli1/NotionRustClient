@@ -5,6 +5,10 @@
 
 /// The pretty form of `src`, or None if it uses something we can't render.
 pub fn pretty_tex(src: &str) -> Option<String> {
+    // bounds the recursion (one level per `{`); Notion equations are short
+    if src.len() > 1000 {
+        return None;
+    }
     let mut p = P {
         cs: src.chars().collect(),
         i: 0,
@@ -328,5 +332,6 @@ mod tests {
         ] {
             assert_eq!(pretty_tex(src), None, "{src}");
         }
+        assert_eq!(pretty_tex(&"{".repeat(100_000)), None, "no stack overflow");
     }
 }

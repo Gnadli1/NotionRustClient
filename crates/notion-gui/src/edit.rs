@@ -7,6 +7,7 @@ use notion_core::markdown::{from_markdown, to_markdown};
 use notion_core::model::{plain_text, RichText};
 
 use crate::app::Message;
+use crate::keys::{Chord, Command, Keymap};
 use crate::outline::{Marker, Row};
 use crate::slash::{filter, Menu};
 
@@ -20,11 +21,11 @@ pub enum EditKey {
     Enter,
     Backspace,
     Escape,
-    /// Tab
+    /// keymap `indent` (Tab)
     Indent,
-    /// Shift+Tab
+    /// keymap `outdent` (Shift+Tab)
     Outdent,
-    /// Ctrl+Enter
+    /// keymap `toggle_check` (Ctrl+Enter)
     ToggleCheck,
 }
 
@@ -37,17 +38,16 @@ pub enum Route {
     Default,
 }
 
+/// The editor's own keys, after the keymap had its say: Tab and modified
+/// Enter never type a character.
 pub fn route(key: &Key, m: Modifiers) -> Route {
     let Key::Named(named) = key.as_ref() else {
         return Route::Default;
     };
     let plain = m.is_empty();
     match named {
-        Named::Tab if m.command() || m.alt() => Route::Swallow,
-        Named::Tab if m.shift() => Route::App(EditKey::Outdent),
-        Named::Tab => Route::App(EditKey::Indent),
-        Named::Enter if m.alt() => Route::Swallow,
-        Named::Enter if m.command() => Route::App(EditKey::ToggleCheck),
+        Named::Tab => Route::Swallow,
+        Named::Enter if m.alt() || m.command() => Route::Swallow,
         // Shift+Enter: the default binding inserts a newline
         Named::Enter if m.shift() => Route::Default,
         Named::Enter => Route::App(EditKey::Enter),
@@ -59,10 +59,22 @@ pub fn route(key: &Key, m: Modifiers) -> Route {
     }
 }
 
-/// `text_editor::key_binding` for the row editor.
-pub fn binding(kp: KeyPress) -> Option<Binding<Message>> {
+/// `text_editor::key_binding` for the row editor: keymap commands first
+/// (global ones are left to the window listener), then [`route`].
+pub fn binding(kp: KeyPress, keys: &Keymap) -> Option<Binding<Message>> {
     if !matches!(kp.status, Status::Focused { .. }) {
         return None;
+    }
+    let cmd = Chord::of(&kp.key, kp.physical_key, kp.modifiers).and_then(|c| keys.get(&c));
+    if let Some(cmd) = cmd {
+        let msg = match cmd {
+            c if c.is_global() => return None,
+            Command::Indent => Message::EditKey(EditKey::Indent),
+            Command::Outdent => Message::EditKey(EditKey::Outdent),
+            Command::ToggleCheck => Message::EditKey(EditKey::ToggleCheck),
+            c => Message::Command(c),
+        };
+        return Some(Binding::Custom(msg));
     }
     match route(&kp.key, kp.modifiers) {
         Route::App(k) => Some(Binding::Custom(Message::EditKey(k))),
@@ -217,17 +229,11 @@ mod tests {
         let k = Key::Named;
         assert_eq!(route(&k(Named::Enter), none), Route::App(EditKey::Enter));
         assert_eq!(route(&k(Named::Enter), Modifiers::SHIFT), Route::Default);
-        assert_eq!(
-            route(&k(Named::Enter), Modifiers::CTRL),
-            Route::App(EditKey::ToggleCheck)
-        );
+        // Ctrl+Enter / Tab / Shift+Tab come from the keymap; unbound, they're eaten
+        assert_eq!(route(&k(Named::Enter), Modifiers::CTRL), Route::Swallow);
         assert_eq!(route(&k(Named::Enter), Modifiers::ALT), Route::Swallow);
-        assert_eq!(route(&k(Named::Tab), none), Route::App(EditKey::Indent));
-        assert_eq!(
-            route(&k(Named::Tab), Modifiers::SHIFT),
-            Route::App(EditKey::Outdent)
-        );
-        assert_eq!(route(&k(Named::Tab), Modifiers::CTRL), Route::Swallow);
+        assert_eq!(route(&k(Named::Tab), none), Route::Swallow);
+        assert_eq!(route(&k(Named::Tab), Modifiers::SHIFT), Route::Swallow);
         assert_eq!(route(&k(Named::ArrowUp), none), Route::App(EditKey::Up));
         assert_eq!(
             route(&k(Named::ArrowUp), Modifiers::SHIFT),

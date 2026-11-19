@@ -8,7 +8,9 @@ notion-core = { path = "../notion-core" }
 # advanced: widget operations (unfocus); a feature, no extra crates
 iced = { workspace = true, features = ["advanced"] }
 tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+tempfile.workspace = true
 wiremock.workspace = true

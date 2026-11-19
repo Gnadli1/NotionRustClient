@@ -214,19 +214,17 @@ fn scan_eq(cs: &[char], mut i: usize) -> Option<(String, usize)> {
     while i < cs.len() {
         match cs[i] {
             '\\' => i += 2,
-            '$' if i > start && !cs[i - 1].is_whitespace() => {
+            // Pandoc: not `$` + space, and a digit after it means a price
+            '$' if i > start
+                && !cs[i - 1].is_whitespace()
+                && !cs.get(i + 1).is_some_and(char::is_ascii_digit) =>
+            {
                 return Some((cs[start..i].iter().collect(), i + 1));
             }
             _ => i += 1,
         }
     }
     None
-}
-
-/// True if `$tex$` parses back to exactly `tex`.
-fn eq_round_trips(tex: &str) -> bool {
-    let cs: Vec<char> = format!("${tex}$").chars().collect();
-    scan_eq(&cs, 1).is_some_and(|(t, end)| t == tex && end == cs.len())
 }
 
 pub fn from_markdown(s: &str) -> Vec<RichText> {
@@ -362,14 +360,13 @@ pub fn from_markdown(s: &str) -> Vec<RichText> {
     )
 }
 
-/// False if any run is a mention (Markdown would flatten it), or an equation
-/// whose TeX wouldn't survive `$…$` (e.g. a bare `$` or edge spaces).
+/// True if editing `rt` as Markdown loses nothing beyond underline/colour:
+/// no mentions, and it survives `to_markdown` → `from_markdown` (an equation
+/// with a bare `$`, edge spaces, or a digit right after it doesn't).
 pub fn is_markdown_editable(rt: &[RichText]) -> bool {
-    rt.iter().all(|r| match &r.kind {
-        RichTextKind::Text { .. } => true,
-        RichTextKind::Equation { expression } => eq_round_trips(expression),
-        RichTextKind::Mention(_) => false,
-    })
+    !rt.iter()
+        .any(|r| matches!(r.kind, RichTextKind::Mention(_)))
+        && normalize(&from_markdown(&to_markdown(rt))) == normalize(rt)
 }
 
 /// Splits text runs longer than Notion's 2000-char limit, keeping their style.
@@ -616,7 +613,7 @@ mod tests {
         assert!(!is_markdown_editable(&[p("x"), m]));
         assert!(is_markdown_editable(&[p("x"), eq("x^2")]));
         // TeX that `$…$` can't carry stays read-only
-        for bad in ["a$", " x", "x ", "x\\", ""] {
+        for bad in ["a$", " x", "x ", "x\\"] {
             assert!(!is_markdown_editable(&[eq(bad)]), "{bad:?}");
         }
     }
@@ -647,7 +644,7 @@ mod tests {
                 b(" more"),
             ],
             vec![eq("a"), eq("b")],
-            vec![eq("e^{i\\pi}+1=0"), p("5 costs $5")],
+            vec![eq("e^{i\\pi}+1=0"), p(" costs $5")],
             vec![eq("\\$x\\$")],
             vec![p("$"), eq("x"), p("$")],
         ];
@@ -661,6 +658,15 @@ mod tests {
 
     #[test]
     fn dollar_parsing() {
+        // prices: a digit after the closing `$` keeps it text
+        for lit in ["$10-$20", "$5/$6", "from $1 to $2", "$x$2"] {
+            assert_eq!(from_markdown(lit), vec![p(lit)], "{lit}");
+        }
+        assert_eq!(from_markdown("$x$ 2"), vec![eq("x"), p(" 2")]);
+        // so an equation right before a digit can't be written: read-only
+        assert!(!is_markdown_editable(&[eq("x"), p("2")]));
+        assert!(is_markdown_editable(&[eq("x"), p(" 2")]));
+        assert!(is_markdown_editable(&[p("$10-$20")]));
         assert_eq!(from_markdown("$x$"), vec![eq("x")]);
         assert_eq!(
             from_markdown("a $x^2$ b"),
