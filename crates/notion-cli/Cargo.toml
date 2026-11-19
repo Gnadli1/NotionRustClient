@@ -1,0 +1,11 @@
+[package]
+name = "notion-cli"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+notion-core = { path = "../notion-core" }
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
