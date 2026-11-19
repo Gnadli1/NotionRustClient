@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use crate::api::{BlockNode, Client};
+use crate::markdown::split_runs;
 use crate::model::{Block, BlockKind, Page, Parent, RichText};
 use crate::ops::{Op, OpKind, OpStatus};
 use crate::store::{ts, Store};
@@ -52,17 +53,22 @@ pub async fn pull_page(
     let tree = client.block_tree(&page.id).await?;
 
     // Snapshot local state before writing anything, so traversal order can't
-    // matter: blocks with queued edits/moves keep their cached version, queued
-    // deletes stay gone, unpushed `local-*` creates survive.
+    // matter: blocks with queued edits keep their cached version, queued
+    // deletes stay gone, unpushed `local-*` creates and queued moves keep their
+    // cached place (and subtree).
     let mut kept = HashMap::new();
     let mut deleted = HashSet::new();
+    let mut moved = HashSet::new();
     for op in store.queued_ops()? {
         match &op.kind {
-            OpKind::UpdateBlock { block_id, .. } | OpKind::MoveBlock { block_id, .. } => {
+            OpKind::UpdateBlock { block_id, .. } => {
                 let id = store.resolve_id(block_id)?;
                 if let Some(b) = store.get_block(&id)? {
                     kept.insert(id, b);
                 }
+            }
+            OpKind::MoveBlock { block_id, .. } => {
+                moved.insert(store.resolve_id(block_id)?);
             }
             OpKind::DeleteBlock { block_id } => {
                 deleted.insert(store.resolve_id(block_id)?);
@@ -70,18 +76,30 @@ pub async fn pull_page(
             _ => {}
         }
     }
-    let mut locals: HashMap<String, Vec<Block>> = HashMap::new();
+    // parent id → [(cached previous sibling, block)] in cached order
+    let mut pinned: HashMap<String, Vec<(Option<String>, Block)>> = HashMap::new();
     {
+        // ponytail: windows over the whole blocks table; filter by page if caches get big
         let mut st = store.conn.prepare(
-            "SELECT parent_id, raw FROM blocks WHERE id LIKE 'local-%' ORDER BY parent_id, position",
+            "SELECT parent_id, prev, raw FROM (SELECT id, parent_id, position, raw,
+               LAG(id) OVER (PARTITION BY parent_id ORDER BY position) AS prev FROM blocks)
+             WHERE id LIKE 'local-%' OR id IN (SELECT value FROM json_each(?1))
+             ORDER BY parent_id, position",
         )?;
-        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let moved_json = serde_json::to_string(&moved)?;
+        let rows = st.query_map([moved_json], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
         for row in rows {
-            let (parent, raw) = row?;
-            locals
+            let (parent, prev, raw) = row?;
+            pinned
                 .entry(parent)
                 .or_default()
-                .push(serde_json::from_str(&raw)?);
+                .push((prev, serde_json::from_str(&raw)?));
         }
     }
 
@@ -101,8 +119,10 @@ pub async fn pull_page(
     while let Some((parent_id, nodes)) = todo.pop() {
         let mut list = Vec::new();
         for n in nodes {
-            if deleted.contains(&n.block.id) {
-                continue; // its subtree is skipped too: no rows under a missing parent
+            // Skipped subtrees: no rows under a missing parent, and a locally
+            // moved block's cached subtree stays as it is.
+            if deleted.contains(&n.block.id) || moved.contains(&n.block.id) {
+                continue;
             }
             match kept.get(&n.block.id) {
                 Some(c) => {
@@ -122,7 +142,18 @@ pub async fn pull_page(
                 todo.push((n.block.id.clone(), &n.children));
             }
         }
-        list.extend(locals.remove(&parent_id).unwrap_or_default());
+        // Re-insert pinned blocks after their cached predecessor (first if
+        // they were first, last if it's gone).
+        for (prev, b) in pinned.remove(&parent_id).unwrap_or_default() {
+            let at = match prev {
+                None => 0,
+                Some(p) => list
+                    .iter()
+                    .position(|x| x.id == p)
+                    .map_or(list.len(), |i| i + 1),
+            };
+            list.insert(at, b);
+        }
         store.replace_children(&page.id, &parent_id, &list)?;
     }
     store.upsert_page(&page)?;
@@ -318,8 +349,12 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
                     .append_children(&parent, std::slice::from_ref(&local), after.as_deref())
                     .await?,
             )?;
-            store.rename_block(&local.id, &new.id)?;
-            store.put_block(&new)?;
+            // A create kept for a locally deleted block (see local_delete_block)
+            // must not bring it back into the cache; its DeleteBlock follows.
+            if store.get_block(&local.id)?.is_some() {
+                store.rename_block(&local.id, &new.id)?;
+                store.put_block(&new)?;
+            }
             store.map_id(&local.id, &new.id)?;
             record_block(own, &new)?;
         }
@@ -385,6 +420,10 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
                 store.map_id(old, &b.id)?;
                 record_block(own, b)?;
             }
+            // put_block appended the copy last; cache order only, a pull fixes it otherwise
+            if let Err(e) = store.move_block_local(&top.id, &new_parent, after.as_deref()) {
+                tracing::warn!("moved block {} not repositioned in cache: {e}", top.id);
+            }
         }
     }
     Ok(Outcome::Applied)
@@ -392,39 +431,285 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
 
 // ---------------------------------------------------------------- local edits
 
+fn cached(store: &Store, block_id: &str) -> Result<Block> {
+    store
+        .get_block(block_id)?
+        .ok_or_else(|| Error::Invalid(format!("block {block_id} not cached")))
+}
+
+/// Caches `block` and queues a PATCH of it with `body`, based on `base`. An
+/// unpushed `local-*` block has its queued create rewritten with the new
+/// content instead; that create's op id is returned.
+fn enqueue_update(store: &Store, base: &Block, block: &Block, body: Value) -> Result<i64> {
+    store.atomic(|| {
+        store.put_block(block)?;
+        if let Some(Op {
+            id,
+            kind: OpKind::CreateBlock {
+                parent_id, after, ..
+            },
+            ..
+        }) = store.queued_create_for(&block.id)?
+        {
+            let kind = OpKind::CreateBlock {
+                parent_id,
+                after,
+                block: serde_json::to_value(cached(store, &block.id)?)?,
+            };
+            store.update_op_kind(id, &kind)?;
+            return Ok(id);
+        }
+        store.enqueue(
+            OpKind::UpdateBlock {
+                block_id: block.id.clone(),
+                body,
+            },
+            Some(base.last_edited_time),
+            Some(serde_json::to_value(base)?),
+        )
+    })
+}
+
 /// Rewrites a cached block's text and queues the update. Returns the op id.
 pub fn local_edit_text(store: &Store, block_id: &str, text: &str) -> Result<i64> {
-    let mut block = store
-        .get_block(block_id)?
-        .ok_or_else(|| Error::Invalid(format!("block {block_id} not cached")))?;
-    if block.kind.text().is_none() {
+    let runs = if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![RichText::plain(text)]
+    };
+    local_edit_rich(store, block_id, runs)
+}
+
+/// Replaces a cached block's rich text (runs over 2000 chars are split) and
+/// queues the update. Returns the op id.
+pub fn local_edit_rich(store: &Store, block_id: &str, rich_text: Vec<RichText>) -> Result<i64> {
+    let base = cached(store, block_id)?;
+    if base.kind.text().is_none() {
         return Err(Error::Invalid(format!(
             "block type `{}` has no text",
-            block.kind.type_name()
+            base.kind.type_name()
         )));
     }
-    let base_raw = serde_json::to_value(&block)?;
-    let base_time = block.last_edited_time;
-    // Notion caps a rich-text run at 2000 chars.
-    let chars: Vec<char> = text.chars().collect();
-    let runs = chars
-        .chunks(2000)
-        .map(|c| RichText::plain(&c.iter().collect::<String>()))
-        .collect();
-    block.kind.set_text(runs)?;
-    store.put_block(&block)?;
+    let mut block = base.clone();
+    block.kind.set_text(split_runs(rich_text))?;
     let mut body = block.kind.to_request_json()?;
     if let Some(o) = body.as_object_mut() {
         o.remove("type");
     }
-    store.enqueue(
-        OpKind::UpdateBlock {
-            block_id: block_id.to_string(),
-            body,
-        },
-        Some(base_time),
-        Some(base_raw),
+    enqueue_update(store, &base, &block, body)
+}
+
+/// Sets a cached to-do's checkbox and queues `{"to_do":{"checked":..}}`.
+pub fn local_set_checked(store: &Store, block_id: &str, checked: bool) -> Result<i64> {
+    let base = cached(store, block_id)?;
+    let mut block = base.clone();
+    match &mut block.kind {
+        BlockKind::ToDo { checked: c, .. } => *c = checked,
+        k => {
+            return Err(Error::Invalid(format!(
+                "block type `{}` is not a to-do",
+                k.type_name()
+            )))
+        }
+    }
+    enqueue_update(
+        store,
+        &base,
+        &block,
+        json!({ "to_do": { "checked": checked } }),
     )
+}
+
+/// (placed block, parent, after) of an op that puts a block somewhere.
+fn placement(k: &OpKind) -> Option<(&str, &str, Option<&str>)> {
+    match k {
+        OpKind::CreateBlock {
+            parent_id,
+            after,
+            block,
+        } => Some((
+            block["id"].as_str().unwrap_or_default(),
+            parent_id,
+            after.as_deref(),
+        )),
+        OpKind::MoveBlock {
+            block_id,
+            new_parent_id,
+            after,
+        } => Some((block_id, new_parent_id, after.as_deref())),
+        _ => None,
+    }
+}
+
+/// The block an op is about (for a create: the block it creates).
+fn op_block(k: &OpKind) -> Option<&str> {
+    match k {
+        OpKind::CreateBlock { block, .. } => block["id"].as_str(),
+        OpKind::UpdateBlock { block_id, .. }
+        | OpKind::DeleteBlock { block_id }
+        | OpKind::MoveBlock { block_id, .. } => Some(block_id),
+        OpKind::UpdatePageProperties { .. } => None,
+    }
+}
+
+/// Deletes a cached block and its subtree.
+///
+/// Queued ops on blocks in the subtree are dropped, except a `local-*`
+/// block's create that a surviving op is placed relative to (as parent or
+/// `after`): it stays, so the queue still replays in order. A real block
+/// whose dropped MoveBlock put it into the subtree gets its own DeleteBlock,
+/// since remotely it never moved. Returns the root's DeleteBlock op, or None
+/// if the root is a `local-*` block whose create was dropped.
+pub fn local_delete_block(store: &Store, block_id: &str) -> Result<Option<i64>> {
+    store.atomic(|| {
+        let block = cached(store, block_id)?;
+        let subtree: HashSet<String> = store.subtree_ids(block_id)?.into_iter().collect();
+        let ops = store.queued_ops()?;
+        let mut drop = Vec::new();
+        for op in &ops {
+            let t = op_block(&op.kind)
+                .map(|t| store.resolve_id(t))
+                .transpose()?;
+            drop.push(t.is_some_and(|t| subtree.contains(&t)));
+        }
+        loop {
+            let mut used = HashSet::new();
+            for (op, _) in ops.iter().zip(&drop).filter(|(_, d)| !**d) {
+                if let Some((_, parent, after)) = placement(&op.kind) {
+                    used.insert(parent);
+                    used.extend(after);
+                }
+            }
+            let mut kept_one = false;
+            for (op, d) in ops.iter().zip(drop.iter_mut()) {
+                if *d
+                    && matches!(op.kind, OpKind::CreateBlock { .. })
+                    && op_block(&op.kind).is_some_and(|b| used.contains(b))
+                {
+                    *d = false;
+                    kept_one = true;
+                }
+            }
+            if !kept_one {
+                break;
+            }
+        }
+
+        // first dropped base per block: what the remote looked like before our edits
+        let mut bases = HashMap::new();
+        let mut moved_in = Vec::new();
+        let mut root_create_kept = false;
+        for (op, d) in ops.iter().zip(&drop) {
+            let t = match op_block(&op.kind) {
+                Some(t) => store.resolve_id(t)?,
+                None => continue,
+            };
+            if !d {
+                root_create_kept |= t == block_id;
+                continue;
+            }
+            store.complete_op(op.id)?;
+            if op.base_last_edited_time.is_some() {
+                bases
+                    .entry(t.clone())
+                    .or_insert((op.base_last_edited_time, op.base_raw.clone()));
+            }
+            if matches!(op.kind, OpKind::MoveBlock { .. })
+                && !t.starts_with("local-")
+                && t != block_id
+                && !moved_in.contains(&t)
+            {
+                moved_in.push(t);
+            }
+        }
+        store.delete_block(block_id)?;
+        for t in moved_in {
+            let (time, raw) = bases.remove(&t).unwrap_or_default();
+            store.enqueue(OpKind::DeleteBlock { block_id: t }, time, raw)?;
+        }
+        let (time, raw) = if block_id.starts_with("local-") {
+            if !root_create_kept {
+                return Ok(None);
+            }
+            (None, None) // our own create: nothing remote to conflict with
+        } else {
+            bases.remove(block_id).unwrap_or((
+                Some(block.last_edited_time),
+                Some(serde_json::to_value(&block)?),
+            ))
+        };
+        store
+            .enqueue(
+                OpKind::DeleteBlock {
+                    block_id: block_id.to_string(),
+                },
+                time,
+                raw,
+            )
+            .map(Some)
+    })
+}
+
+/// Moves a cached block under `new_parent` after `after` (None = last) and
+/// queues the move.
+///
+/// An unpushed `local-*` block has its queued create rewritten instead
+/// (returns None) when that keeps the queue's replay order: no other op is
+/// placed after the block, the block has no queued move, and no later op
+/// places the new parent or anchor, or anything into the new parent.
+/// Otherwise a MoveBlock is queued.
+pub fn local_move_block(
+    store: &Store,
+    block_id: &str,
+    new_parent: &str,
+    after: Option<&str>,
+) -> Result<Option<i64>> {
+    store.atomic(|| {
+        let base = cached(store, block_id)?;
+        store.move_block_local(block_id, new_parent, after)?;
+        let create = store.queued_create_for(block_id)?;
+        if let Some(c) = &create {
+            let mut safe = true;
+            for op in store.queued_ops()? {
+                if let Some((b, parent, aft)) = placement(&op.kind).filter(|_| op.id != c.id) {
+                    let later = op.id > c.id;
+                    safe &= b != block_id
+                        && aft != Some(block_id)
+                        && !(later
+                            && (b == new_parent || Some(b) == after || parent == new_parent));
+                }
+            }
+            if safe {
+                let kind = OpKind::CreateBlock {
+                    parent_id: new_parent.to_string(),
+                    after: after.map(str::to_string),
+                    block: serde_json::to_value(cached(store, block_id)?)?,
+                };
+                store.update_op_kind(c.id, &kind)?;
+                return Ok(None);
+            }
+        }
+        // A local block's base is our own create: nothing remote to conflict with.
+        let (base_time, base_raw) = if create.is_some() {
+            (None, None)
+        } else {
+            (
+                Some(base.last_edited_time),
+                Some(serde_json::to_value(&base)?),
+            )
+        };
+        store
+            .enqueue(
+                OpKind::MoveBlock {
+                    block_id: block_id.to_string(),
+                    new_parent_id: new_parent.to_string(),
+                    after: after.map(str::to_string),
+                },
+                base_time,
+                base_raw,
+            )
+            .map(Some)
+    })
 }
 
 /// Caches a new block under a temporary `local-…` id and queues its creation.
@@ -455,16 +740,19 @@ pub fn local_create_block(
     v["created_time"] = json!(ts(&now));
     v["last_edited_time"] = json!(ts(&now));
     let block: Block = serde_json::from_value(v)?;
-    store.put_block(&block)?;
-    store.enqueue(
-        OpKind::CreateBlock {
-            parent_id: parent_id.to_string(),
-            after: after.map(str::to_string),
-            block: serde_json::to_value(&block)?,
-        },
-        None,
-        None,
-    )?;
+    store.atomic(|| {
+        store.put_block(&block)?;
+        store.move_block_local(&id, parent_id, after)?;
+        store.enqueue(
+            OpKind::CreateBlock {
+                parent_id: parent_id.to_string(),
+                after: after.map(str::to_string),
+                block: serde_json::to_value(&block)?,
+            },
+            None,
+            None,
+        )
+    })?;
     Ok(id)
 }
 
@@ -1114,24 +1402,15 @@ mod tests {
             .kind;
         let local = local_create_block(&store, "p", None, kind).unwrap();
         assert!(local.starts_with("local-"));
-        local_edit_text(&store, &local, "edited").unwrap();
+        // the edit is folded into the pending create: one op, created with the new text
+        let create = store.queued_ops().unwrap()[0].id;
+        assert_eq!(local_edit_text(&store, &local, "edited").unwrap(), create);
+        assert_eq!(store.queued_ops().unwrap().len(), 1);
 
         Mock::given(method("PATCH"))
             .and(path("/v1/blocks/p/children"))
-            .respond_with(list(vec![blk("real1", pp("p"), "x", T2, false)]))
-            .expect(1)
-            .mount(&s)
-            .await;
-        get(
-            &s,
-            "/v1/blocks/real1",
-            ok(blk("real1", pp("p"), "x", T2, false)),
-        )
-        .await;
-        Mock::given(method("PATCH"))
-            .and(path("/v1/blocks/real1"))
             .and(body_string_contains("edited"))
-            .respond_with(ok(blk("real1", pp("p"), "edited", T2, false)))
+            .respond_with(list(vec![blk("real1", pp("p"), "edited", T2, false)]))
             .expect(1)
             .mount(&s)
             .await;
@@ -1139,7 +1418,7 @@ mod tests {
         assert_eq!(
             r,
             PushReport {
-                applied: 2,
+                applied: 1,
                 conflicts: 0,
                 failed: 0
             }
@@ -1318,5 +1597,492 @@ mod tests {
         };
         assert_eq!(body["paragraph"]["rich_text"].as_array().unwrap().len(), 3);
         assert!(body.get("type").is_none());
+    }
+
+    fn queue(store: &Store) -> Vec<OpKind> {
+        store
+            .queued_ops()
+            .unwrap()
+            .into_iter()
+            .map(|o| o.kind)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn local_create_respects_after() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a", "b"]).await;
+        let x = local_create_block(&store, "p", Some("a"), BlockKind::Divider).unwrap();
+        assert_eq!(ids(&store.children("p").unwrap()), ["a", x.as_str(), "b"]);
+        let OpKind::CreateBlock { after, .. } = &queue(&store)[0] else {
+            panic!()
+        };
+        assert_eq!(after.as_deref(), Some("a"));
+        // unknown `after`: nothing cached, nothing queued
+        assert!(local_create_block(&store, "p", Some("zz"), BlockKind::Divider).is_err());
+        assert_eq!(ids(&store.children("p").unwrap()), ["a", x.as_str(), "b"]);
+        assert_eq!(queue(&store).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_edit_rich_keeps_annotations() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        let rt = crate::markdown::from_markdown("x **bold**");
+        local_edit_rich(&store, "b", rt.clone()).unwrap();
+        let b = store.get_block("b").unwrap().unwrap();
+        assert_eq!(b.kind.text().unwrap().rich_text, rt);
+        let OpKind::UpdateBlock { body, .. } = &queue(&store)[0] else {
+            panic!()
+        };
+        assert_eq!(
+            body["paragraph"]["rich_text"][1]["annotations"]["bold"],
+            true
+        );
+        // empty text still clears the runs
+        local_edit_text(&store, "b", "").unwrap();
+        assert!(store
+            .get_block("b")
+            .unwrap()
+            .unwrap()
+            .kind
+            .text()
+            .unwrap()
+            .rich_text
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_set_checked_patches_only_checked() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        let mut todo = blk("t", pp("p"), "task", T, false);
+        todo["type"] = json!("to_do");
+        todo["to_do"] = json!({ "rich_text": [], "checked": false });
+        store
+            .put_block(&serde_json::from_value(todo.clone()).unwrap())
+            .unwrap();
+        assert!(local_set_checked(&store, "b", true).is_err());
+        local_set_checked(&store, "t", true).unwrap();
+        let t = store.get_block("t").unwrap().unwrap();
+        assert!(matches!(t.kind, BlockKind::ToDo { checked: true, .. }));
+        assert_eq!(
+            queue(&store),
+            [OpKind::UpdateBlock {
+                block_id: "t".into(),
+                body: json!({ "to_do": { "checked": true } })
+            }]
+        );
+        get(&s, "/v1/blocks/t", ok(todo.clone())).await;
+        todo["last_edited_time"] = json!(T2);
+        todo["to_do"]["checked"] = json!(true);
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/t"))
+            .and(wiremock::matchers::body_json(
+                json!({ "to_do": { "checked": true } }),
+            ))
+            .respond_with(ok(todo))
+            .expect(1)
+            .mount(&s)
+            .await;
+        assert_eq!(push(&client(&s), &store).await.unwrap().applied, 1);
+    }
+
+    #[tokio::test]
+    async fn local_delete_drops_subtree_ops_and_keeps_base() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a", "b"]).await;
+        let orig = serde_json::to_value(store.get_block("a").unwrap().unwrap()).unwrap();
+        local_edit_text(&store, "a", "edited").unwrap();
+        let kid = local_create_block(&store, "a", None, BlockKind::Divider).unwrap();
+        local_edit_text(&store, "b", "keep").unwrap();
+
+        let del = local_delete_block(&store, "a").unwrap().unwrap();
+        assert_eq!(ids(&store.children("p").unwrap()), ["b"]);
+        assert_eq!(store.get_block(&kid).unwrap(), None);
+        let ops = store.queued_ops().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(&ops[0].kind, OpKind::UpdateBlock { block_id, .. } if block_id == "b"));
+        assert_eq!(ops[1].id, del);
+        assert_eq!(
+            ops[1].kind,
+            OpKind::DeleteBlock {
+                block_id: "a".into()
+            }
+        );
+        assert_eq!(ops[1].base_raw.as_ref(), Some(&orig));
+    }
+
+    #[tokio::test]
+    async fn local_blocks_rewrite_or_drop_their_create() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a", "b"]).await;
+        let x = local_create_block(&store, "p", Some("a"), BlockKind::Divider).unwrap();
+        let y = local_create_block(&store, "p", Some(&x), BlockKind::Divider).unwrap();
+        let z = local_create_block(&store, "p", Some(&y), BlockKind::Divider).unwrap();
+        let creates = |store: &Store| -> Vec<String> {
+            queue(store)
+                .iter()
+                .filter_map(|k| match k {
+                    OpKind::CreateBlock { block, .. } => Some(block["id"].as_str().unwrap().into()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // nothing is placed after z: its create just goes
+        assert_eq!(local_delete_block(&store, &z).unwrap(), None);
+        assert_eq!(creates(&store), [x.clone(), y.clone()]);
+        // y is placed after x: x's create stays and a delete of it is queued
+        let d = local_delete_block(&store, &x).unwrap().unwrap();
+        assert_eq!(creates(&store), [x.clone(), y.clone()]);
+        let last = store.queued_ops().unwrap().pop().unwrap();
+        assert_eq!(
+            (last.id, last.kind, last.base_last_edited_time),
+            (
+                d,
+                OpKind::DeleteBlock {
+                    block_id: x.clone()
+                },
+                None
+            )
+        );
+        // nothing depends on y: its create is rewritten in place
+        assert_eq!(local_move_block(&store, &y, "b", None).unwrap(), None);
+        assert_eq!(ids(&store.children("p").unwrap()), ["a", "b"]);
+        assert_eq!(ids(&store.children("b").unwrap()), [y.as_str()]);
+        let OpKind::CreateBlock {
+            parent_id,
+            after,
+            block,
+        } = &queue(&store)[1]
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (parent_id.as_str(), after, block["id"].as_str()),
+            ("b", &None, Some(y.as_str()))
+        );
+        assert_eq!(block["parent"]["block_id"], "b");
+    }
+
+    #[tokio::test]
+    async fn local_move_falls_back_when_order_depends_on_it() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a", "b"]).await;
+        // p=[a,b]: x after b, then y after a → [a,y,b,x]; moving x after a in
+        // place would replay as x-after-a, y-after-a = [a,y,x,b]
+        let x = local_create_block(&store, "p", Some("b"), BlockKind::Divider).unwrap();
+        let y = local_create_block(&store, "p", Some("a"), BlockKind::Divider).unwrap();
+        let m = local_move_block(&store, &x, "p", Some("a"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ids(&store.children("p").unwrap()),
+            ["a", x.as_str(), y.as_str(), "b"]
+        );
+        let ops = store.queued_ops().unwrap();
+        let OpKind::CreateBlock { after, .. } = &ops[0].kind else {
+            panic!()
+        };
+        assert_eq!(after.as_deref(), Some("b"));
+        assert_eq!(
+            (ops[2].id, &ops[2].kind, ops[2].base_last_edited_time),
+            (
+                m,
+                &OpKind::MoveBlock {
+                    block_id: x.clone(),
+                    new_parent_id: "p".into(),
+                    after: Some("a".into())
+                },
+                None
+            )
+        );
+        // y is placed after... nothing; but w is placed after y: y must move by op
+        let _w = local_create_block(&store, "p", Some(&y), BlockKind::Divider).unwrap();
+        assert!(local_move_block(&store, &y, "b", None).unwrap().is_some());
+        // x already has a queued move: later moves queue too
+        assert!(local_move_block(&store, &x, "b", None).unwrap().is_some());
+        assert_eq!(ids(&store.children("b").unwrap()), [y.as_str(), x.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn kept_create_and_delete_replay_in_order() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        // x after a, z after a, y after x → [a,z,x,y]; delete x → [a,z,y]
+        let x = local_create_block(&store, "p", Some("a"), BlockKind::Divider).unwrap();
+        let z = local_create_block(&store, "p", Some("a"), BlockKind::Divider).unwrap();
+        let y = local_create_block(&store, "p", Some(&x), BlockKind::Divider).unwrap();
+        local_delete_block(&store, &x).unwrap().unwrap();
+        assert_eq!(
+            ids(&store.children("p").unwrap()),
+            ["a", z.as_str(), y.as_str()]
+        );
+
+        let made = |id: &str| list(vec![blk(id, pp("p"), "", T2, false)]);
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/p/children"))
+            .and(body_string_contains("\"after\":\"x1\""))
+            .respond_with(made("y1"))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/p/children"))
+            .and(body_string_contains("\"after\":\"a\""))
+            .respond_with(made("x1"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/p/children"))
+            .and(body_string_contains("\"after\":\"a\""))
+            .respond_with(made("z1"))
+            .expect(1)
+            .mount(&s)
+            .await;
+        // the DeleteBlock queued on the local id resolves to the real one
+        get(&s, "/v1/blocks/x1", ok(blk("x1", pp("p"), "", T2, false))).await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/blocks/x1"))
+            .respond_with(ok(blk("x1", pp("p"), "", T2, false)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        assert_eq!(push(&client(&s), &store).await.unwrap().applied, 4);
+        assert_eq!(ids(&store.children("p").unwrap()), ["a", "z1", "y1"]);
+        assert!(store.queued_ops().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleted_parent_takes_moved_in_blocks_with_it() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a", "b", "c"]).await;
+        let orig_b = serde_json::to_value(store.get_block("b").unwrap().unwrap()).unwrap();
+        local_move_block(&store, "b", "a", None).unwrap().unwrap();
+        let d = local_delete_block(&store, "a").unwrap().unwrap();
+        let ops = store.queued_ops().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(
+            ops[0].kind,
+            OpKind::DeleteBlock {
+                block_id: "b".into()
+            }
+        );
+        assert_eq!(ops[0].base_raw.as_ref(), Some(&orig_b));
+        assert_eq!(
+            (ops[1].id, &ops[1].kind),
+            (
+                d,
+                &OpKind::DeleteBlock {
+                    block_id: "a".into()
+                }
+            )
+        );
+
+        // same under an unpushed local root: its create goes, b's delete stays
+        let x = local_create_block(
+            &store,
+            "p",
+            None,
+            BlockKind::Paragraph(serde_json::from_value(json!({ "rich_text": [] })).unwrap()),
+        )
+        .unwrap();
+        local_move_block(&store, "c", &x, None).unwrap().unwrap();
+        assert_eq!(local_delete_block(&store, &x).unwrap(), None);
+        assert_eq!(
+            queue(&store)[2..],
+            [OpKind::DeleteBlock {
+                block_id: "c".into()
+            }]
+        );
+        assert!(store.children("p").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_delete_fixes_parent_has_children() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a", "b"]).await;
+        local_move_block(&store, "b", "a", None).unwrap();
+        assert!(store.get_block("a").unwrap().unwrap().has_children);
+        local_delete_block(&store, "b").unwrap();
+        assert!(!store.get_block("a").unwrap().unwrap().has_children);
+    }
+
+    #[tokio::test]
+    async fn local_checked_on_unpushed_todo_rewrites_create() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &[]).await;
+        let todo = BlockKind::ToDo {
+            text: serde_json::from_value(json!({ "rich_text": [] })).unwrap(),
+            checked: false,
+        };
+        let t = local_create_block(&store, "p", None, todo).unwrap();
+        let create = store.queued_ops().unwrap()[0].id;
+        assert_eq!(local_set_checked(&store, &t, true).unwrap(), create);
+        let OpKind::CreateBlock { block, .. } = &queue(&store)[0] else {
+            panic!()
+        };
+        assert_eq!(queue(&store).len(), 1);
+        assert_eq!(block["to_do"]["checked"], true);
+    }
+
+    #[tokio::test]
+    async fn local_create_not_rewritten_past_a_later_move() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["g", "r"]).await;
+        let x = local_create_block(&store, "p", Some("r"), BlockKind::Divider).unwrap();
+        assert_eq!(local_move_block(&store, &x, "r", None).unwrap(), None); // Tab
+        assert!(local_move_block(&store, "r", "g", None).unwrap().is_some()); // Shift+Tab on r
+                                                                              // Shift+Tab on x: x's create runs before r's move, so it can't say "after r under g"
+        assert!(local_move_block(&store, &x, "g", Some("r"))
+            .unwrap()
+            .is_some());
+        let OpKind::CreateBlock { parent_id, .. } = &queue(&store)[0] else {
+            panic!()
+        };
+        assert_eq!(parent_id, "r");
+        assert_eq!(ids(&store.children("g").unwrap()), ["r", x.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn local_move_of_real_block_queues_move() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a", "b", "c"]).await;
+        let id = local_move_block(&store, "c", "a", None).unwrap().unwrap();
+        assert_eq!(ids(&store.children("p").unwrap()), ["a", "b"]);
+        assert_eq!(ids(&store.children("a").unwrap()), ["c"]);
+        assert!(store.get_block("a").unwrap().unwrap().has_children);
+        let op = &store.queued_ops().unwrap()[0];
+        assert_eq!(op.id, id);
+        assert_eq!(
+            op.kind,
+            OpKind::MoveBlock {
+                block_id: "c".into(),
+                new_parent_id: "a".into(),
+                after: None
+            }
+        );
+        assert!(op.base_last_edited_time.is_some());
+        assert!(local_move_block(&store, "a", "c", None).is_err());
+    }
+
+    #[tokio::test]
+    async fn locally_moved_block_survives_pull() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let c = client(&s);
+        let remote = |time: &'static str| {
+            let s = &s;
+            async move {
+                get(s, "/v1/pages/p", ok(page("p", pp("root"), time))).await;
+                get(
+                    s,
+                    "/v1/blocks/p/children",
+                    list(vec![
+                        blk("a", pp("p"), "A", T, true),
+                        blk("b", pp("p"), "B", T, true),
+                    ]),
+                )
+                .await;
+                get(
+                    s,
+                    "/v1/blocks/a/children",
+                    list(vec![
+                        blk("a1", bp("a"), "A1", T, true),
+                        blk("a2", bp("a"), "A2", T, false),
+                    ]),
+                )
+                .await;
+                get(
+                    s,
+                    "/v1/blocks/a1/children",
+                    list(vec![blk("a11", bp("a1"), "A11", T, false)]),
+                )
+                .await;
+                get(
+                    s,
+                    "/v1/blocks/b/children",
+                    list(vec![blk("b1", bp("b"), "B1", T, false)]),
+                )
+                .await;
+            }
+        };
+        remote(T).await;
+        pull_page(&c, &store, "p", false).await.unwrap();
+        s.reset().await;
+
+        // b's children are written before a's, so a stale a1 would win last
+        local_move_block(&store, "a1", "b", Some("b1")).unwrap();
+        local_edit_text(&store, "a1", "mine").unwrap();
+        local_move_block(&store, "b", "a", Some("a2")).unwrap();
+        remote(T2).await;
+        pull_page(&c, &store, "p", false).await.unwrap();
+        assert_eq!(ids(&store.children("p").unwrap()), ["a"]);
+        assert_eq!(ids(&store.children("a").unwrap()), ["a2", "b"]);
+        assert_eq!(ids(&store.children("b").unwrap()), ["b1", "a1"]);
+        assert_eq!(ids(&store.children("a1").unwrap()), ["a11"]);
+        assert_eq!(text(&store, "a1"), "mine");
+    }
+
+    #[tokio::test]
+    async fn pushed_move_lands_after_its_anchor() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let c = client(&s);
+        get(&s, "/v1/pages/p", ok(page("p", pp("root"), T))).await;
+        get(
+            &s,
+            "/v1/blocks/p/children",
+            list(vec![
+                blk("m", pp("p"), "M", T, false),
+                blk("t", pp("p"), "T", T, true),
+            ]),
+        )
+        .await;
+        get(
+            &s,
+            "/v1/blocks/t/children",
+            list(vec![
+                blk("t1", bp("t"), "T1", T, false),
+                blk("t2", bp("t"), "T2", T, false),
+            ]),
+        )
+        .await;
+        pull_page(&c, &store, "p", false).await.unwrap();
+        s.reset().await;
+
+        local_move_block(&store, "m", "t", Some("t1")).unwrap();
+        get(&s, "/v1/blocks/m", ok(blk("m", pp("p"), "M", T, false))).await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/t/children"))
+            .and(body_string_contains("\"after\":\"t1\""))
+            .respond_with(list(vec![blk("nm", bp("t"), "M", T2, false)]))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/blocks/m"))
+            .respond_with(ok(blk("m", pp("p"), "M", T2, false)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        assert_eq!(push(&c, &store).await.unwrap().applied, 1);
+        assert_eq!(ids(&store.children("t").unwrap()), ["t1", "nm", "t2"]);
+        assert_eq!(ids(&store.children("p").unwrap()), ["t"]);
     }
 }

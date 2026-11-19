@@ -2,6 +2,7 @@
 //! JSON in `raw`; the other columns exist for lookups and ordering.
 
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -49,6 +50,7 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        conn.busy_timeout(Duration::from_secs(5))?;
         // journal_mode returns a row, so it can't go through execute().
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -79,6 +81,15 @@ impl Store {
         self.get("SELECT raw FROM pages WHERE id = ?1", id)
     }
 
+    /// (id, title) of every cached page not in trash, ordered by title.
+    pub fn pages(&self) -> Result<Vec<(String, String)>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, title FROM pages WHERE in_trash = 0 ORDER BY title COLLATE NOCASE, id",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Makes `blocks` the full, ordered child list of `parent_id`; cached
     /// children not in `blocks` are dropped together with their subtrees, and
     /// listed blocks' cached content is overwritten. Callers must therefore
@@ -86,22 +97,23 @@ impl Store {
     /// level of a fetched tree top-down, or a moved block's descendants can be
     /// lost when its old parent is replaced.
     pub fn replace_children(&self, page_id: &str, parent_id: &str, blocks: &[Block]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        let keep: Vec<&str> = blocks.iter().map(|b| b.id.as_str()).collect();
-        let stale: Vec<String> = {
-            let mut st = tx.prepare("SELECT id FROM blocks WHERE parent_id = ?1")?;
-            let ids = st.query_map([parent_id], |r| r.get::<_, String>(0))?;
-            ids.filter(|id| !matches!(id, Ok(id) if keep.contains(&id.as_str())))
-                .collect::<rusqlite::Result<_>>()?
-        };
-        for id in &stale {
-            Self::delete_subtree(&tx, id)?;
-        }
-        for (i, b) in blocks.iter().enumerate() {
-            Self::write_block(&tx, b, page_id, parent_id, i as i64)?;
-        }
-        tx.commit()?;
-        Ok(())
+        self.atomic(|| {
+            let tx = &self.conn;
+            let keep: Vec<&str> = blocks.iter().map(|b| b.id.as_str()).collect();
+            let stale: Vec<String> = {
+                let mut st = tx.prepare("SELECT id FROM blocks WHERE parent_id = ?1")?;
+                let ids = st.query_map([parent_id], |r| r.get::<_, String>(0))?;
+                ids.filter(|id| !matches!(id, Ok(id) if keep.contains(&id.as_str())))
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for id in &stale {
+                Self::delete_subtree(tx, id)?;
+            }
+            for (i, b) in blocks.iter().enumerate() {
+                Self::write_block(tx, b, page_id, parent_id, i as i64)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn get_block(&self, id: &str) -> Result<Option<Block>> {
@@ -158,24 +170,139 @@ impl Store {
         Self::write_block(&self.conn, b, &page_id, &parent_id, position)
     }
 
+    /// Moves a cached block (with its subtree) under `new_parent` (a cached
+    /// page, else a cached block), right after its child `after`, or last if
+    /// `None`. Renumbers both parents' children, patches the raw `parent` and
+    /// fixes both parents' `has_children`. Moving a block into itself or its
+    /// own subtree is an error.
+    pub fn move_block_local(&self, id: &str, new_parent: &str, after: Option<&str>) -> Result<()> {
+        self.atomic(|| {
+        let tx = &self.conn;
+        let old_parent: String = tx
+            .query_row("SELECT parent_id FROM blocks WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .ok_or_else(|| Error::Invalid(format!("block {id} not cached")))?;
+        let cycle: bool = tx.query_row(
+            &format!("{SUBTREE} SELECT EXISTS(SELECT 1 FROM sub WHERE id = ?2)"),
+            [id, new_parent],
+            |r| r.get(0),
+        )?;
+        if cycle {
+            return Err(Error::Invalid(format!(
+                "cannot move block {id} into its own subtree"
+            )));
+        }
+        let is_page: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pages WHERE id = ?1)",
+            [new_parent],
+            |r| r.get(0),
+        )?;
+        let (parent, page_id) = if is_page {
+            (Parent::Page(new_parent.into()), new_parent.to_string())
+        } else {
+            let page_id: String = tx
+                .query_row(
+                    "SELECT page_id FROM blocks WHERE id = ?1",
+                    [new_parent],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::Invalid(format!("parent {new_parent} not cached")))?;
+            (Parent::Block(new_parent.into()), page_id)
+        };
+        let mut sibs: Vec<String> = Self::child_ids(tx, new_parent)?
+            .into_iter()
+            .filter(|s| s != id)
+            .collect();
+        let at = match after {
+            None => sibs.len(),
+            Some(a) => {
+                sibs.iter().position(|s| s == a).ok_or_else(|| {
+                    Error::Invalid(format!("{a} is not another child of {new_parent}"))
+                })? + 1
+            }
+        };
+        sibs.insert(at, id.to_string());
+
+        tx.execute(
+            "UPDATE blocks SET parent_id = ?2, raw = json_set(raw, '$.parent', json(?3)) WHERE id = ?1",
+            params![id, new_parent, serde_json::to_string(&parent)?],
+        )?;
+        tx.execute(
+            &format!("{SUBTREE} UPDATE blocks SET page_id = ?2 WHERE id IN (SELECT id FROM sub)"),
+            [id, &page_id],
+        )?;
+        Self::renumber(tx, &sibs)?;
+        if old_parent != new_parent {
+            Self::renumber(tx, &Self::child_ids(tx, &old_parent)?)?;
+        }
+        Self::refresh_has_children(tx, &old_parent)?;
+        Self::refresh_has_children(tx, new_parent)?;
+        Ok(())
+        })
+    }
+
+    /// `id` and the ids of every block below it.
+    pub(crate) fn subtree_ids(&self, id: &str) -> Result<Vec<String>> {
+        let mut st = self
+            .conn
+            .prepare(&format!("{SUBTREE} SELECT id FROM sub"))?;
+        let ids = st.query_map([id], |r| r.get(0))?;
+        Ok(ids.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Deletes a cached block and its subtree, and fixes the parent's `has_children`.
     pub fn delete_block(&self, id: &str) -> Result<()> {
-        Self::delete_subtree(&self.conn, id)
+        self.atomic(|| {
+            let parent: Option<String> = self
+                .conn
+                .query_row("SELECT parent_id FROM blocks WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            Self::delete_subtree(&self.conn, id)?;
+            match parent {
+                Some(p) => Self::refresh_has_children(&self.conn, &p),
+                None => Ok(()),
+            }
+        })
+    }
+
+    /// Runs `f` atomically: rolled back if it fails. Nests (uses a SAVEPOINT).
+    pub(crate) fn atomic<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("SAVEPOINT atomic")?;
+        match f() {
+            Ok(v) => {
+                self.conn.execute_batch("RELEASE atomic")?;
+                Ok(v)
+            }
+            Err(e) => {
+                // keep the original error; a failed rollback leaves nothing better to report
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO atomic; RELEASE atomic");
+                Err(e)
+            }
+        }
     }
 
     /// Re-keys a block (e.g. `local-<n>` → real id), keeping its children attached.
     pub fn rename_block(&self, old_id: &str, new_id: &str) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE blocks SET id = ?2, raw = json_set(raw, '$.id', ?2) WHERE id = ?1",
-            params![old_id, new_id],
-        )?;
-        tx.execute(
-            "UPDATE blocks SET parent_id = ?2, raw = json_set(raw, '$.parent.block_id', ?2)
+        self.atomic(|| {
+            let tx = &self.conn;
+            tx.execute(
+                "UPDATE blocks SET id = ?2, raw = json_set(raw, '$.id', ?2) WHERE id = ?1",
+                params![old_id, new_id],
+            )?;
+            tx.execute(
+                "UPDATE blocks SET parent_id = ?2, raw = json_set(raw, '$.parent.block_id', ?2)
              WHERE parent_id = ?1",
-            params![old_id, new_id],
-        )?;
-        tx.commit()?;
-        Ok(())
+                params![old_id, new_id],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn upsert_data_source(&self, d: &DataSource) -> Result<()> {
@@ -231,6 +358,36 @@ impl Store {
                 v.to_string()
             ],
         )?;
+        Ok(())
+    }
+
+    fn child_ids(conn: &Connection, parent_id: &str) -> Result<Vec<String>> {
+        let mut st =
+            conn.prepare("SELECT id FROM blocks WHERE parent_id = ?1 ORDER BY position")?;
+        let ids = st.query_map([parent_id], |r| r.get(0))?;
+        Ok(ids.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Sets `has_children` (column and raw) from the cached children. Pages
+    /// aren't in `blocks`, so a page id is a no-op.
+    fn refresh_has_children(conn: &Connection, id: &str) -> Result<()> {
+        conn.execute(
+            "UPDATE blocks SET has_children = EXISTS(SELECT 1 FROM blocks c WHERE c.parent_id = ?1),
+               raw = json_set(raw, '$.has_children', json(CASE WHEN EXISTS(
+                 SELECT 1 FROM blocks c WHERE c.parent_id = ?1) THEN 'true' ELSE 'false' END))
+             WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    fn renumber(conn: &Connection, ids: &[String]) -> Result<()> {
+        for (i, id) in ids.iter().enumerate() {
+            conn.execute(
+                "UPDATE blocks SET position = ?2 WHERE id = ?1",
+                params![id, i as i64],
+            )?;
+        }
         Ok(())
     }
 
@@ -435,6 +592,123 @@ mod tests {
         s.delete_block("x").unwrap();
         assert_eq!(s.get_block("x").unwrap(), None);
         assert_eq!(s.get_block("y").unwrap(), None);
+    }
+
+    #[test]
+    fn pages_sorted_by_title_without_trash() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_page(&page("p1", pp("r"), "Zeta")).unwrap();
+        s.upsert_page(&page("p2", pp("r"), "Alpha")).unwrap();
+        let mut gone = page("p3", pp("r"), "Beta");
+        gone.in_trash = true;
+        s.upsert_page(&gone).unwrap();
+        s.upsert_page(&page("p4", pp("r"), "beta")).unwrap();
+        assert_eq!(
+            s.pages().unwrap(),
+            [
+                ("p2".into(), "Alpha".into()),
+                ("p4".into(), "beta".into()),
+                ("p1".into(), "Zeta".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn atomic_rolls_back_and_nests() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_children("p", "p", &[block("a", pp("p"), "A")])
+            .unwrap();
+        let r: Result<()> = s.atomic(|| {
+            s.replace_children("p", "p", &[block("b", pp("p"), "B")])?; // nested
+            s.delete_block("b")?;
+            Err(Error::Invalid("boom".into()))
+        });
+        assert!(r.is_err());
+        assert_eq!(ids(&s.children("p").unwrap()), ["a"]);
+        s.atomic(|| s.delete_block("a")).unwrap();
+        assert!(s.children("p").unwrap().is_empty());
+    }
+
+    #[test]
+    fn busy_timeout_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("cache.db")).unwrap();
+        let ms: i64 = s
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, 5000);
+    }
+
+    #[test]
+    fn move_block_local_reorders_reparents_and_rejects_cycles() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_page(&page("p", pp("r"), "P")).unwrap();
+        s.upsert_page(&page("q", pp("r"), "Q")).unwrap();
+        let abc = ["a", "b", "c"].map(|i| block(i, pp("p"), i));
+        s.replace_children("p", "p", &abc).unwrap();
+        s.replace_children("p", "a", &[block("a1", bp("a"), "A1")])
+            .unwrap();
+        s.replace_children("p", "a1", &[block("a11", bp("a1"), "A11")])
+            .unwrap();
+        let col = |id: &str, c: &str| -> String {
+            s.conn
+                .query_row(
+                    &format!("SELECT {c} FROM blocks WHERE id = ?1"),
+                    [id],
+                    |r| r.get::<_, rusqlite::types::Value>(0),
+                )
+                .map(|v| format!("{v:?}"))
+                .unwrap()
+        };
+
+        // same-parent reorder
+        s.move_block_local("c", "p", None).unwrap();
+        assert_eq!(ids(&s.children("p").unwrap()), ["a", "b", "c"]);
+        s.move_block_local("c", "p", Some("a")).unwrap();
+        assert_eq!(ids(&s.children("p").unwrap()), ["a", "c", "b"]);
+
+        // into a block: old parent renumbered, has_children fixed on both
+        s.move_block_local("a1", "b", None).unwrap();
+        assert_eq!(ids(&s.children("b").unwrap()), ["a1"]);
+        assert!(s.children("a").unwrap().is_empty());
+        let a = s.get_block("a").unwrap().unwrap();
+        let b = s.get_block("b").unwrap().unwrap();
+        assert!(!a.has_children && b.has_children);
+        assert_eq!(col("a", "has_children"), "Integer(0)");
+        assert_eq!(col("b", "has_children"), "Integer(1)");
+        let a1 = s.get_block("a1").unwrap().unwrap();
+        assert_eq!(a1.parent, Parent::Block("b".into()));
+        assert_eq!(ids(&s.children("a1").unwrap()), ["a11"]);
+
+        // to another page: parent type flips, subtree page_id follows
+        s.move_block_local("b", "q", None).unwrap();
+        assert_eq!(
+            s.get_block("b").unwrap().unwrap().parent,
+            Parent::Page("q".into())
+        );
+        assert_eq!(col("a11", "page_id"), "Text(\"q\")");
+        assert_eq!(ids(&s.children("p").unwrap()), ["a", "c"]);
+        assert_eq!(col("c", "position"), "Integer(1)");
+
+        // errors: cycles, self, bad after, unknown parent / block
+        for (id, parent, after) in [
+            ("b", "b", None),
+            ("b", "a11", None),
+            ("a", "p", Some("a")),
+            ("a", "p", Some("b")),
+            ("a", "nowhere", None),
+            ("nope", "p", None),
+        ] {
+            assert!(
+                matches!(
+                    s.move_block_local(id, parent, after),
+                    Err(Error::Invalid(_))
+                ),
+                "{id} → {parent} after {after:?}"
+            );
+        }
+        assert_eq!(ids(&s.children("p").unwrap()), ["a", "c"]);
     }
 
     #[test]

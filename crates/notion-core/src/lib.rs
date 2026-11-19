@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod error;
+pub mod markdown;
 pub mod model;
 pub mod ops;
 pub mod store;

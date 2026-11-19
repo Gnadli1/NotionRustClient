@@ -104,3 +104,15 @@ sync worker thread: current-thread tokio runtime + Client + Store (connection #2
 2. Push: **manual Ctrl+S**, or automatic (e.g. 5 s after the last edit).
 3. Tab/Shift+Tab via copy-then-delete in this slice: **yes, in G3**, or defer.
 4. Blocks with mentions or equations: **read-only in the editor**, or editable at the risk of flattening the mention to plain text.
+
+## Known gaps after C1 (reviewed, deferred)
+
+1. **Markdown `*` closes an open italic first.** There are no flanking rules. Hand-typed `2 * 3 * 4` becomes italic, and `*a **b** c*` loses its bold. Text produced by `to_markdown` still round-trips.
+2. **Pull writes the remote `has_children`.** This can undo the local fix-up for a parent whose only children are pinned moved or local blocks. Push corrects it.
+3. **A create whose cached row was deleted by a parent's MoveBlock during the same push** isn't written back to the cache. It reappears on the post-push re-pull.
+4. **A panic inside `Store::atomic`** leaves its SAVEPOINT open.
+5. **Contrived chains can fail visibly on push and are marked Failed.** One example: move a real block into A, create after it, move the new block out, then delete A.
+6. **A `Failed` create for a deleted local block** stays in the queue.
+7. **`Store::pages()` also returns data-source rows.** The sidebar may want to filter them out.
+8. **Run splitting counts Rust `char`s.** It's unverified whether Notion's 2000-character limit is counted in UTF-16 units.
+9. **UNVERIFIED live:** annotated rich text in PATCH and append bodies, and copy-then-delete moves with `after`.

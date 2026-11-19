@@ -3,13 +3,17 @@
 //!
 //! Limitations: underline and colour are dropped; mentions and equations are
 //! written as their plain text (callers should treat such text as read-only,
-//! see [`is_markdown_editable`]); a code run containing a backtick is written as
-//! escaped plain text, so its `code` annotation is lost.
+//! see [`is_markdown_editable`]). Inside code spans only `\` and `` ` `` are
+//! escaped; in link URLs `(` and `)` are escaped too.
 
 use crate::model::{Annotations, RichText, RichTextKind};
 
 /// Notion's per-run character limit.
 const MAX_RUN: usize = 2000;
+/// Characters backslash-escaped in plain text.
+const ESCAPED: &[char] = &['\\', '*', '`', '~', '[', ']'];
+const CODE_ESCAPED: &[char] = &['\\', '`'];
+const URL_ESCAPED: &[char] = &['\\', '*', '`', '~', '[', ']', '(', ')'];
 
 #[derive(Debug, Clone, PartialEq, Default)]
 struct Style {
@@ -67,7 +71,7 @@ fn normalize(rt: &[RichText]) -> Vec<(String, Style)> {
             bold: a.bold,
             italic: a.italic,
             strike: a.strikethrough,
-            code: a.code && !text.contains('`'),
+            code: a.code,
         };
         match out.last_mut() {
             Some((t, s)) if *s == style => t.push_str(&text),
@@ -87,9 +91,9 @@ fn open_str(m: &Mark) -> &'static str {
     }
 }
 
-fn push_escaped(out: &mut String, s: &str, extra: &[char]) {
+fn push_escaped(out: &mut String, s: &str, set: &[char]) {
     for c in s.chars() {
-        if matches!(c, '\\' | '*' | '`' | '~' | '[' | ']') || extra.contains(&c) {
+        if set.contains(&c) {
             out.push('\\');
         }
         out.push(c);
@@ -100,7 +104,7 @@ fn close(out: &mut String, m: &Mark) {
     match m {
         Mark::Link(u) => {
             out.push_str("](");
-            push_escaped(out, u, &['(', ')']);
+            push_escaped(out, u, URL_ESCAPED);
             out.push(')');
         }
         m => out.push_str(open_str(m)),
@@ -120,11 +124,11 @@ pub fn to_markdown(rt: &[RichText]) -> String {
             out.push_str(open_str(m));
             open.push(m.clone());
         }
-        if style.code {
-            out.push_str(&text);
-        } else {
-            push_escaped(&mut out, &text, &[]);
-        }
+        push_escaped(
+            &mut out,
+            &text,
+            if style.code { CODE_ESCAPED } else { ESCAPED },
+        );
     }
     while let Some(m) = open.pop() {
         close(&mut out, &m);
@@ -134,9 +138,56 @@ pub fn to_markdown(rt: &[RichText]) -> String {
 
 enum Item {
     Ch(char),
+    Lit(&'static str),
     Code(String),
     Open(Mark),
     Close,
+}
+
+/// Closes the innermost open mark matching `want`; openers above it become
+/// literal text. Returns the closed opener's item index.
+///
+/// An empty span (closer right after its opener) is literal instead: the
+/// opener becomes text, the `closer` text is pushed if given and its index
+/// returned, else None (the caller emits the closer as text).
+fn close_mark(
+    items: &mut Vec<Item>,
+    stack: &mut Vec<(Mark, usize)>,
+    want: impl Fn(&Mark) -> bool,
+    closer: Option<&'static str>,
+) -> Option<usize> {
+    let pos = stack.iter().rposition(|(m, _)| want(m))?;
+    for (m, at) in stack.drain(pos + 1..) {
+        items[at] = Item::Lit(open_str(&m));
+    }
+    let (m, at) = stack.pop().unwrap();
+    if at + 1 == items.len() {
+        items[at] = Item::Lit(open_str(&m));
+        items.push(Item::Lit(closer?));
+    } else {
+        items.push(Item::Close);
+    }
+    Some(at)
+}
+
+/// Text from `i` up to the first unescaped `end` (a backslash escapes chars in
+/// `esc`); returns (text, index past `end`), or None if unterminated or empty.
+fn scan(cs: &[char], mut i: usize, end: char, esc: &[char]) -> Option<(String, usize)> {
+    let mut s = String::new();
+    while i < cs.len() {
+        match cs[i] {
+            '\\' if cs.get(i + 1).is_some_and(|n| esc.contains(n)) => {
+                s.push(cs[i + 1]);
+                i += 2;
+            }
+            c if c == end => return (!s.is_empty()).then_some((s, i + 1)),
+            c => {
+                s.push(c);
+                i += 1;
+            }
+        }
+    }
+    None
 }
 
 pub fn from_markdown(s: &str) -> Vec<RichText> {
@@ -144,88 +195,73 @@ pub fn from_markdown(s: &str) -> Vec<RichText> {
     let mut items: Vec<Item> = Vec::new();
     // (mark, index of its Open item)
     let mut stack: Vec<(Mark, usize)> = Vec::new();
-    let top = |st: &Vec<(Mark, usize)>| st.last().map(|(m, _)| m.clone());
     let mut i = 0;
     while i < cs.len() {
         let c = cs[i];
         let next = cs.get(i + 1).copied();
-        match c {
-            '\\' if next.is_some_and(|n| n.is_ascii_punctuation()) => {
-                items.push(Item::Ch(next.unwrap()));
+        let mark = match (c, next) {
+            ('\\', Some(n)) if ESCAPED.contains(&n) => {
+                items.push(Item::Ch(n));
                 i += 2;
                 continue;
             }
-            '`' => {
-                if let Some(end) = cs[i + 1..].iter().position(|&x| x == '`') {
-                    items.push(Item::Code(cs[i + 1..i + 1 + end].iter().collect()));
-                    i += end + 2;
-                    continue;
-                }
-            }
-            '*' => {
-                let (mark, n) = if top(&stack) == Some(Mark::Italic) {
-                    (Mark::Italic, 1)
-                } else if next == Some('*') {
-                    (Mark::Bold, 2)
-                } else {
-                    (Mark::Italic, 1)
-                };
-                if top(&stack) == Some(mark.clone()) {
-                    stack.pop();
-                    items.push(Item::Close);
-                } else {
-                    stack.push((mark.clone(), items.len()));
-                    items.push(Item::Open(mark));
-                }
-                i += n;
-                continue;
-            }
-            '~' if next == Some('~') => {
-                if top(&stack) == Some(Mark::Strike) {
-                    stack.pop();
-                    items.push(Item::Close);
-                } else {
-                    stack.push((Mark::Strike, items.len()));
-                    items.push(Item::Open(Mark::Strike));
-                }
-                i += 2;
-                continue;
-            }
-            '[' => {
-                stack.push((Mark::Link(String::new()), items.len()));
-                items.push(Item::Open(Mark::Link(String::new())));
-                i += 1;
-                continue;
-            }
-            ']' if matches!(top(&stack), Some(Mark::Link(_))) && next == Some('(') => {
-                if let Some((url, end)) = parse_url(&cs, i + 2) {
-                    let (_, at) = stack.pop().unwrap();
-                    items[at] = Item::Open(Mark::Link(url));
-                    items.push(Item::Close);
+            ('`', _) => {
+                if let Some((code, end)) = scan(&cs, i + 1, '`', CODE_ESCAPED) {
+                    items.push(Item::Code(code));
                     i = end;
                     continue;
                 }
+                None
             }
-            _ => {}
+            ('*', _) if matches!(stack.last(), Some((Mark::Italic, _))) => Some(Mark::Italic),
+            ('*', Some('*')) => Some(Mark::Bold),
+            ('*', _) => Some(Mark::Italic),
+            ('~', Some('~')) => Some(Mark::Strike),
+            ('[', _) => Some(Mark::Link(String::new())),
+            (']', Some('(')) => {
+                let url = scan(&cs, i + 2, ')', URL_ESCAPED);
+                if let Some((url, end)) = url {
+                    if let Some(at) =
+                        close_mark(&mut items, &mut stack, |m| matches!(m, Mark::Link(_)), None)
+                    {
+                        items[at] = Item::Open(Mark::Link(url));
+                        i = end;
+                        continue;
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+        match mark {
+            None => {
+                items.push(Item::Ch(c));
+                i += 1;
+            }
+            Some(m) => {
+                i += open_str(&m).len();
+                let is_link = matches!(m, Mark::Link(_));
+                if is_link
+                    || close_mark(&mut items, &mut stack, |x| *x == m, Some(open_str(&m))).is_none()
+                {
+                    stack.push((m.clone(), items.len()));
+                    items.push(Item::Open(m));
+                }
+            }
         }
-        items.push(Item::Ch(c));
-        i += 1;
     }
     // Unmatched openers are literal text.
     for (m, at) in stack {
-        let lit = open_str(&m);
-        items[at] = Item::Code(String::new()); // placeholder, replaced below
-        items.splice(at..=at, lit.chars().map(Item::Ch));
+        items[at] = Item::Lit(open_str(&m));
     }
 
     let mut runs: Vec<(String, Style)> = Vec::new();
     let mut active: Vec<Mark> = Vec::new();
-    let mut push = |c: &str, st: Style| match runs.last_mut() {
-        Some((t, s)) if *s == st => t.push_str(c),
-        _ => runs.push((c.to_string(), st)),
-    };
-    let style_of = |active: &[Mark]| {
-        let mut st = Style::default();
+    let mut push = |text: &str, code: bool, active: &[Mark]| {
+        let mut st = Style {
+            code,
+            ..Style::default()
+        };
         for m in active {
             match m {
                 Mark::Link(u) => st.link = Some(u.clone()),
@@ -235,17 +271,16 @@ pub fn from_markdown(s: &str) -> Vec<RichText> {
                 Mark::Code => st.code = true,
             }
         }
-        st
+        match runs.last_mut() {
+            Some((t, s)) if *s == st => t.push_str(text),
+            _ => runs.push((text.to_string(), st)),
+        }
     };
     for it in items {
         match it {
-            Item::Ch(c) => push(c.encode_utf8(&mut [0; 4]), style_of(&active)),
-            Item::Code(t) if !t.is_empty() => {
-                let mut st = style_of(&active);
-                st.code = true;
-                push(&t, st);
-            }
-            Item::Code(_) => {}
+            Item::Ch(c) => push(c.encode_utf8(&mut [0; 4]), false, &active),
+            Item::Lit(s) => push(s, false, &active),
+            Item::Code(t) => push(&t, true, &active),
             Item::Open(m) => active.push(m),
             Item::Close => {
                 active.pop();
@@ -271,25 +306,6 @@ pub fn from_markdown(s: &str) -> Vec<RichText> {
             })
             .collect(),
     )
-}
-
-/// URL after `](`, honouring backslash escapes; returns (url, index past `)`).
-fn parse_url(cs: &[char], mut i: usize) -> Option<(String, usize)> {
-    let mut url = String::new();
-    while i < cs.len() {
-        match cs[i] {
-            '\\' if i + 1 < cs.len() => {
-                url.push(cs[i + 1]);
-                i += 2;
-            }
-            ')' => return Some((url, i + 1)),
-            c => {
-                url.push(c);
-                i += 1;
-            }
-        }
-    }
-    None
 }
 
 /// False if any run is a mention or equation (Markdown would flatten it).
@@ -350,100 +366,152 @@ mod tests {
     fn p(t: &str) -> RichText {
         rt(t, None, false, false, false, false)
     }
+    fn b(t: &str) -> RichText {
+        rt(t, None, true, false, false, false)
+    }
+    fn i(t: &str) -> RichText {
+        rt(t, None, false, true, false, false)
+    }
+    fn bi(t: &str) -> RichText {
+        rt(t, None, true, true, false, false)
+    }
+    fn code(t: &str) -> RichText {
+        rt(t, None, false, false, false, true)
+    }
 
+    /// Canonical (merged, default colour) rich text survives exactly.
     #[test]
-    fn round_trips() {
-        let mut underlined = rt("u", None, true, false, false, false);
-        underlined.annotations.underline = true;
-        underlined.annotations.color = "red".into();
+    fn round_trips_exactly() {
         let cases: Vec<Vec<RichText>> = vec![
             vec![p("plain text")],
-            vec![p("a "), rt("bold", None, true, false, false, false), p(" b")],
-            vec![rt("bi", None, true, true, false, false)],
+            vec![p("a "), b("bold"), p(" b")],
+            vec![bi("bi")],
+            vec![p("x "), b("bold"), bi("both"), b("bold")],
             vec![
-                p("x "),
-                rt("bold", None, true, false, false, false),
-                rt("both", None, true, true, false, false),
-                rt("bold", None, true, false, false, false),
+                rt(
+                    "go ",
+                    Some("http://e.com/a_(b)"),
+                    false,
+                    false,
+                    false,
+                    false,
+                ),
+                rt(
+                    "here",
+                    Some("http://e.com/a_(b)"),
+                    true,
+                    false,
+                    false,
+                    false,
+                ),
             ],
+            vec![code("a*b"), p(" x")],
+            vec![code(r"a`b\c``"), p(" x")],
+            vec![p(r"lit * [x] \ ` ~ ~~ ** end \n C:\path (y)")],
+            vec![b("b"), i("i")],
+            vec![i("i"), b("b")],
+            vec![i("i"), bi("bi")],
+            vec![bi("bi"), i("i")],
+            vec![bi("bi"), b("b")],
+            vec![b("b"), bi("bi")],
+            vec![rt("lb", Some("u"), true, false, false, false), b("b")],
             vec![
-                rt("go ", Some("http://e.com/a_(b)"), false, false, false, false),
-                rt("here", Some("http://e.com/a_(b)"), true, false, false, false),
-            ],
-            vec![rt("a*b", None, false, false, false, true), p(" x")],
-            vec![p(r"lit * [x] \ ` ~ ~~ ** end")],
-            vec![
-                rt("b", None, true, false, false, false),
-                rt("i", None, false, true, false, false),
-            ],
-            vec![
-                rt("i", None, false, true, false, false),
-                rt("bi", None, true, true, false, false),
-            ],
-            vec![
-                rt("bi", None, true, true, false, false),
-                rt("i", None, false, true, false, false),
-            ],
-            vec![
-                rt("lb", Some("u"), true, false, false, false),
-                rt("b", None, true, false, false, false),
+                rt("a", Some("u1"), false, false, false, false),
+                rt("b", Some("u2"), false, false, false, false),
             ],
             vec![
                 rt("s", None, false, false, true, false),
                 rt("si", None, false, true, true, false),
                 rt("c", None, true, false, true, true),
             ],
-            vec![p("a"), p("b"), underlined],
+            vec![rt("all", Some("u"), true, true, true, true), p("\nline 2")],
+            vec![rt("bc", None, true, false, false, true), code("c")],
         ];
-        let key = |v: &[RichText]| normalize(v);
         for c in cases {
             let md = to_markdown(&c);
-            let back = from_markdown(&md);
-            assert_eq!(key(&back), key(&c), "markdown: {md}");
-            for r in &back {
-                let RichTextKind::Text { content, link } = &r.kind else {
-                    panic!()
-                };
-                assert_eq!((&r.plain_text, &r.href), (content, link));
-            }
+            assert_eq!(from_markdown(&md), c, "markdown: {md}");
         }
+    }
+
+    #[test]
+    fn drops_underline_colour_and_merges() {
+        let mut u = b("u");
+        u.annotations.underline = true;
+        u.annotations.color = "red".into();
+        let md = to_markdown(&[p("a"), p("b"), b("x"), u]);
+        assert_eq!(md, "ab**xu**");
+        assert_eq!(from_markdown(&md), vec![p("ab"), b("xu")]);
     }
 
     #[test]
     fn parses_exact_runs() {
         assert_eq!(
             from_markdown("a **b *c* d** e"),
-            vec![
-                p("a "),
-                rt("b ", None, true, false, false, false),
-                rt("c", None, true, true, false, false),
-                rt(" d", None, true, false, false, false),
-                p(" e"),
-            ]
+            vec![p("a "), b("b "), bi("c"), b(" d"), p(" e")]
         );
         assert_eq!(
             from_markdown("[x](http://y)"),
             vec![rt("x", Some("http://y"), false, false, false, false)]
         );
-        assert_eq!(
-            from_markdown("`a*b`"),
-            vec![rt("a*b", None, false, false, false, true)]
-        );
+        assert_eq!(from_markdown("`a*b`"), vec![code("a*b")]);
         assert_eq!(from_markdown("**unclosed"), vec![p("**unclosed")]);
         assert_eq!(from_markdown(r"\*x\* [y"), vec![p("*x* [y")]);
         assert_eq!(
             from_markdown("~~s~~ `open"),
             vec![rt("s", None, false, false, true, false), p(" `open")]
         );
+        // unmatched openers stay literal, in place
+        assert_eq!(from_markdown("~~a *b"), vec![p("~~a *b")]);
+        // an unmatched inner opener doesn't block the outer close
+        assert_eq!(from_markdown("**a [b] c**"), vec![b("a [b] c")]);
+        // `*` closes an open italic first: `**` here is close + reopen
+        assert_eq!(from_markdown("*a **b* c"), vec![i("a b"), p(" c")]);
+        // empty link URL / empty code span are literal
+        assert_eq!(from_markdown("[x]()"), vec![p("[x]()")]);
+        assert_eq!(from_markdown("a``b"), vec![p("a``b")]);
+        // empty spans don't swallow what was typed
+        for lit in ["****", "~~~~", "[](u)", "a ** b", "******"] {
+            assert_eq!(from_markdown(lit), vec![p(lit)], "{lit}");
+        }
+        assert_eq!(from_markdown("**a****b**"), vec![b("ab")]); // close + reopen
+                                                                // backslash only escapes what to_markdown escapes
+        assert_eq!(from_markdown(r"C:\path \( \\"), vec![p(r"C:\path \( \")]);
+        assert_eq!(from_markdown("single ~ tilde"), vec![p("single ~ tilde")]);
     }
 
     #[test]
-    fn backtick_code_falls_back_and_long_runs_split() {
-        let c = rt("a`b", None, false, false, false, true);
-        assert_eq!(from_markdown(&to_markdown(&[c])), vec![p("a`b")]);
+    fn markdown_is_stable() {
+        let nasty = [
+            "**a *b** c*",
+            "***x***y*",
+            "**a*b**",
+            "~~a **b~~ c**",
+            "[a **b](u) c**",
+            "[a [b](u)](v)",
+            "[x](u",
+            "`a\\`b` \\",
+            "*a* **b** ~~c~~ `d` [e](f)",
+            "****",
+            "*",
+            "~~~",
+            "]][[",
+            "\\",
+            "a\nb **c\nd**",
+        ];
+        for s in nasty {
+            let m = to_markdown(&from_markdown(s));
+            assert_eq!(to_markdown(&from_markdown(&m)), m, "input: {s}");
+        }
+    }
+
+    #[test]
+    fn long_runs_split() {
         let long = from_markdown(&"x".repeat(4500));
         let lens: Vec<usize> = long.iter().map(|r| r.plain_text.len()).collect();
         assert_eq!(lens, [2000, 2000, 500]);
+        let long = from_markdown(&format!("**{}**", "é".repeat(2001)));
+        assert_eq!(long.len(), 2);
+        assert!(long.iter().all(|r| r.annotations.bold));
     }
 
     #[test]
@@ -452,5 +520,10 @@ mod tests {
         let mut m = p("@bob");
         m.kind = RichTextKind::Mention(serde_json::json!({ "type": "user" }));
         assert!(!is_markdown_editable(&[p("x"), m]));
+        let mut e = p("x^2");
+        e.kind = RichTextKind::Equation {
+            expression: "x^2".into(),
+        };
+        assert!(!is_markdown_editable(&[e]));
     }
 }

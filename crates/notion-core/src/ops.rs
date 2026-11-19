@@ -175,6 +175,36 @@ impl Store {
         Ok(())
     }
 
+    /// Replaces an op's kind (and payload) in place, keeping its queue position.
+    pub fn update_op_kind(&self, id: i64, kind: &OpKind) -> Result<()> {
+        let payload = serde_json::to_value(kind)?;
+        self.conn.execute(
+            "UPDATE ops SET kind = ?2, target_id = ?3, payload = ?4 WHERE id = ?1",
+            params![
+                id,
+                payload["kind"].as_str(),
+                kind.target_id(),
+                payload.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The queued CreateBlock op that creates the block `local_id`, if any.
+    pub fn queued_create_for(&self, local_id: &str) -> Result<Option<Op>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, payload, base_last_edited_time, base_raw, status, error, created_at
+                 FROM ops WHERE status = 'queued' AND kind = 'create_block'
+                   AND json_extract(payload, '$.block.id') = ?1",
+                [local_id],
+                read_row,
+            )
+            .optional()?;
+        row.map(to_op).transpose()
+    }
+
     pub fn map_id(&self, local_id: &str, remote_id: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO id_map (local_id, remote_id) VALUES (?1, ?2)",
@@ -307,6 +337,43 @@ mod tests {
         assert!(s.ops_by_status(OpStatus::Failed).unwrap().is_empty());
         assert!(s.ops_by_status(OpStatus::Conflict).unwrap().is_empty());
         assert!(s.queued_ops().unwrap().is_empty());
+    }
+
+    #[test]
+    fn update_kind_and_find_create() {
+        let s = Store::open_in_memory().unwrap();
+        let create = |parent: &str| OpKind::CreateBlock {
+            parent_id: parent.into(),
+            after: None,
+            block: json!({ "id": "local-1", "type": "divider" }),
+        };
+        let other = s
+            .enqueue(
+                OpKind::DeleteBlock {
+                    block_id: "local-1".into(),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        let id = s.enqueue(create("p"), None, None).unwrap();
+        assert_eq!(s.queued_create_for("local-2").unwrap(), None);
+        assert_eq!(s.queued_create_for("local-1").unwrap().unwrap().id, id);
+
+        s.update_op_kind(id, &create("q")).unwrap();
+        let ops = s.queued_ops().unwrap();
+        assert_eq!((ops[0].id, ops[1].id), (other, id));
+        assert_eq!(ops[1].kind, create("q"));
+        let target: String = s
+            .conn
+            .query_row("SELECT target_id FROM ops WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(target, "q");
+
+        s.mark_op(id, OpStatus::Failed, None).unwrap();
+        assert_eq!(s.queued_create_for("local-1").unwrap(), None);
     }
 
     #[test]
