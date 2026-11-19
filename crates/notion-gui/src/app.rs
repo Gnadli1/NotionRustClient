@@ -43,7 +43,15 @@ pub enum Message {
     EditorAction(text_editor::Action),
     /// A key the row editor hands to the app.
     EditKey(EditKey),
+    /// ☐/☑ clicked.
+    ToggleCheck(String),
+    /// Ctrl+K
+    FocusSearch,
+    /// Esc anywhere: back from the search box to the outline.
+    SearchEscape,
 }
+
+const SEARCH_ID: &str = "search";
 
 pub struct State {
     store: Store,
@@ -224,6 +232,17 @@ impl Drop for State {
 
 pub fn update(s: &mut State, msg: Message) -> Task<Message> {
     match msg {
+        // a push is modal: the worker may already have sent the ops an edit
+        // would rewrite
+        Message::Focus(_)
+        | Message::EditorAction(_)
+        | Message::EditKey(_)
+        | Message::ToggleCheck(_)
+        | Message::FocusSearch
+        | Message::SearchEscape
+        | Message::Open(_)
+        | Message::PickResult(_)
+            if s.pushing() => {}
         Message::Open(id) => {
             if !s.leave() {
                 return Task::none();
@@ -240,8 +259,10 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             }
         }
         Message::Push => {
-            s.commit();
-            s.send(Cmd::Push);
+            // a failed commit keeps the editor; pushing now would lose the text
+            if s.commit() {
+                s.send(Cmd::Push);
+            }
         }
         Message::SearchInput(q) => s.search = q,
         Message::SearchSubmit => {
@@ -261,7 +282,23 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             s.pending_open = Some(id.clone());
             s.send(Cmd::Pull { id, force: false });
         }
-        Message::Focus(_) | Message::EditorAction(_) | Message::EditKey(_) if s.pushing() => {}
+        Message::ToggleCheck(id) => return toggle_check(s, &id),
+        Message::FocusSearch => {
+            s.commit();
+            return Task::batch([
+                operation::focus(SEARCH_ID),
+                operation::select_all(SEARCH_ID),
+            ]);
+        }
+        Message::SearchEscape => {
+            return if s.editing.is_some() {
+                operation::focus(EDITOR_ID)
+            } else {
+                iced::advanced::widget::operate(
+                    iced::advanced::widget::operation::focusable::unfocus(),
+                )
+            };
+        }
         Message::Focus(id) => return s.focus(&id),
         Message::EditorAction(a) => {
             if let Some(e) = &mut s.editing {
@@ -335,7 +372,9 @@ fn on_edit_key(s: &mut State, k: EditKey) -> Task<Message> {
             }
         }
         KeyAction::NewBlockAfter => {
-            s.commit();
+            if !s.commit() {
+                return Task::none();
+            }
             // commit may have resolved the id and rebuilt the rows
             let Some(row) = s.editing_row().cloned() else {
                 return Task::none();
@@ -387,12 +426,70 @@ fn on_edit_key(s: &mut State, k: EditKey) -> Task<Message> {
         KeyAction::Leave => {
             s.leave();
         }
+        KeyAction::Indent => return move_editing(s, outline::indent_target),
+        KeyAction::Outdent => return move_editing(s, outline::outdent_target),
+        KeyAction::ToggleCheck => return toggle_check(s, &id),
     }
     Task::none()
 }
 
-/// Ctrl+R pull, Ctrl+Shift+R force pull, Ctrl+S push. Sees events even when a
-/// widget (the search box) captured them.
+type Target = fn(&[Row], usize) -> Option<(String, Option<String>)>;
+
+/// Tab / Shift+Tab: commit, then move the edited block to `target`. Focus
+/// stays on it; its id only changes on push.
+fn move_editing(s: &mut State, target: Target) -> Task<Message> {
+    if !s.commit() {
+        return Task::none();
+    }
+    let Some(id) = s.editing.as_ref().map(|e| e.block_id.clone()) else {
+        return Task::none();
+    };
+    let Some(idx) = s.rows.iter().position(|r| r.block_id == id) else {
+        return Task::none();
+    };
+    let Some((parent, after)) = target(&s.rows, idx) else {
+        return Task::none();
+    };
+    // push would refuse it anyway (copy-then-delete can't recreate these)
+    if let Some(m) = outline::unmovable_in_subtree(&s.rows, idx) {
+        s.last_error = Some(format!("can't move: its subtree contains {}", m.label()));
+        return Task::none();
+    }
+    if let Err(e) = sync::local_move_block(&s.store, &id, &parent, after.as_deref()) {
+        s.last_error = Some(e.to_string());
+    }
+    s.refresh();
+    operation::focus(EDITOR_ID)
+}
+
+/// Ctrl+Enter or a click on ☐/☑: commit, then flip the to-do. No-op otherwise.
+fn toggle_check(s: &mut State, id: &str) -> Task<Message> {
+    if !s.commit() {
+        return Task::none();
+    }
+    let Some(Marker::Todo(checked)) = s.rows.iter().find(|r| r.block_id == id).map(|r| &r.marker)
+    else {
+        return Task::none();
+    };
+    let checked = *checked;
+    let res = s
+        .store
+        .resolve_id(id)
+        .and_then(|id| sync::local_set_checked(&s.store, &id, !checked));
+    if let Err(e) = res {
+        s.last_error = Some(e.to_string());
+    }
+    s.refresh();
+    if s.editing.is_some() {
+        operation::focus(EDITOR_ID)
+    } else {
+        Task::none()
+    }
+}
+
+/// Ctrl+R pull, Ctrl+Shift+R force pull, Ctrl+S push, Ctrl+K search, Esc
+/// back to the outline. Sees events even when a widget captured them (an Esc
+/// the editor also handles is harmless: it refocuses or unfocuses).
 fn shortcut(ev: iced::Event, _: event::Status, _: iced::window::Id) -> Option<Message> {
     let iced::Event::Keyboard(keyboard::Event::KeyPressed {
         key,
@@ -403,13 +500,16 @@ fn shortcut(ev: iced::Event, _: event::Status, _: iced::window::Id) -> Option<Me
     else {
         return None;
     };
-    let Key::Character(c) = key.as_ref() else {
-        return None;
+    let c = match key.as_ref() {
+        Key::Named(keyboard::key::Named::Escape) if modifiers.is_empty() => {
+            return Some(Message::SearchEscape)
+        }
+        Key::Character(c) if modifiers.command() => c,
+        _ => return None,
     };
-    if !modifiers.command() {
-        return None;
-    }
-    if c.eq_ignore_ascii_case("r") {
+    if c.eq_ignore_ascii_case("k") {
+        Some(Message::FocusSearch)
+    } else if c.eq_ignore_ascii_case("r") {
         Some(Message::Pull {
             force: modifiers.shift(),
         })
@@ -482,12 +582,20 @@ fn row_view<'a>(r: &'a Row, editing: Option<&'a Editing>) -> Element<'a, Message
         let body: Element<_> = if label.is_empty() {
             editor.into()
         } else {
-            row![text(label).size(size), editor].spacing(6).into()
+            let marker = mouse_area(text(label).size(size))
+                .on_press(Message::ToggleCheck(r.block_id.clone()));
+            row![marker, editor].spacing(6).into()
         };
         return container(body).padding(indent).into();
     }
     let mut spans: Vec<Span<'_, ()>> = Vec::new();
-    if !label.is_empty() {
+    // to-do box is its own click target; it captures the press, so the
+    // row's Focus doesn't fire too
+    let todo = matches!(r.marker, Marker::Todo(_)).then(|| {
+        mouse_area(text(label.clone()).size(size))
+            .on_press(Message::ToggleCheck(r.block_id.clone()))
+    });
+    if todo.is_none() && !label.is_empty() {
         let sep = if matches!(r.marker, Marker::Code(_)) {
             "\n"
         } else {
@@ -496,9 +604,11 @@ fn row_view<'a>(r: &'a Row, editing: Option<&'a Editing>) -> Element<'a, Message
         spans.push(span(format!("{label}{sep}")).color_maybe(grey.then_some(GREY)));
     }
     spans.extend(r.rich_text.iter().map(styled));
-    let body = container(rich_text(spans).size(size))
-        .padding(indent)
-        .width(Fill);
+    let content: Element<_> = match todo {
+        Some(t) => row![t, rich_text(spans).size(size)].spacing(6).into(),
+        None => rich_text(spans).size(size).into(),
+    };
+    let body = container(content).padding(indent).width(Fill);
     if r.editable {
         mouse_area(body)
             .on_press(Message::Focus(r.block_id.clone()))
@@ -509,7 +619,8 @@ fn row_view<'a>(r: &'a Row, editing: Option<&'a Editing>) -> Element<'a, Message
 }
 
 pub fn view(s: &State) -> Element<'_, Message> {
-    let mut side = column![text_input("Search Notion…", &s.search)
+    let mut side = column![text_input("Search Notion… (Ctrl+K)", &s.search)
+        .id(SEARCH_ID)
         .on_input(Message::SearchInput)
         .on_submit(Message::SearchSubmit)]
     .spacing(4)
@@ -742,6 +853,152 @@ mod tests {
         assert!(!row.rich_text[0].annotations.italic);
     }
 
+    fn depth(s: &State, id: &str) -> usize {
+        s.rows.iter().find(|r| r.block_id == id).unwrap().depth
+    }
+
+    fn kinds(s: &State) -> Vec<String> {
+        s.store
+            .queued_ops()
+            .unwrap()
+            .iter()
+            .map(|o| {
+                serde_json::to_value(&o.kind).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tab_and_shift_tab_move_the_block_and_keep_focus() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("c".into()));
+        up(&mut s, Message::EditKey(EditKey::Outdent));
+        assert_eq!(ids(&s), vec!["a", "c", "img", "m", "b"]);
+        assert_eq!(depth(&s, "c"), 0);
+        assert_eq!(editing(&s), Some("c"));
+        up(&mut s, Message::EditKey(EditKey::Outdent));
+        assert_eq!(depth(&s, "c"), 0, "top level: no-op");
+
+        up(&mut s, Message::EditKey(EditKey::Indent));
+        assert_eq!(depth(&s, "c"), 1);
+        assert_eq!(s.rows[1].parent, "a");
+        assert_eq!(editing(&s), Some("c"));
+        assert!(
+            kinds(&s).iter().all(|k| k == "move_block"),
+            "{:?}",
+            kinds(&s)
+        );
+
+        up(&mut s, Message::Focus("a".into()));
+        up(&mut s, Message::EditKey(EditKey::Indent));
+        assert_eq!(depth(&s, "a"), 0, "first block: no previous sibling");
+    }
+
+    #[test]
+    fn move_is_refused_for_unmovable_subtrees() {
+        use crate::outline::tests::blk;
+        for (t, payload) in [
+            ("image", json!({ "type": "external" })),
+            ("child_page", json!({ "title": "Sub" })),
+        ] {
+            let (mut s, _rx) = editing_state();
+            s.store
+                .replace_children("pg", "b", &[blk("u", "b", t, payload)])
+                .unwrap();
+            s.refresh();
+            up(&mut s, Message::Focus("b".into()));
+            up(&mut s, Message::EditKey(EditKey::Indent));
+            assert_eq!(depth(&s, "b"), 0, "{t}");
+            assert!(s.store.queued_ops().unwrap().is_empty());
+            assert!(s.last_error.as_deref().unwrap().contains("can't move"));
+        }
+    }
+
+    #[test]
+    fn ctrl_enter_and_click_toggle_todos_only() {
+        use crate::outline::tests::{blk, rt};
+        let (mut s, _rx) = editing_state();
+        s.store
+            .replace_children(
+                "pg",
+                "b",
+                &[blk(
+                    "t",
+                    "b",
+                    "to_do",
+                    json!({ "rich_text": rt("t"), "checked": false }),
+                )],
+            )
+            .unwrap();
+        s.refresh();
+        let marker = |s: &State| {
+            s.rows
+                .iter()
+                .find(|r| r.block_id == "t")
+                .unwrap()
+                .marker
+                .clone()
+        };
+
+        up(&mut s, Message::Focus("t".into()));
+        type_text(&mut s, "!");
+        up(&mut s, Message::EditKey(EditKey::ToggleCheck));
+        assert_eq!(marker(&s), Marker::Todo(true));
+        assert_eq!(editing(&s), Some("t"));
+        assert_eq!(
+            kinds(&s),
+            vec!["update_block"; 2],
+            "commit, then the checkbox"
+        );
+        let t = s.store.get_block("t").unwrap().unwrap();
+        assert_eq!(
+            notion_core::model::plain_text(&t.kind.text().unwrap().rich_text),
+            "t!"
+        );
+
+        up(&mut s, Message::EditKey(EditKey::Escape));
+        up(&mut s, Message::ToggleCheck("t".into()));
+        assert_eq!(marker(&s), Marker::Todo(false), "click on the box");
+
+        let before = s.store.queued_ops().unwrap().len();
+        up(&mut s, Message::Focus("a".into()));
+        up(&mut s, Message::EditKey(EditKey::ToggleCheck));
+        up(&mut s, Message::ToggleCheck("a".into()));
+        assert_eq!(s.store.queued_ops().unwrap().len(), before, "not a to-do");
+    }
+
+    #[test]
+    fn failed_commit_blocks_push_and_new_block() {
+        let (mut s, mut rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        type_text(&mut s, "x");
+        s.store.delete_block("b").unwrap();
+        up(&mut s, Message::EditKey(EditKey::Enter));
+        assert!(
+            !ids(&s).iter().any(|i| i.starts_with("local-")),
+            "(b) no block created"
+        );
+
+        up(&mut s, Message::Focus("a".into()));
+        type_text(&mut s, "y");
+        s.store.delete_block("a").unwrap();
+        up(&mut s, Message::Push);
+        assert!(rx.try_recv().is_err(), "(a) push not sent");
+
+        // (a) Open and PickResult are ignored mid-push
+        s.store.replace_children("pg", "pg", &[]).unwrap();
+        up(&mut s, Message::Push);
+        assert!(s.pushing());
+        up(&mut s, Message::Open("other".into()));
+        up(&mut s, Message::PickResult("other".into()));
+        assert_eq!(s.current.as_deref(), Some("pg"));
+        assert_eq!(rx.try_recv().unwrap(), Cmd::Push);
+        assert!(rx.try_recv().is_err());
+    }
+
     #[test]
     fn push_is_modal() {
         let (mut s, mut rx) = editing_state();
@@ -943,6 +1200,7 @@ mod tests {
         ));
         assert!(matches!(k("s", true, false), Some(Message::Push)));
         assert!(k("s", false, false).is_none());
+        assert!(matches!(k("k", true, false), Some(Message::FocusSearch)));
         let mut held = key("s", true, false);
         if let iced::Event::Keyboard(keyboard::Event::KeyPressed { repeat, .. }) = &mut held {
             *repeat = true;

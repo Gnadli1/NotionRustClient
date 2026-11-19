@@ -1526,6 +1526,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_after_two_moves_goes_to_final_copy() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a", "b", "m"]).await;
+        // Tab, Shift+Tab, then an edit
+        local_move_block(&store, "m", "a", None).unwrap().unwrap();
+        local_move_block(&store, "m", "p", Some("a"))
+            .unwrap()
+            .unwrap();
+        local_edit_text(&store, "m", "edited").unwrap();
+
+        get(&s, "/v1/blocks/m", ok(blk("m", pp("p"), "m", T, false))).await;
+        get(&s, "/v1/blocks/m1", ok(blk("m1", bp("a"), "m", T2, false))).await;
+        get(&s, "/v1/blocks/m2", ok(blk("m2", pp("p"), "m", T2, false))).await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/a/children"))
+            .respond_with(list(vec![blk("m1", bp("a"), "m", T2, false)]))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/p/children"))
+            .respond_with(list(vec![blk("m2", pp("p"), "m", T2, false)]))
+            .expect(1)
+            .mount(&s)
+            .await;
+        for id in ["m", "m1"] {
+            Mock::given(method("DELETE"))
+                .and(path(format!("/v1/blocks/{id}")))
+                .respond_with(ok(blk(id, pp("p"), "m", T2, false)))
+                .expect(1)
+                .mount(&s)
+                .await;
+        }
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/m2"))
+            .and(body_string_contains("edited"))
+            .respond_with(ok(blk("m2", pp("p"), "edited", T2, false)))
+            .expect(1)
+            .mount(&s)
+            .await;
+
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!(
+            r,
+            PushReport {
+                applied: 3,
+                conflicts: 0,
+                failed: 0
+            }
+        );
+        assert_eq!(store.resolve_id("m").unwrap(), "m2");
+        assert_eq!(text(&store, "m2"), "edited");
+        s.verify().await;
+    }
+
+    #[tokio::test]
     async fn pull_data_source_upserts_changed_rows() {
         let s = MockServer::start().await;
         let store = Store::open_in_memory().unwrap();

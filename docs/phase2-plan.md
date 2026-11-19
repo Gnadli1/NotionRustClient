@@ -126,3 +126,9 @@ sync worker thread: current-thread tokio runtime + Client + Store (connection #2
 5. **Push is modal.** Editing is frozen until the push returns.
 6. **Remote delete during an edit.** If a pull finds the block being edited was deleted remotely, the typed text is discarded and the status bar shows a message about it.
 7. **A commit after a pull that lands mid-edit isn't checked for conflicts** against that pull.
+
+## Known gaps after G3 (reviewed, deferred)
+
+1. **Outdent leaves the following siblings under the old parent.** The block lands right after its parent, as the spec says. Notion's own UI adopts the siblings instead.
+2. **A heading can be a Tab target only if it already shows children.** Rows don't carry `is_toggleable`.
+3. **Every indent or outdent is copy-then-delete on push.** The block gets a new id and loses its comments and backlinks. Moving a block twice before pushing copies it twice.

@@ -5,7 +5,8 @@ version.workspace = true
 
 [dependencies]
 notion-core = { path = "../notion-core" }
-iced.workspace = true
+# advanced: widget operations (unfocus); a feature, no extra crates
+iced = { workspace = true, features = ["advanced"] }
 tokio.workspace = true
 
 [dev-dependencies]

@@ -19,12 +19,18 @@ pub enum EditKey {
     Enter,
     Backspace,
     Escape,
+    /// Tab
+    Indent,
+    /// Shift+Tab
+    Outdent,
+    /// Ctrl+Enter
+    ToggleCheck,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Route {
     App(EditKey),
-    /// Eaten: Tab, Shift+Tab and Ctrl+Enter are G3's.
+    /// Eaten (Alt+Enter, Ctrl+Tab): no stray newline or tab character.
     Swallow,
     /// text_editor's default binding.
     Default,
@@ -36,8 +42,11 @@ pub fn route(key: &Key, m: Modifiers) -> Route {
     };
     let plain = m.is_empty();
     match named {
-        Named::Tab => Route::Swallow,
-        Named::Enter if m.command() || m.alt() => Route::Swallow,
+        Named::Tab if m.command() || m.alt() => Route::Swallow,
+        Named::Tab if m.shift() => Route::App(EditKey::Outdent),
+        Named::Tab => Route::App(EditKey::Indent),
+        Named::Enter if m.alt() => Route::Swallow,
+        Named::Enter if m.command() => Route::App(EditKey::ToggleCheck),
         // Shift+Enter: the default binding inserts a newline
         Named::Enter if m.shift() => Route::Default,
         Named::Enter => Route::App(EditKey::Enter),
@@ -80,6 +89,9 @@ pub enum KeyAction {
     DeleteRow,
     /// Commit and stop editing.
     Leave,
+    Indent,
+    Outdent,
+    ToggleCheck,
 }
 
 pub fn key_action(k: EditKey, c: Caret) -> KeyAction {
@@ -92,6 +104,9 @@ pub fn key_action(k: EditKey, c: Caret) -> KeyAction {
         EditKey::Backspace if c.empty => KeyAction::DeleteRow,
         EditKey::Backspace => KeyAction::Pass(Action::Edit(Edit::Backspace)),
         EditKey::Escape => KeyAction::Leave,
+        EditKey::Indent => KeyAction::Indent,
+        EditKey::Outdent => KeyAction::Outdent,
+        EditKey::ToggleCheck => KeyAction::ToggleCheck,
     }
 }
 
@@ -161,9 +176,17 @@ mod tests {
         let k = Key::Named;
         assert_eq!(route(&k(Named::Enter), none), Route::App(EditKey::Enter));
         assert_eq!(route(&k(Named::Enter), Modifiers::SHIFT), Route::Default);
-        assert_eq!(route(&k(Named::Enter), Modifiers::CTRL), Route::Swallow);
-        assert_eq!(route(&k(Named::Tab), none), Route::Swallow);
-        assert_eq!(route(&k(Named::Tab), Modifiers::SHIFT), Route::Swallow);
+        assert_eq!(
+            route(&k(Named::Enter), Modifiers::CTRL),
+            Route::App(EditKey::ToggleCheck)
+        );
+        assert_eq!(route(&k(Named::Enter), Modifiers::ALT), Route::Swallow);
+        assert_eq!(route(&k(Named::Tab), none), Route::App(EditKey::Indent));
+        assert_eq!(
+            route(&k(Named::Tab), Modifiers::SHIFT),
+            Route::App(EditKey::Outdent)
+        );
+        assert_eq!(route(&k(Named::Tab), Modifiers::CTRL), Route::Swallow);
         assert_eq!(route(&k(Named::ArrowUp), none), Route::App(EditKey::Up));
         assert_eq!(
             route(&k(Named::ArrowUp), Modifiers::SHIFT),

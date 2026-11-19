@@ -205,12 +205,21 @@ impl Store {
         row.map(to_op).transpose()
     }
 
+    /// Maps `local_id` to `remote_id`. Earlier ids that mapped to `local_id`
+    /// (a block copied again by a later move) follow it, so `resolve_id`
+    /// stays one hop.
     pub fn map_id(&self, local_id: &str, remote_id: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO id_map (local_id, remote_id) VALUES (?1, ?2)",
-            [local_id, remote_id],
-        )?;
-        Ok(())
+        self.atomic(|| {
+            self.conn.execute(
+                "UPDATE id_map SET remote_id = ?2 WHERE remote_id = ?1",
+                [local_id, remote_id],
+            )?;
+            self.conn.execute(
+                "INSERT OR REPLACE INTO id_map (local_id, remote_id) VALUES (?1, ?2)",
+                [local_id, remote_id],
+            )?;
+            Ok(())
+        })
     }
 
     /// Remote id if `id` is a mapped local id, else `id` unchanged.
@@ -231,6 +240,18 @@ impl Store {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn id_map_follows_chains() {
+        let s = Store::open_in_memory().unwrap();
+        s.map_id("x", "x1").unwrap();
+        s.map_id("c", "x1").unwrap();
+        s.map_id("x1", "x2").unwrap();
+        assert_eq!(s.resolve_id("x").unwrap(), "x2");
+        assert_eq!(s.resolve_id("c").unwrap(), "x2");
+        assert_eq!(s.resolve_id("x1").unwrap(), "x2");
+        assert_eq!(s.resolve_id("other").unwrap(), "other");
+    }
 
     #[test]
     fn ops_survive_reopen_in_fifo_order() {
