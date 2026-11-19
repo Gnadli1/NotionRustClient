@@ -483,6 +483,81 @@ impl BlockKind {
     }
 }
 
+/// A block type a text block can be converted to (`/` menu, Markdown shortcuts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    Paragraph,
+    Heading1,
+    Heading2,
+    Heading3,
+    Bulleted,
+    Numbered,
+    ToDo,
+    Toggle,
+    Quote,
+    Callout,
+    Code,
+    Divider,
+}
+
+impl TargetKind {
+    /// The target matching `kind`; None for kinds that can't be converted.
+    pub fn of(kind: &BlockKind) -> Option<Self> {
+        Some(match kind {
+            BlockKind::Paragraph(_) => Self::Paragraph,
+            BlockKind::Heading1(_) => Self::Heading1,
+            BlockKind::Heading2(_) => Self::Heading2,
+            BlockKind::Heading3(_) => Self::Heading3,
+            BlockKind::BulletedListItem(_) => Self::Bulleted,
+            BlockKind::NumberedListItem(_) => Self::Numbered,
+            BlockKind::ToDo { .. } => Self::ToDo,
+            BlockKind::Toggle(_) => Self::Toggle,
+            BlockKind::Quote(_) => Self::Quote,
+            BlockKind::Callout(_) => Self::Callout,
+            BlockKind::Code { .. } => Self::Code,
+            BlockKind::Divider => Self::Divider,
+            _ => return None,
+        })
+    }
+
+    /// A block of this type carrying `text`. Divider drops it; Code keeps only
+    /// its plain text. `.to_request_json()` gives the Notion payload.
+    pub fn block_kind(self, text: TextBlock) -> BlockKind {
+        let heading = |text| Heading {
+            text,
+            is_toggleable: false,
+        };
+        match self {
+            Self::Paragraph => BlockKind::Paragraph(text),
+            Self::Heading1 => BlockKind::Heading1(heading(text)),
+            Self::Heading2 => BlockKind::Heading2(heading(text)),
+            Self::Heading3 => BlockKind::Heading3(heading(text)),
+            Self::Bulleted => BlockKind::BulletedListItem(text),
+            Self::Numbered => BlockKind::NumberedListItem(text),
+            Self::ToDo => BlockKind::ToDo {
+                text,
+                checked: false,
+            },
+            Self::Toggle => BlockKind::Toggle(text),
+            Self::Quote => BlockKind::Quote(text),
+            Self::Callout => BlockKind::Callout(text),
+            Self::Code => {
+                let s = plain_text(&text.rich_text);
+                let rich_text = if s.is_empty() {
+                    Vec::new()
+                } else {
+                    crate::markdown::split_runs(vec![RichText::plain(&s)])
+                };
+                BlockKind::Code {
+                    text: TextBlock { rich_text, ..text },
+                    language: "plain text".into(),
+                }
+            }
+            Self::Divider => BlockKind::Divider,
+        }
+    }
+}
+
 impl Block {
     fn from_value(v: Value) -> Result<Self> {
         let t = str_field(&v, "type")?;

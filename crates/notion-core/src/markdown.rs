@@ -6,7 +6,7 @@
 //! see [`is_markdown_editable`]). Inside code spans only `\` and `` ` `` are
 //! escaped; in link URLs `(` and `)` are escaped too.
 
-use crate::model::{Annotations, RichText, RichTextKind};
+use crate::model::{Annotations, RichText, RichTextKind, TargetKind};
 
 /// Notion's per-run character limit.
 const MAX_RUN: usize = 2000;
@@ -341,6 +341,39 @@ pub(crate) fn split_runs(rt: Vec<RichText>) -> Vec<RichText> {
     out
 }
 
+/// A block-type shortcut typed at the very start of a block (`# `, `- `,
+/// `1. `, `[] `, `> `, `` ``` ``, `---`, ...) and the text after it. For
+/// `` ``` `` the rest is returned as text, not parsed as a language.
+pub fn markdown_shortcut(text: &str) -> Option<(TargetKind, &str)> {
+    use TargetKind::*;
+    if text == "---" {
+        return Some((Divider, ""));
+    }
+    if let Some(rest) = text.strip_prefix("```") {
+        return Some((Code, rest));
+    }
+    let prefixes = [
+        ("# ", Heading1),
+        ("## ", Heading2),
+        ("### ", Heading3),
+        ("- ", Bulleted),
+        ("* ", Bulleted),
+        ("[] ", ToDo),
+        ("[ ] ", ToDo),
+        ("> ", Quote),
+    ];
+    for (p, k) in prefixes {
+        if let Some(rest) = text.strip_prefix(p) {
+            return Some((k, rest));
+        }
+    }
+    let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    (digits > 0)
+        .then(|| text[digits..].strip_prefix(". "))
+        .flatten()
+        .map(|rest| (Numbered, rest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,5 +558,38 @@ mod tests {
             expression: "x^2".into(),
         };
         assert!(!is_markdown_editable(&[e]));
+    }
+
+    #[test]
+    fn shortcuts() {
+        use TargetKind::*;
+        let cases = [
+            ("# a", Some((Heading1, "a"))),
+            ("## a", Some((Heading2, "a"))),
+            ("### a", Some((Heading3, "a"))),
+            ("- a", Some((Bulleted, "a"))),
+            ("* a", Some((Bulleted, "a"))),
+            ("1. a", Some((Numbered, "a"))),
+            ("42. ", Some((Numbered, ""))),
+            ("[] a", Some((ToDo, "a"))),
+            ("[ ] a", Some((ToDo, "a"))),
+            ("> a", Some((Quote, "a"))),
+            ("```", Some((Code, ""))),
+            ("```x", Some((Code, "x"))),
+            ("---", Some((Divider, ""))),
+            ("#x", None),
+            (" # a", None),
+            (" # ", None),
+            ("####", None),
+            ("-a", None),
+            ("1.a", None),
+            (". a", None),
+            ("--- a", None),
+            ("[x] a", None),
+            ("", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(markdown_shortcut(input), want, "{input:?}");
+        }
     }
 }

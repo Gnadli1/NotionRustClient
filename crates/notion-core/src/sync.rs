@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use crate::api::{BlockNode, Client};
 use crate::markdown::split_runs;
-use crate::model::{Block, BlockKind, Page, Parent, RichText};
+use crate::model::{Block, BlockKind, Page, Parent, RichText, TargetKind, TextBlock};
 use crate::ops::{Op, OpKind, OpStatus};
 use crate::store::{ts, Store};
 use crate::{Error, Result};
@@ -201,8 +201,26 @@ pub async fn push(client: &Client, store: &Store) -> Result<PushReport> {
     // last_edited_time of objects written by this push, so a later op on the
     // same object doesn't see our own write as a remote edit.
     let mut own = HashMap::new();
+    // Anchors of failed creates: a later DeleteBlock of the anchor (a type
+    // conversion's replace) must not run, or the original is lost.
+    let mut blocked = HashSet::new();
     for op in store.queued_ops()? {
-        match apply(client, store, &op, &mut own).await {
+        if let OpKind::DeleteBlock { block_id } = &op.kind {
+            if blocked.contains(&store.resolve_id(block_id)?) {
+                store.mark_op(op.id, OpStatus::Failed, Some("anchor's create failed"))?;
+                report.failed += 1;
+                continue;
+            }
+        }
+        let res = apply(client, store, &op, &mut own).await;
+        if let (
+            OpKind::CreateBlock { after: Some(a), .. },
+            Ok(Outcome::Failed(_)) | Err(Error::Api { .. }),
+        ) = (&op.kind, &res)
+        {
+            blocked.insert(store.resolve_id(a)?);
+        }
+        match res {
             Ok(Outcome::Applied) => {
                 store.complete_op(op.id)?;
                 report.applied += 1;
@@ -754,6 +772,95 @@ pub fn local_create_block(
         )
     })?;
     Ok(id)
+}
+
+/// What `local_change_type` did to the block's id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeOutcome {
+    /// Same block, same id (same type, or an unpushed create rewritten).
+    Kept,
+    /// The block was replaced by this new `local-*` block at its position.
+    Replaced(String),
+}
+
+/// Converts a cached block to `target`, keeping its rich text (Divider drops
+/// it, Code keeps it as plain text).
+///
+/// Notion can't change a block's type, so an existing block is replaced: a new
+/// block is created right after it and the old one deleted (new id, comments
+/// and backlinks are lost). An unpushed `local-*` block has its queued create
+/// rewritten instead. Blocks with children are refused.
+pub fn local_change_type(
+    store: &Store,
+    block_id: &str,
+    target: TargetKind,
+) -> Result<ChangeOutcome> {
+    store.atomic(|| {
+        let mut block = cached(store, block_id)?;
+        let from = TargetKind::of(&block.kind).ok_or_else(|| {
+            Error::Invalid(format!(
+                "block type `{}` cannot be converted",
+                block.kind.type_name()
+            ))
+        })?;
+        if from == target {
+            return Ok(ChangeOutcome::Kept);
+        }
+        if block.has_children || !store.children(block_id)?.is_empty() {
+            return Err(Error::Invalid(
+                "cannot convert a block that has children".into(),
+            ));
+        }
+        let text = block.kind.text().cloned().unwrap_or(TextBlock {
+            rich_text: Vec::new(),
+            color: "default".into(),
+        });
+        let kind = target.block_kind(TextBlock {
+            rich_text: split_runs(text.rich_text),
+            ..text
+        });
+        if let Some(Op {
+            id,
+            kind: OpKind::CreateBlock {
+                parent_id, after, ..
+            },
+            ..
+        }) = store.queued_create_for(block_id)?
+        {
+            block.kind = kind;
+            store.put_block(&block)?;
+            let kind = OpKind::CreateBlock {
+                parent_id,
+                after,
+                block: serde_json::to_value(cached(store, block_id)?)?,
+            };
+            store.update_op_kind(id, &kind)?;
+            return Ok(ChangeOutcome::Kept);
+        }
+        if block_id.starts_with("local-") {
+            return Err(Error::Invalid("block's create is not queued".into()));
+        }
+        // local_delete_block would drop the unpushed move, leaving the block
+        // remotely where it was, so the create's `after` would be in the
+        // wrong parent.
+        for op in store.queued_ops()? {
+            if let OpKind::MoveBlock { block_id: m, .. } = &op.kind {
+                if store.resolve_id(m)? == block_id {
+                    return Err(Error::Invalid(
+                        "cannot convert a moved block before pushing the move".into(),
+                    ));
+                }
+            }
+        }
+        let parent = block
+            .parent
+            .id()
+            .ok_or_else(|| Error::Invalid(format!("block {block_id} has no parent id")))?
+            .to_string();
+        let new = local_create_block(store, &parent, Some(block_id), kind)?;
+        local_delete_block(store, block_id)?;
+        Ok(ChangeOutcome::Replaced(new))
+    })
 }
 
 #[cfg(test)]
@@ -2141,5 +2248,360 @@ mod tests {
         assert_eq!(push(&c, &store).await.unwrap().applied, 1);
         assert_eq!(ids(&store.children("t").unwrap()), ["t1", "nm", "t2"]);
         assert_eq!(ids(&store.children("p").unwrap()), ["t"]);
+    }
+
+    fn bold(t: &str) -> RichText {
+        let mut r = RichText::plain(t);
+        r.annotations.bold = true;
+        r
+    }
+    fn h2(id: &str, text: &str, time: &str) -> Value {
+        let mut v = blk(id, pp("p"), text, time, false);
+        let o = v.as_object_mut().unwrap();
+        let payload = o.remove("paragraph").unwrap();
+        o.insert("type".into(), json!("heading_2"));
+        o.insert("heading_2".into(), payload);
+        v
+    }
+    fn rich(store: &Store, id: &str) -> Vec<RichText> {
+        store
+            .get_block(id)
+            .unwrap()
+            .unwrap()
+            .kind
+            .text()
+            .unwrap()
+            .rich_text
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn change_type_rewrites_local_create() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &[]).await;
+        let local = local_create_block(
+            &store,
+            "p",
+            None,
+            TargetKind::Paragraph.block_kind(TextBlock {
+                rich_text: vec![bold("x")],
+                color: "default".into(),
+            }),
+        )
+        .unwrap();
+        let out = local_change_type(&store, &local, TargetKind::Heading1).unwrap();
+        assert_eq!(out, ChangeOutcome::Kept);
+        assert!(matches!(
+            store.get_block(&local).unwrap().unwrap().kind,
+            BlockKind::Heading1(_)
+        ));
+        assert_eq!(rich(&store, &local), [bold("x")]);
+        let q = queue(&store);
+        assert_eq!(q.len(), 1);
+        let OpKind::CreateBlock { block, .. } = &q[0] else {
+            panic!("{q:?}")
+        };
+        assert_eq!(block["id"], json!(local));
+        assert_eq!(block["type"], "heading_1");
+        assert!(block.get("paragraph").is_none());
+        assert_eq!(
+            block["heading_1"]["rich_text"][0]["annotations"]["bold"],
+            true
+        );
+        // same type: no-op
+        assert_eq!(
+            local_change_type(&store, &local, TargetKind::Heading1).unwrap(),
+            ChangeOutcome::Kept
+        );
+        assert_eq!(queue(&store), q);
+    }
+
+    #[tokio::test]
+    async fn change_type_replaces_existing_block() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a", "b", "c"]).await;
+        let mut b = store.get_block("b").unwrap().unwrap();
+        b.kind.set_text(vec![bold("B")]).unwrap();
+        store.put_block(&b).unwrap();
+
+        let ChangeOutcome::Replaced(new) =
+            local_change_type(&store, "b", TargetKind::Heading2).unwrap()
+        else {
+            panic!("kept")
+        };
+        assert!(new.starts_with("local-"));
+        assert_eq!(ids(&store.children("p").unwrap()), ["a", new.as_str(), "c"]);
+        assert!(store.get_block("b").unwrap().is_none());
+        assert!(matches!(
+            store.get_block(&new).unwrap().unwrap().kind,
+            BlockKind::Heading2(_)
+        ));
+        assert_eq!(rich(&store, &new), [bold("B")]);
+        let q = queue(&store);
+        assert!(
+            matches!(&q[..], [OpKind::CreateBlock { parent_id, after: Some(a), .. }, OpKind::DeleteBlock { block_id }]
+                if parent_id == "p" && a == "b" && block_id == "b"),
+            "{q:?}"
+        );
+        // edit before push folds into the create
+        local_edit_text(&store, &new, "edited").unwrap();
+        assert_eq!(store.queued_ops().unwrap().len(), 2);
+
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/p/children"))
+            .and(body_string_contains(r#""after":"b""#))
+            .and(body_string_contains("heading_2"))
+            .and(body_string_contains("edited"))
+            .respond_with(list(vec![h2("real1", "edited", T2)]))
+            .expect(1)
+            .mount(&s)
+            .await;
+        get(&s, "/v1/blocks/b", ok(serde_json::to_value(&b).unwrap())).await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/blocks/b"))
+            .respond_with(ok(blk("b", pp("p"), "b", T2, false)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!(
+            r,
+            PushReport {
+                applied: 2,
+                conflicts: 0,
+                failed: 0
+            }
+        );
+        assert_eq!(ids(&store.children("p").unwrap()), ["a", "real1", "c"]);
+        assert_eq!(store.resolve_id(&new).unwrap(), "real1");
+        s.reset().await;
+
+        // a later edit goes to the new real id
+        local_edit_text(&store, "real1", "again").unwrap();
+        get(&s, "/v1/blocks/real1", ok(h2("real1", "edited", T2))).await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/real1"))
+            .and(body_string_contains("again"))
+            .respond_with(ok(h2("real1", "again", T2)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!(
+            r,
+            PushReport {
+                applied: 1,
+                conflicts: 0,
+                failed: 0
+            }
+        );
+        assert_eq!(text(&store, "real1"), "again");
+    }
+
+    #[tokio::test]
+    async fn change_type_refuses_children_and_unconvertible() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        let kid = BlockKind::Paragraph(TextBlock {
+            rich_text: vec![],
+            color: "default".into(),
+        });
+        local_create_block(&store, "a", None, kid).unwrap();
+        let q = queue(&store);
+        let e = local_change_type(&store, "a", TargetKind::Quote).unwrap_err();
+        assert!(e.to_string().contains("children"), "{e}");
+        assert_eq!(queue(&store), q);
+
+        let mut v = blk("cp", pp("p"), "", T, false);
+        let o = v.as_object_mut().unwrap();
+        o.remove("paragraph");
+        o.insert("type".into(), json!("child_page"));
+        o.insert("child_page".into(), json!({ "title": "Sub" }));
+        store
+            .put_block(&serde_json::from_value(v).unwrap())
+            .unwrap();
+        assert!(local_change_type(&store, "cp", TargetKind::Paragraph).is_err());
+        assert_eq!(queue(&store), q);
+    }
+
+    #[tokio::test]
+    async fn change_type_refuses_unpushed_move() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a", "b"]).await;
+        local_move_block(&store, "b", "a", None).unwrap();
+        let q = queue(&store);
+        let e = local_change_type(&store, "b", TargetKind::Heading2).unwrap_err();
+        assert!(e.to_string().contains("moved"), "{e}");
+        assert_eq!(queue(&store), q);
+        assert!(store.get_block("b").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_conversion_create_keeps_original() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a", "b"]).await;
+        local_change_type(&store, "b", TargetKind::Quote).unwrap();
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/p/children"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "object": "error", "status": 400, "code": "validation_error", "message": "bad"
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/blocks/b"))
+            .respond_with(ok(blk("b", pp("p"), "b", T2, false)))
+            .expect(0)
+            .mount(&s)
+            .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!(
+            r,
+            PushReport {
+                applied: 0,
+                conflicts: 0,
+                failed: 2
+            }
+        );
+        let failed = store.ops_by_status(OpStatus::Failed).unwrap();
+        assert_eq!(failed.len(), 2);
+        assert_eq!(failed[1].error.as_deref(), Some("anchor's create failed"));
+        assert!(store.queued_ops().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn change_type_refuses_local_without_queued_create() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &[]).await;
+        let local = local_create_block(
+            &store,
+            "p",
+            None,
+            TargetKind::Paragraph.block_kind(TextBlock {
+                rich_text: vec![],
+                color: "default".into(),
+            }),
+        )
+        .unwrap();
+        let op = store.queued_ops().unwrap()[0].id;
+        store.mark_op(op, OpStatus::Failed, Some("x")).unwrap();
+        let e = local_change_type(&store, &local, TargetKind::Quote).unwrap_err();
+        assert!(e.to_string().contains("not queued"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn change_type_rewrites_moved_local_create() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        let local = local_create_block(
+            &store,
+            "p",
+            None,
+            TargetKind::Paragraph.block_kind(TextBlock {
+                rich_text: vec![],
+                color: "default".into(),
+            }),
+        )
+        .unwrap();
+        // a later op placed after the local block forces a queued MoveBlock
+        local_create_block(
+            &store,
+            "p",
+            Some(&local),
+            TargetKind::Paragraph.block_kind(TextBlock {
+                rich_text: vec![],
+                color: "default".into(),
+            }),
+        )
+        .unwrap();
+        local_move_block(&store, &local, "a", None).unwrap();
+        assert!(queue(&store)
+            .iter()
+            .any(|k| matches!(k, OpKind::MoveBlock { .. })));
+        assert_eq!(
+            local_change_type(&store, &local, TargetKind::Heading1).unwrap(),
+            ChangeOutcome::Kept
+        );
+    }
+
+    #[tokio::test]
+    async fn change_type_to_divider_drops_text() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        let ChangeOutcome::Replaced(new) =
+            local_change_type(&store, "a", TargetKind::Divider).unwrap()
+        else {
+            panic!("kept")
+        };
+        assert_eq!(
+            store.get_block(&new).unwrap().unwrap().kind,
+            BlockKind::Divider
+        );
+        let OpKind::CreateBlock { block, .. } = &queue(&store)[0] else {
+            panic!()
+        };
+        assert_eq!(block["type"], "divider");
+        assert!(!block.to_string().contains("rich_text"), "{block}");
+    }
+
+    #[tokio::test]
+    async fn change_type_to_code_strips_annotations() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &[]).await;
+        let mut link = RichText::plain("y");
+        link.href = Some("https://x".into());
+        link.kind = crate::model::RichTextKind::Text {
+            content: "y".into(),
+            link: Some("https://x".into()),
+        };
+        let kind = BlockKind::Quote(TextBlock {
+            rich_text: vec![bold("x"), link],
+            color: "default".into(),
+        });
+        let local = local_create_block(&store, "p", None, kind).unwrap();
+        local_change_type(&store, &local, TargetKind::Code).unwrap();
+        match store.get_block(&local).unwrap().unwrap().kind {
+            BlockKind::Code { text, language } => {
+                assert_eq!(text.rich_text, [RichText::plain("xy")]);
+                assert_eq!(language, "plain text");
+            }
+            k => panic!("{k:?}"),
+        }
+        // long text stays within Notion's per-run limit
+        let long = "z".repeat(2500);
+        let p2 = local_create_block(
+            &store,
+            "p",
+            None,
+            TargetKind::Paragraph.block_kind(TextBlock {
+                rich_text: vec![bold(&long)],
+                color: "default".into(),
+            }),
+        )
+        .unwrap();
+        local_change_type(&store, &p2, TargetKind::Code).unwrap();
+        let runs = rich(&store, &p2);
+        assert!(runs.len() == 2 && runs.iter().all(|r| r.plain_text.chars().count() <= 2000));
+        assert_eq!(plain_text(&runs), long);
+        // and back: the plain text is kept
+        local_change_type(&store, &local, TargetKind::ToDo).unwrap();
+        match store.get_block(&local).unwrap().unwrap().kind {
+            BlockKind::ToDo { text, checked } => {
+                assert_eq!(text.rich_text, [RichText::plain("xy")]);
+                assert!(!checked);
+            }
+            k => panic!("{k:?}"),
+        }
+        assert_eq!(queue(&store).len(), 2);
     }
 }
