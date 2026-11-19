@@ -1,5 +1,7 @@
 # Handoff: continue Phase 2 on the MiniPC (2026-11-19)
 
+> **Superseded.** The handover was cancelled. C1 and G1–G3 were finished on the laptop: commits 0c4b53a, 0fd98f4, 7794dac and 82a60c7. See the known-gaps sections in `docs/phase2-plan.md`. The rest of this file is kept for history.
+
 Read `docs/phase2-plan.md` first. It is approved with all defaults: iced 0.14, manual Ctrl+S push, Tab/Shift+Tab in G3, and mention/equation blocks read-only. Phase 1 is done and verified live; see `docs/plan.md` §6–7.
 
 ## State at handoff
