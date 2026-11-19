@@ -46,3 +46,4 @@ The docs recommend retrying 500/502/503/504 for GET and DELETE only. The spec on
 | 10 | A 503 on a write "may already be saved"; the `retry_guidance` shape isn't documented | Not retried. The op is marked `Failed`, and the user re-runs push. |
 | 11 | Per-workspace rate limit value isn't published, and its `Retry-After` can exceed 60 s | Honour `Retry-After` up to `max_backoff` (60 s, configurable). If it's longer, fail with `RetriesExhausted`. |
 | 12 | Data source query has its own limit of about 3 req/s, and returns at most 10,000 results | The default 3 req/s limiter covers the rate. The 10k cap is a known gap. |
+| 13 | Whether `plain_text`/`href` in rich text and read-only mention subtypes are accepted in PATCH/append bodies | Send response-shaped rich text; verify in T5 live smoke test |
