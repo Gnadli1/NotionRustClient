@@ -1,6 +1,6 @@
 # Phase 1 plan: `notion-core` + `notion-cli`
 
-Status: **DRAFT, waiting for approval.** API facts come from `docs/api-notes.md`, which was researched from developers.notion.com.
+Status: **Approved 2026-11-19 with the default answers to Q1–Q5; Phase 1 built (see §6).** API facts come from `docs/api-notes.md`, which was researched from developers.notion.com.
 Unresolved points and decisions that need you are in `docs/open-questions.md`.
 
 ## 0. Prerequisites (not code)
@@ -324,3 +324,44 @@ CREATE TABLE id_map (local_id TEXT PRIMARY KEY, remote_id TEXT NOT NULL);
 - Each task goes to a `general-purpose` implementer subagent, then a separate reviewer subagent, with at most 2 review rounds.
 - The `developer` and `reviewer` agents defined on this machine are scoped to another project (Lunch Map Wels), so I'll brief generic agents instead.
 - One commit per approved task.
+
+## 6. What was built (Phase 1)
+
+Commits: T0 skeleton → T1 model → T2 api → T3 store+ops → T4 sync → T5 CLI. Each task was implemented by one agent and reviewed by a separate one, with at most 2 review rounds. Gate: `cargo test` and `cargo clippy --all-targets -- -D warnings`. Tests never hit the real API, apart from `tests/live_smoke.rs` (`#[ignore]`, needs `NOTION_TOKEN` and `NOTION_TEST_PAGE_ID`, read-only).
+
+**Changes from §3, made during implementation (all small additions):**
+- **`Parent::Other(Value)`.** Unknown parent types such as `agent_id` stay lossless instead of failing the whole response. You approved this.
+- **`Op.base_raw` and the `ops.base_raw` column.** A snapshot of the object the edit was based on, used for the Q2 equal-timestamp content comparison.
+- **`sync::pull_page(.., force)`.** Plus the CLI `pull --full` (Q3).
+- **Two local-edit helpers:** `sync::local_edit_text` and `sync::local_create_block`.
+- **`Store` additions:** `delete_block` and `rename_block`. **Op-queue additions:** `map_id` and `resolve_id`, for temporary `local-*` ids.
+- **`append_children` chunks requests to ≤100 children.** Later chunks pass `after` = the last created id.
+- **The paginator warns on an incomplete `request_status`.** This happens when a query hits Notion's 10k result cap.
+- **Pull skip rule.** A page is skipped only if its cached `last_edited_time` is equal **and** it already has cached blocks.
+- **Conflict check details.**
+  - Conflict if `remote > base`, or if the times are equal and the content differs from base.
+  - Inside one push, our own writes become the new base, so two queued edits to one block both apply.
+  - A same-minute remote edit after our write is still caught.
+- **MoveBlock does copy-then-delete (Q1).**
+  - It is refused, with no writes, if the subtree contains `unsupported`, `child_page` or `child_database`.
+  - Every copied block's old id is mapped to its new id.
+- **Error handling in push.**
+  - `Error::Api` marks the op `Failed` and push continues.
+  - Network errors, `RetriesExhausted` and SQLite errors abort push and leave the op queued.
+- **CLI id input.** Ids are normalised from dashed or undashed form or a Notion URL (query string stripped). `cat`, `edit-block` and `status` work offline without a token.
+
+## 7. Known gaps (for Phase 2)
+
+1. **Partial failures aren't idempotent.**
+   - If a create or move fails halfway, or a cache write fails after the remote write succeeded, the op stays queued. Re-running it can duplicate blocks on Notion.
+   - Chunked `append_children` isn't atomic either.
+2. **Own-writes tracking only lives within one push.** If a push aborts after a create, a later queued edit of that block can be flagged as a false conflict.
+3. **Rows can skip their blocks.** `pull_data_source` updates a row's `last_edited_time` in the cache. A row already pulled with blocks can then be skipped by a later unforced `pull_page`. Workaround: `pull --full`. A "blocks pulled at" marker would fix it.
+4. **Does a nested edit bump the page's `last_edited_time`?** Not stated in the docs (Q3). Verify with the live run; if it doesn't, pull must always walk the tree.
+5. **Rich text sent back to Notion.** We send rich text in the response shape (`plain_text`, `href`, read-only mention types). Notion may reject some of it in PATCH/append bodies (open-questions B13).
+6. **Sync futures are `!Send`.** `&Store` (a rusqlite `Connection`) is held across awaits. The GUI will need a current-thread runtime, a dedicated sync thread, or `Arc<Mutex<Store>>` / a connection per task.
+7. **No 5xx retry** (Q5 default). A 503 on a write is left `Failed` for a manual re-push.
+8. **Only text-ish blocks are typed.** Images, tables, columns, synced blocks and so on are cached and shown as `[type]` but can't be edited. Most property types are read-only or `Unsupported`.
+9. **Data source queries return at most 10k results.** Beyond that we only log a warning.
+10. **Creating a local block ignores `after` for the cached position.** It's appended at the end until the next pull.
+11. **No CLI command for data sources** (`pull_data_source` is core-only), and **no conflict resolution UI.** Conflicted ops just stay listed in `status`.
