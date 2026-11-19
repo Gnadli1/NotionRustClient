@@ -114,24 +114,31 @@ fn render_block(b: &Block, depth: usize, out: &mut String) {
         .text()
         .map(|t| plain_text(&t.rich_text))
         .unwrap_or_default();
+    let marker = match &b.kind {
+        BlockKind::Heading1(_) => "# ",
+        BlockKind::Heading2(_) => "## ",
+        BlockKind::Heading3(_) => "### ",
+        BlockKind::BulletedListItem(_) => "- ",
+        BlockKind::NumberedListItem(_) => "1. ",
+        BlockKind::ToDo { checked: true, .. } => "[x] ",
+        BlockKind::ToDo { .. } => "[ ] ",
+        BlockKind::Toggle(_) => "▸ ",
+        BlockKind::Quote(_) => "> ",
+        BlockKind::Callout(_) => "! ",
+        _ => "",
+    };
     let line = match &b.kind {
-        BlockKind::Paragraph(_) => text,
-        BlockKind::Heading1(_) => format!("# {text}"),
-        BlockKind::Heading2(_) => format!("## {text}"),
-        BlockKind::Heading3(_) => format!("### {text}"),
-        BlockKind::BulletedListItem(_) => format!("- {text}"),
-        BlockKind::NumberedListItem(_) => format!("1. {text}"),
-        BlockKind::ToDo { checked, .. } => format!("[{}] {text}", if *checked { "x" } else { " " }),
-        BlockKind::Toggle(_) => format!("▸ {text}"),
-        BlockKind::Quote(_) => format!("> {text}"),
-        BlockKind::Callout(_) => format!("! {text}"),
-        BlockKind::Code { language, .. } => format!("```{language}\n{ind}{text}\n{ind}```"),
+        // Code lines keep their own indentation, so continuation lines get only the block indent.
+        BlockKind::Code { language, .. } => format!("```{language}\n{text}\n```"),
         BlockKind::Divider => "---".into(),
         BlockKind::ChildPage { title } => format!("[page: {title}]"),
         BlockKind::ChildDatabase { title } => format!("[database: {title}]"),
         BlockKind::Unsupported { .. } => format!("[{}]", b.kind.type_name()),
+        _ => format!("{marker}{text}"),
     };
-    out.push_str(&format!("{ind}{line}\n"));
+    // Continuation lines line up under the text, after the marker.
+    let cont = format!("\n{ind}{}", " ".repeat(marker.chars().count()));
+    out.push_str(&format!("{ind}{}\n", line.replace('\n', &cont)));
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -276,13 +283,19 @@ mod tests {
                         "c",
                         "b",
                         "code",
-                        json!({ "rich_text": rt("let x = 1;"), "language": "rust" }),
+                        json!({ "rich_text": rt("let x = 1;\n  y();"), "language": "rust" }),
+                    ),
+                    blk(
+                        "m",
+                        "b",
+                        "bulleted_list_item",
+                        json!({ "rich_text": rt("first\nsecond") }),
                     ),
                 ],
             )
             .unwrap();
 
-        let expected = "# My Page\n\n## Intro\nHello\n- item\n  1. nested\n  ```rust\n  let x = 1;\n  ```\n[x] done\n---\n[image]\n";
+        let expected = "# My Page\n\n## Intro\nHello\n- item\n  1. nested\n  ```rust\n  let x = 1;\n    y();\n  ```\n  - first\n    second\n[x] done\n---\n[image]\n";
         assert_eq!(render_page(&store, PID).unwrap(), expected);
         assert!(render_page(&store, "ffffffff-ffff-ffff-ffff-ffffffffffff").is_err());
     }
