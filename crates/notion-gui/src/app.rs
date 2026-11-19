@@ -13,14 +13,17 @@ use iced::widget::{
     text_editor, text_input,
 };
 use iced::{event, Color, Element, Fill, Font, Subscription, Task};
+use notion_core::markdown::from_markdown;
+use notion_core::model::{plain_text, TargetKind};
 use notion_core::model::{BlockKind, Parent, RichText, TextBlock};
 use notion_core::ops::OpStatus;
 use notion_core::store::Store;
-use notion_core::sync;
+use notion_core::sync::{self, ChangeOutcome};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::edit::{key_action, EditKey, Editing, KeyAction, EDITOR_ID};
 use crate::outline::{self, Marker, Row};
+use crate::slash::{self, Menu, MenuKey};
 use crate::worker::{Cmd, Event};
 
 #[derive(Debug, Clone)]
@@ -45,6 +48,8 @@ pub enum Message {
     EditKey(EditKey),
     /// ☐/☑ clicked.
     ToggleCheck(String),
+    /// `/` menu entry chosen (index into the filtered list).
+    SlashPick(usize),
     /// Ctrl+K
     FocusSearch,
     /// Esc anywhere: back from the search box to the outline.
@@ -116,6 +121,8 @@ impl State {
         let Some(e) = &mut self.editing else {
             return Some(true);
         };
+        // a commit ends the `/` menu; its query is kept as typed
+        e.menu = None;
         let Some(rt) = e.changed() else {
             return Some(true);
         };
@@ -238,6 +245,7 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         | Message::EditorAction(_)
         | Message::EditKey(_)
         | Message::ToggleCheck(_)
+        | Message::SlashPick(_)
         | Message::FocusSearch
         | Message::SearchEscape
         | Message::Open(_)
@@ -300,11 +308,8 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             };
         }
         Message::Focus(id) => return s.focus(&id),
-        Message::EditorAction(a) => {
-            if let Some(e) = &mut s.editing {
-                e.content.perform(a);
-            }
-        }
+        Message::EditorAction(a) => return on_editor_action(s, a),
+        Message::SlashPick(i) => return slash_pick(s, i),
         Message::EditKey(k) => return on_edit_key(s, k),
         Message::WorkerGone => {
             s.sent.clear();
@@ -350,10 +355,179 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
     Task::none()
 }
 
+/// Typing: opens the `/` menu, re-checks its query, fires Markdown shortcuts.
+fn on_editor_action(s: &mut State, a: text_editor::Action) -> Task<Message> {
+    let Some(e) = &mut s.editing else {
+        return Task::none();
+    };
+    let typed = match &a {
+        text_editor::Action::Edit(text_editor::Edit::Insert(c)) => Some(*c),
+        _ => None,
+    };
+    e.content.perform(a);
+    let (line, col) = e.pos();
+    if e.menu.is_some() {
+        e.menu_query();
+    } else if typed == Some('/') && !e.code {
+        e.menu = Some(Menu {
+            line,
+            slash: col - 1,
+            selected: 0,
+        });
+    } else if typed.is_some() {
+        // Notion only converts plain text blocks
+        // ...without children: core refuses those, no error while typing
+        let paragraph = s.editing_row().is_some_and(|r| {
+            r.marker == Marker::None
+                && s.store
+                    .get_block(&r.block_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|b| !b.has_children)
+                && s.store.children(&r.block_id).is_ok_and(|c| c.is_empty())
+        });
+        let text = s
+            .editing
+            .as_ref()
+            .map(|e| e.content.text())
+            .unwrap_or_default();
+        if let Some((kind, rest)) = paragraph
+            .then(|| slash::shortcut(&text, line, col))
+            .flatten()
+        {
+            return convert(s, kind, &rest, (0, 0));
+        }
+    }
+    Task::none()
+}
+
+fn slash_pick(s: &mut State, i: usize) -> Task<Message> {
+    let Some(e) = &mut s.editing else {
+        return Task::none();
+    };
+    let Some(q) = e.menu_query() else {
+        return Task::none();
+    };
+    let Some(item) = slash::filter(&q).get(i).copied() else {
+        return Task::none();
+    };
+    let m = e.menu.clone().expect("menu_query kept it open");
+    let (_, col) = e.pos();
+    let buf = m.strip(&e.content.text(), col);
+    convert(s, item.kind, &buf, (m.line, m.slash))
+}
+
+/// Converts the edited block to `kind` and continues editing it with `buf`
+/// (cursor at `pos`). On refusal the buffer is left as typed.
+fn convert(s: &mut State, kind: TargetKind, buf: &str, pos: (usize, usize)) -> Task<Message> {
+    let Some(id) = s.editing.as_ref().map(|e| e.block_id.clone()) else {
+        return Task::none();
+    };
+    if kind == TargetKind::Divider && !buf.trim().is_empty() {
+        return divider_after(s, buf, pos);
+    }
+    // code is raw text: drop the Markdown marks
+    let (buf, pos) = if kind == TargetKind::Code {
+        // ponytail: cursor to the start, mapping it through the stripped marks isn't worth it
+        (plain_text(&from_markdown(buf)), (0, 0))
+    } else {
+        (buf.to_string(), pos)
+    };
+    let buf = buf.as_str();
+    let res = s
+        .store
+        .resolve_id(&id)
+        .and_then(|id| sync::local_change_type(&s.store, &id, kind).map(|o| (id, o)));
+    let new = match res {
+        Ok((_, ChangeOutcome::Replaced(new))) => new,
+        Ok((id, ChangeOutcome::Kept)) => id,
+        Err(err) => {
+            s.last_error = Some(err.to_string());
+            if let Some(e) = &mut s.editing {
+                e.menu = None;
+            }
+            return Task::none();
+        }
+    };
+    // the old id may be gone: don't let refresh discard the editor
+    s.editing = None;
+    s.refresh();
+    let Some(row) = s.rows.iter().find(|r| r.block_id == new).cloned() else {
+        return Task::none();
+    };
+    if !row.editable {
+        // a divider has no text: continue in a new paragraph below it
+        let para = BlockKind::Paragraph(TextBlock {
+            rich_text: Vec::new(),
+            color: "default".into(),
+        });
+        return match sync::local_create_block(&s.store, &row.parent, Some(&row.block_id), para) {
+            Ok(p) => {
+                s.refresh();
+                s.focus(&p)
+            }
+            Err(err) => {
+                s.last_error = Some(err.to_string());
+                Task::none()
+            }
+        };
+    }
+    let mut e = Editing::new(&row);
+    e.set_buffer(buf, pos.0, pos.1);
+    s.editing = Some(e);
+    s.commit();
+    operation::focus(EDITOR_ID)
+}
+
+/// Divider picked on a block with text: keep the block, put a divider after it.
+fn divider_after(s: &mut State, buf: &str, pos: (usize, usize)) -> Task<Message> {
+    if let Some(e) = &mut s.editing {
+        e.set_buffer(buf, pos.0, pos.1);
+    }
+    if !s.commit() {
+        return Task::none();
+    }
+    let Some(row) = s.editing_row().cloned() else {
+        return Task::none();
+    };
+    match sync::local_create_block(
+        &s.store,
+        &row.parent,
+        Some(&row.block_id),
+        BlockKind::Divider,
+    ) {
+        Ok(_) => s.refresh(),
+        Err(err) => s.last_error = Some(err.to_string()),
+    }
+    operation::focus(EDITOR_ID)
+}
+
 fn on_edit_key(s: &mut State, k: EditKey) -> Task<Message> {
     let Some(e) = &mut s.editing else {
         return Task::none();
     };
+    if e.menu.is_some() {
+        let n = e.menu_query().map_or(0, |q| slash::filter(&q).len());
+        // menu_query closed it: the key is the editor's
+        if let Some(m) = e.menu.as_mut().filter(|_| n > 0) {
+            match slash::menu_key(k) {
+                MenuKey::Prev => m.selected = (m.selected + n - 1) % n,
+                MenuKey::Next => m.selected = (m.selected + 1) % n,
+                MenuKey::Pick => {
+                    let i = m.selected;
+                    return slash_pick(s, i);
+                }
+                MenuKey::Close => e.menu = None,
+                MenuKey::Ignore => {}
+                MenuKey::Editor => {
+                    e.content
+                        .perform(text_editor::Action::Edit(text_editor::Edit::Backspace));
+                    e.menu_query();
+                }
+            }
+            return Task::none();
+        }
+    }
     let id = e.block_id.clone();
     let Some(idx) = s.rows.iter().position(|r| r.block_id == id) else {
         return Task::none();
@@ -586,6 +760,10 @@ fn row_view<'a>(r: &'a Row, editing: Option<&'a Editing>) -> Element<'a, Message
                 .on_press(Message::ToggleCheck(r.block_id.clone()));
             row![marker, editor].spacing(6).into()
         };
+        let body: Element<_> = match e.menu.as_ref() {
+            None => body,
+            Some(m) => column![body, slash_menu(e, m)].spacing(4).into(),
+        };
         return container(body).padding(indent).into();
     }
     let mut spans: Vec<Span<'_, ()>> = Vec::new();
@@ -616,6 +794,30 @@ fn row_view<'a>(r: &'a Row, editing: Option<&'a Editing>) -> Element<'a, Message
     } else {
         body.into()
     }
+}
+
+/// The `/` menu, drawn in the outline right under the edited row.
+fn slash_menu<'a>(e: &Editing, m: &Menu) -> Element<'a, Message> {
+    let (line, col) = e.pos();
+    let buf = e.content.text();
+    let q = m.query(&buf, line, col).unwrap_or_default();
+    let items = slash::filter(q).into_iter().enumerate().map(|(i, it)| {
+        let style = if i == m.selected {
+            button::primary
+        } else {
+            button::text
+        };
+        button(row![text(it.name).width(140), text(it.hint).size(12).color(GREY)].spacing(8))
+            .on_press(Message::SlashPick(i))
+            .style(style)
+            .width(Fill)
+            .into()
+    });
+    container(column(items).spacing(2))
+        .style(container::bordered_box)
+        .padding(4)
+        .max_width(360)
+        .into()
 }
 
 pub fn view(s: &State) -> Element<'_, Message> {
@@ -1251,5 +1453,183 @@ mod tests {
         );
         assert_eq!(s.last_error.as_deref(), Some("boom"));
         assert_eq!(s.sent.len(), 0);
+    }
+
+    fn marker(s: &State) -> Marker {
+        s.editing_row().unwrap().marker.clone()
+    }
+
+    fn buffer(s: &State) -> String {
+        s.editing.as_ref().unwrap().content.text()
+    }
+
+    fn menu_open(s: &State) -> bool {
+        s.editing.as_ref().unwrap().menu.is_some()
+    }
+
+    #[test]
+    fn slash_h1_on_a_fresh_block_keeps_it() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        up(&mut s, Message::EditKey(EditKey::Enter));
+        let local = editing(&s).unwrap().to_string();
+        type_text(&mut s, "/h1");
+        assert!(menu_open(&s));
+        up(&mut s, Message::EditKey(EditKey::Enter));
+        assert_eq!(editing(&s), Some(local.as_str()));
+        assert_eq!(marker(&s), Marker::Heading(1));
+        assert_eq!(buffer(&s), "");
+        assert!(!menu_open(&s));
+    }
+
+    #[test]
+    fn slash_on_a_real_block_follows_the_replacement() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        type_text(&mut s, "/quo");
+        // Down then Up wraps back to the only match
+        up(&mut s, Message::EditKey(EditKey::Down));
+        up(&mut s, Message::EditKey(EditKey::Up));
+        up(&mut s, Message::EditKey(EditKey::Enter));
+        assert!(editing(&s).unwrap().starts_with("local-"));
+        assert_eq!(marker(&s), Marker::Quote);
+        assert_eq!(buffer(&s), "b");
+        assert!(!ids(&s).contains(&"b"));
+    }
+
+    #[test]
+    fn refused_change_keeps_the_text() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("a".into()));
+        type_text(&mut s, "/h1");
+        up(&mut s, Message::SlashPick(0));
+        assert!(s.last_error.is_some());
+        assert_eq!(editing(&s), Some("a"));
+        assert_eq!(buffer(&s), "a/h1");
+        assert_eq!(marker(&s), Marker::None);
+        assert!(!menu_open(&s));
+    }
+
+    #[test]
+    fn menu_closes_on_no_match_backspace_and_escape() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        type_text(&mut s, "/zzz");
+        assert!(!menu_open(&s));
+        // Enter is the editor's again: a new block
+        up(&mut s, Message::EditKey(EditKey::Enter));
+        assert_ne!(editing(&s), Some("b"));
+
+        up(&mut s, Message::Focus("b".into()));
+        type_text(&mut s, "/h");
+        up(&mut s, Message::EditKey(EditKey::Backspace));
+        assert!(menu_open(&s));
+        up(&mut s, Message::EditKey(EditKey::Backspace));
+        assert!(!menu_open(&s));
+        assert_eq!(buffer(&s), "b/zzz");
+
+        type_text(&mut s, "/");
+        up(&mut s, Message::EditKey(EditKey::Escape));
+        assert!(!menu_open(&s));
+        assert_eq!(editing(&s), Some("b"));
+    }
+
+    #[test]
+    fn markdown_shortcut_only_on_paragraphs() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        up(&mut s, Message::EditKey(EditKey::Enter));
+        type_text(&mut s, "# ");
+        assert_eq!(marker(&s), Marker::Heading(1));
+        assert_eq!(buffer(&s), "");
+        type_text(&mut s, "# ");
+        assert_eq!(marker(&s), Marker::Heading(1));
+        assert_eq!(buffer(&s), "# ");
+    }
+
+    #[test]
+    fn markdown_shortcut_keeps_the_rest() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        let e = s.editing.as_mut().unwrap();
+        e.set_buffer("b", 0, 0);
+        type_text(&mut s, "-");
+        type_text(&mut s, " ");
+        assert_eq!(marker(&s), Marker::Bullet);
+        assert_eq!(buffer(&s), "b");
+    }
+
+    #[test]
+    fn divider_and_code_shortcuts() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        up(&mut s, Message::EditKey(EditKey::Enter));
+        type_text(&mut s, "---");
+        // continues in a fresh paragraph under the divider
+        assert_eq!(marker(&s), Marker::None);
+        let i = s
+            .rows
+            .iter()
+            .position(|r| Some(r.block_id.as_str()) == editing(&s))
+            .unwrap();
+        assert_eq!(s.rows[i - 1].marker, Marker::Divider);
+        type_text(&mut s, "```");
+        assert!(matches!(marker(&s), Marker::Code(_)));
+        assert_eq!(buffer(&s), "");
+    }
+
+    #[test]
+    fn divider_on_a_block_with_text_keeps_it() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        type_text(&mut s, "/div");
+        up(&mut s, Message::EditKey(EditKey::Enter));
+        assert_eq!(editing(&s), Some("b"));
+        assert_eq!(buffer(&s), "b");
+        let i = s.rows.iter().position(|r| r.block_id == "b").unwrap();
+        assert_eq!(s.rows[i + 1].marker, Marker::Divider);
+        assert_eq!(plain_text(&s.rows[i].rich_text), "b");
+    }
+
+    #[test]
+    fn code_conversion_drops_markdown_marks() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        type_text(&mut s, " **x**/code");
+        up(&mut s, Message::EditKey(EditKey::Enter));
+        assert!(matches!(marker(&s), Marker::Code(_)));
+        assert_eq!(buffer(&s), "b x");
+    }
+
+    #[test]
+    fn stale_menu_passes_the_key_on_and_commit_closes_it() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("b".into()));
+        // the `/` it pointed at is gone
+        s.editing.as_mut().unwrap().menu = Some(Menu {
+            line: 0,
+            slash: 0,
+            selected: 0,
+        });
+        up(&mut s, Message::EditKey(EditKey::Enter));
+        assert_ne!(editing(&s), Some("b"), "Enter made a new block");
+
+        up(&mut s, Message::Focus("b".into()));
+        type_text(&mut s, "/h1");
+        up(&mut s, Message::Push);
+        assert!(s.editing.as_ref().is_none_or(|e| e.menu.is_none()));
+        let b = s.rows.iter().find(|r| r.block_id == "b").unwrap();
+        assert_eq!(plain_text(&b.rich_text), "b/h1");
+    }
+
+    #[test]
+    fn no_shortcut_on_a_block_with_children() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::Focus("a".into()));
+        s.editing.as_mut().unwrap().set_buffer("a", 0, 0);
+        type_text(&mut s, "# ");
+        assert_eq!(s.last_error, None);
+        assert_eq!(marker(&s), Marker::None);
+        assert_eq!(buffer(&s), "# a");
     }
 }

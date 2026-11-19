@@ -8,6 +8,7 @@ use notion_core::model::{plain_text, RichText};
 
 use crate::app::Message;
 use crate::outline::{Marker, Row};
+use crate::slash::{filter, Menu};
 
 /// Widget id of the (single) row editor.
 pub const EDITOR_ID: &str = "row-editor";
@@ -117,6 +118,8 @@ pub struct Editing {
     pub code: bool,
     pub original: String,
     pub content: text_editor::Content,
+    /// The open `/` menu.
+    pub menu: Option<Menu>,
 }
 
 impl Editing {
@@ -134,7 +137,41 @@ impl Editing {
             code,
             content,
             original,
+            menu: None,
         }
+    }
+
+    /// Replaces the buffer and puts the cursor at `line`/`col` (bytes).
+    pub fn set_buffer(&mut self, text: &str, line: usize, col: usize) {
+        self.content = text_editor::Content::with_text(text);
+        self.content.move_to(text_editor::Cursor {
+            position: text_editor::Position { line, column: col },
+            selection: None,
+        });
+    }
+
+    /// Cursor (line, byte column).
+    pub fn pos(&self) -> (usize, usize) {
+        let p = self.content.cursor().position;
+        (p.line, p.column)
+    }
+
+    /// The `/` menu's query, closing the menu when the cursor left it or
+    /// nothing matches.
+    pub fn menu_query(&mut self) -> Option<String> {
+        let m = self.menu.as_mut()?;
+        let (line, col) = (
+            self.content.cursor().position.line,
+            self.content.cursor().position.column,
+        );
+        let q = m.query(&self.content.text(), line, col).map(str::to_string);
+        let n = q.as_deref().map_or(0, |q| filter(q).len());
+        if n == 0 {
+            self.menu = None;
+            return None;
+        }
+        m.selected = m.selected.min(n - 1);
+        q
     }
 
     pub fn caret(&self) -> Caret {
