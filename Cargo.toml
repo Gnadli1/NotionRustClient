@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/notion-core", "crates/notion-cli"]
+members = ["crates/notion-core", "crates/notion-cli", "crates/notion-gui"]
 
 [workspace.package]
 edition = "2021"
@@ -17,5 +17,6 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 rusqlite = { version = "0.32", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+iced = "0.14"
 wiremock = "0.6"
 tempfile = "3"

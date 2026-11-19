@@ -1,0 +1,9 @@
+[package]
+name = "notion-gui"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+notion-core = { path = "../notion-core" }
+iced.workspace = true
+tokio.workspace = true
