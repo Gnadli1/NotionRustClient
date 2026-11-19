@@ -2,7 +2,7 @@
 //! buffer and the worker channel (its Task is just widget focus), so it is
 //! testable without a window.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use iced::keyboard::{self, Key};
@@ -51,6 +51,8 @@ pub enum Message {
     EditKey(EditKey),
     /// ☐/☑ clicked.
     ToggleCheck(String),
+    /// ▸/▾ clicked: expand or collapse a toggle (view only, no op).
+    ToggleOpen(String),
     /// `/` menu entry chosen (index into the filtered list).
     SlashPick(usize),
     /// Any key press, seen window-wide: runs its global keymap command.
@@ -91,6 +93,8 @@ pub struct State {
     pub(crate) keys: Keymap,
     /// System light/dark mode; `None` (no preference) renders light.
     pub(crate) mode: iced::theme::Mode,
+    /// Expanded toggles; every other toggle is collapsed (Notion's default).
+    pub(crate) open: HashSet<String>,
 }
 
 impl State {
@@ -112,6 +116,7 @@ impl State {
             editing: None,
             keys: Keymap::default(),
             mode: iced::theme::Mode::None,
+            open: HashSet::new(),
         };
         s.refresh();
         s
@@ -185,7 +190,21 @@ impl State {
             return Task::none();
         };
         self.editing = Some(Editing::new(row));
+        self.reveal_edited();
         operation::focus(EDITOR_ID)
+    }
+
+    /// Expands the toggles the edited row is hidden in.
+    fn reveal_edited(&mut self) {
+        let Some(e) = &self.editing else { return };
+        let Some(idx) = self.rows.iter().position(|r| r.block_id == e.block_id) else {
+            return;
+        };
+        for id in outline::ancestors(&self.rows, idx) {
+            if self.rows.iter().any(|r| r.block_id == id && r.toggle) {
+                self.open.insert(id.to_string());
+            }
+        }
     }
 
     /// The editable cell `col` of table row `row_id`: (table id, its text).
@@ -262,6 +281,14 @@ impl State {
             self.editing = None;
             self.last_error = Some("the edited block is gone; edit discarded".into());
         }
+        // a push renames local-* toggles: keep them expanded
+        let open = std::mem::take(&mut self.open);
+        self.open = open
+            .into_iter()
+            .map(|id| self.store.resolve_id(&id).unwrap_or(id))
+            .collect();
+        // e.g. Tab moved it into a collapsed toggle
+        self.reveal_edited();
     }
 
     fn try_refresh(&mut self) -> notion_core::Result<()> {
@@ -324,6 +351,7 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         | Message::EditorAction(_)
         | Message::EditKey(_)
         | Message::ToggleCheck(_)
+        | Message::ToggleOpen(_)
         | Message::SlashPick(_)
         | Message::Command(_)
         | Message::FocusSearch
@@ -381,6 +409,22 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             s.send(Cmd::Pull { id, force: false });
         }
         Message::ToggleCheck(id) => return toggle_check(s, &id),
+        Message::ToggleOpen(id) => {
+            if !s.open.contains(&id) {
+                s.open.insert(id);
+                return Task::none();
+            }
+            // collapsing over the edited row: commit and leave it first
+            // (before removing, or refresh would re-open it)
+            let inside = s.editing_row().and_then(|r| {
+                let i = s.rows.iter().position(|x| x.block_id == r.block_id)?;
+                Some(outline::ancestors(&s.rows, i).contains(&id.as_str()))
+            });
+            if inside == Some(true) && !s.leave() {
+                return Task::none();
+            }
+            s.open.remove(&id);
+        }
         Message::FocusSearch => {
             s.commit();
             return Task::batch([
@@ -686,17 +730,20 @@ fn on_edit_key(s: &mut State, k: EditKey) -> Task<Message> {
     let Some(idx) = s.rows.iter().position(|r| r.block_id == id) else {
         return Task::none();
     };
-    let editable = |r: &&Row| r.editable;
+    // editable and not inside a collapsed toggle
+    let shown = outline::shown(&s.rows, &s.open);
+    let rows = &s.rows;
+    let target = |i: &usize| rows[*i].editable && shown[*i];
     match key_action(k, e.caret()) {
         KeyAction::Pass(a) => e.content.perform(a),
         KeyAction::FocusPrev => {
-            if let Some(r) = s.rows[..idx].iter().rev().find(editable) {
-                return s.focus(&r.block_id.clone());
+            if let Some(i) = (0..idx).rev().find(target) {
+                return s.focus(&s.rows[i].block_id.clone());
             }
         }
         KeyAction::FocusNext => {
-            if let Some(r) = s.rows[idx + 1..].iter().find(editable) {
-                return s.focus(&r.block_id.clone());
+            if let Some(i) = (idx + 1..s.rows.len()).find(target) {
+                return s.focus(&s.rows[i].block_id.clone());
             }
         }
         KeyAction::NewBlockAfter => {
@@ -733,11 +780,10 @@ fn on_edit_key(s: &mut State, k: EditKey) -> Task<Message> {
             {
                 return Task::none();
             }
-            let prev = s.rows[..idx]
-                .iter()
+            let prev = (0..idx)
                 .rev()
-                .find(editable)
-                .map(|r| r.block_id.clone());
+                .find(target)
+                .map(|i| s.rows[i].block_id.clone());
             s.editing = None;
             let res = s
                 .store
@@ -1393,6 +1439,113 @@ mod tests {
         assert_eq!(editing(&s), Some("b"), "last row: stay");
         up(&mut s, Message::EditKey(EditKey::Up));
         assert_eq!(editing(&s), Some("c"));
+    }
+
+    #[test]
+    fn collapsed_toggles_hide_rows_from_up_down() {
+        use crate::outline::tests::{blk, rt};
+        let (mut s, _rx) = editing_state();
+        // a, a/c, img, m, b, then tg with child in, then z
+        let para = |id: &str, p: &str| blk(id, p, "paragraph", json!({ "rich_text": rt(id) }));
+        let mut kids = s.store.children("pg").unwrap();
+        kids.push(blk("tg", "pg", "toggle", json!({ "rich_text": rt("tg") })));
+        kids.push(para("z", "pg"));
+        s.store.replace_children("pg", "pg", &kids).unwrap();
+        s.store
+            .replace_children("pg", "tg", &[para("in", "tg")])
+            .unwrap();
+        s.refresh();
+
+        up(&mut s, Message::Focus("tg".into()));
+        up(&mut s, Message::EditKey(EditKey::Down));
+        assert_eq!(editing(&s), Some("z"), "collapsed: skips its child");
+        up(&mut s, Message::EditKey(EditKey::Up));
+        assert_eq!(editing(&s), Some("tg"));
+
+        up(&mut s, Message::ToggleOpen("tg".into()));
+        assert!(s.open.contains("tg"));
+        up(&mut s, Message::EditKey(EditKey::Down));
+        assert_eq!(editing(&s), Some("in"), "expanded: child reachable");
+
+        // collapsing over the edited row commits and leaves it
+        type_text(&mut s, "!");
+        up(&mut s, Message::ToggleOpen("tg".into()));
+        assert!(!s.open.contains("tg"));
+        assert_eq!(editing(&s), None);
+        assert_eq!(kinds(&s), ["update_block"], "only the text commit");
+
+        // focusing a hidden row expands its ancestors
+        up(&mut s, Message::Focus("in".into()));
+        assert!(s.open.contains("tg"));
+        up(&mut s, Message::EditKey(EditKey::Escape));
+        up(&mut s, Message::ToggleOpen("tg".into()));
+        up(&mut s, Message::ToggleOpen("tg".into()));
+        assert!(s.open.contains("tg"));
+        assert_eq!(kinds(&s), ["update_block"], "toggling queues no op");
+    }
+
+    #[test]
+    fn styled_blocks_render_without_panicking() {
+        use crate::outline::tests::{blk, rt};
+        let (mut s, _rx) = editing_state();
+        let tb = |id: &str, p: &str, t: &str| blk(id, p, t, json!({ "rich_text": rt(id) }));
+        let put = |s: &State, p: &str, kids: &[notion_core::model::Block]| {
+            s.store.replace_children("pg", p, kids).unwrap()
+        };
+        put(
+            &s,
+            "pg",
+            &[
+                tb("q", "pg", "quote"),
+                blk(
+                    "co",
+                    "pg",
+                    "callout",
+                    json!({ "rich_text": rt("co"), "icon": { "emoji": "⭐" } }),
+                ),
+                blk(
+                    "code",
+                    "pg",
+                    "code",
+                    json!({ "rich_text": rt("x"), "language": "rust" }),
+                ),
+                blk("d", "pg", "divider", json!({})),
+                blk(
+                    "h",
+                    "pg",
+                    "heading_2",
+                    json!({ "rich_text": rt("h"), "is_toggleable": true }),
+                ),
+                blk("cl", "pg", "column_list", json!({})),
+                blk(
+                    "t",
+                    "pg",
+                    "to_do",
+                    json!({ "rich_text": rt("t"), "checked": true }),
+                ),
+            ],
+        );
+        put(&s, "h", &[tb("hb", "h", "bulleted_list_item")]);
+        put(&s, "hb", &[tb("hbb", "hb", "bulleted_list_item")]);
+        put(
+            &s,
+            "cl",
+            &[
+                blk("c1", "cl", "column", json!({})),
+                blk("c2", "cl", "column", json!({})),
+            ],
+        );
+        put(&s, "c1", &[tb("tg", "c1", "toggle")]);
+        put(&s, "tg", &[tb("n", "tg", "numbered_list_item")]);
+        put(&s, "c2", &[tb("p2", "c2", "paragraph")]);
+        s.refresh();
+        let _ = crate::view::view(&s);
+        up(&mut s, Message::Focus("hbb".into()));
+        up(&mut s, Message::Focus("n".into()));
+        assert!(s.open.contains("h") && s.open.contains("tg"));
+        let _ = crate::view::view(&s);
+        up(&mut s, Message::Focus("code".into()));
+        let _ = crate::view::view(&s);
     }
 
     fn key(c: &str, ctrl: bool, shift: bool) -> iced::Event {

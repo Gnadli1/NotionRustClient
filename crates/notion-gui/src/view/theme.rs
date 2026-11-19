@@ -122,6 +122,23 @@ pub fn bordered(t: &Theme) -> container::Style {
     }
 }
 
+/// Callout and code blocks: a light tint, rounded.
+pub fn tinted(t: &Theme) -> container::Style {
+    container::Style {
+        background: Some(of(t).hover.into()),
+        border: Border::default().rounded(4),
+        ..container::Style::default()
+    }
+}
+
+/// The bar left of a quote.
+pub fn quote_bar(t: &Theme) -> rule::Style {
+    rule::Style {
+        color: of(t).text,
+        ..rule::default(t)
+    }
+}
+
 pub fn divider(t: &Theme) -> rule::Style {
     rule::Style {
         color: of(t).border,

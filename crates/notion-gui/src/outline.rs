@@ -1,5 +1,8 @@
 //! Flattened, read-only outline of a cached page. No iced types here.
 
+use std::collections::HashSet;
+use std::ops::Range;
+
 use notion_core::markdown::is_markdown_editable;
 use notion_core::model::{plain_text, BlockKind, RichText, RichTextKind};
 use notion_core::store::Store;
@@ -17,7 +20,8 @@ pub enum Marker {
     /// 1..=3
     Heading(u8),
     Quote,
-    Callout,
+    /// The icon emoji (💡 if it has none).
+    Callout(String),
     Code(String),
     Divider,
     Equation,
@@ -78,7 +82,7 @@ impl Marker {
             Marker::Todo(true) => "☑".into(),
             Marker::Toggle => "▸".into(),
             Marker::Quote => "│".into(),
-            Marker::Callout => "!".into(),
+            Marker::Callout(icon) => icon.clone(),
             Marker::Code(lang) => format!("```{lang}"),
             Marker::Divider => "───".into(),
             Marker::ChildPage(t) => format!("[page: {t}]"),
@@ -118,6 +122,101 @@ pub struct Row {
     /// Inside a synced block: nothing may queue an op on it (to-do clicks
     /// included).
     pub locked: bool,
+    /// Toggle block or toggleable heading: its children can be collapsed.
+    pub toggle: bool,
+    /// Bullets / numbers: how many same-kind list items it is nested in.
+    pub level: usize,
+}
+
+/// Notion's bullet for a nesting level: • ◦ ▪, cycling.
+pub fn bullet(level: usize) -> &'static str {
+    ["•", "◦", "▪"][level % 3]
+}
+
+/// Notion's number label for a nesting level: 1. a. i., cycling.
+pub fn number(n: usize, level: usize) -> String {
+    match level % 3 {
+        0 => format!("{n}."),
+        1 => {
+            // a..z, aa, ab, … (CSS lower-alpha)
+            let (mut n, mut s) = (n, String::new());
+            while n > 0 {
+                n -= 1;
+                s.insert(0, (b'a' + (n % 26) as u8) as char);
+                n /= 26;
+            }
+            format!("{s}.")
+        }
+        _ => {
+            let mut n = n;
+            let mut s = String::new();
+            for (v, r) in [
+                (1000, "m"),
+                (900, "cm"),
+                (500, "d"),
+                (400, "cd"),
+                (100, "c"),
+                (90, "xc"),
+                (50, "l"),
+                (40, "xl"),
+                (10, "x"),
+                (9, "ix"),
+                (5, "v"),
+                (4, "iv"),
+                (1, "i"),
+            ] {
+                while n >= v {
+                    s.push_str(r);
+                    n -= v;
+                }
+            }
+            format!("{s}.")
+        }
+    }
+}
+
+/// Per row: is it shown? Toggles are collapsed unless their id is in `open`;
+/// a collapsed toggle hides its whole subtree.
+pub fn shown(rows: &[Row], open: &HashSet<String>) -> Vec<bool> {
+    // rows deeper than this are inside a collapsed toggle
+    let mut hide_below = usize::MAX;
+    rows.iter()
+        .map(|r| {
+            if r.depth <= hide_below {
+                hide_below = usize::MAX;
+            } else {
+                return false;
+            }
+            if r.toggle && !open.contains(&r.block_id) {
+                hide_below = r.depth;
+            }
+            true
+        })
+        .collect()
+}
+
+/// Ids of `rows[idx]`'s ancestors, nearest first.
+pub fn ancestors(rows: &[Row], idx: usize) -> Vec<&str> {
+    let mut d = rows[idx].depth;
+    let mut out = Vec::new();
+    for r in rows[..idx].iter().rev() {
+        if r.depth < d {
+            out.push(r.block_id.as_str());
+            d = r.depth;
+        }
+    }
+    out
+}
+
+/// The row ranges of a column_list's columns (each column's subtree, without
+/// its own marker row).
+pub fn columns(rows: &[Row], idx: usize) -> Vec<Range<usize>> {
+    let d = rows[idx].depth;
+    let end = idx + 1 + subtree(rows, idx).len();
+    (idx + 1..end)
+        .filter(|&i| rows[i].depth == d + 1)
+        .map(|i| i + 1..i + 1 + subtree(rows, i).len())
+        .collect()
 }
 
 /// Blocks Notion lets hold children (headings only when toggleable, which a
@@ -131,7 +230,7 @@ pub fn can_have_children(m: &Marker) -> bool {
             | Marker::Todo(_)
             | Marker::Toggle
             | Marker::Quote
-            | Marker::Callout
+            | Marker::Callout(_)
     )
 }
 
@@ -189,7 +288,7 @@ pub fn unmovable_in_subtree(rows: &[Row], idx: usize) -> Option<&Marker> {
                 | Marker::Toggle
                 | Marker::Heading(_)
                 | Marker::Quote
-                | Marker::Callout
+                | Marker::Callout(_)
                 | Marker::Code(_)
                 | Marker::Divider
                 | Marker::Equation
@@ -201,7 +300,7 @@ pub fn unmovable_in_subtree(rows: &[Row], idx: usize) -> Option<&Marker> {
 /// databases are leaves.
 pub fn flatten(store: &Store, page_id: &str) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
-    walk(store, page_id, 0, false, &mut rows)?;
+    walk(store, page_id, 0, false, [0, 0], &mut rows)?;
     // a table of contents lists the page's headings
     let toc: String = rows
         .iter()
@@ -311,12 +410,14 @@ fn raw_marker(store: &Store, raw: &Value, locked: bool) -> Result<Marker> {
     })
 }
 
-/// `locked`: under a synced block.
+/// `locked`: under a synced block. `lists`: how many bulleted / numbered
+/// list items the parent is directly nested in (reset by any other block).
 fn walk(
     store: &Store,
     parent: &str,
     depth: usize,
     locked: bool,
+    lists: [usize; 2],
     rows: &mut Vec<Row>,
 ) -> Result<()> {
     let mut number = 0;
@@ -335,7 +436,12 @@ fn walk(
             BlockKind::ToDo { checked, .. } => Marker::Todo(*checked),
             BlockKind::Toggle(_) => Marker::Toggle,
             BlockKind::Quote(_) => Marker::Quote,
-            BlockKind::Callout(_) => Marker::Callout,
+            BlockKind::Callout(_) => Marker::Callout(
+                b.raw["callout"]["icon"]["emoji"]
+                    .as_str()
+                    .unwrap_or("💡")
+                    .into(),
+            ),
             BlockKind::Code { language, .. } => Marker::Code(language.clone()),
             BlockKind::Divider => Marker::Divider,
             BlockKind::Equation { .. } => Marker::Equation,
@@ -368,6 +474,18 @@ fn walk(
             BlockKind::ChildPage { .. } | BlockKind::ChildDatabase { .. }
         ) || matches!(marker, Marker::Table(_));
         let locked = locked || marker == Marker::Synced;
+        let toggle = match &b.kind {
+            BlockKind::Toggle(_) => true,
+            BlockKind::Heading1(h) | BlockKind::Heading2(h) | BlockKind::Heading3(h) => {
+                h.is_toggleable
+            }
+            _ => false,
+        };
+        let (level, kids) = match marker {
+            Marker::Bullet => (lists[0], [lists[0] + 1, 0]),
+            Marker::Number(_) => (lists[1], [0, lists[1] + 1]),
+            _ => (0, [0, 0]),
+        };
         rows.push(Row {
             block_id: b.id.clone(),
             parent: parent.to_string(),
@@ -376,9 +494,11 @@ fn walk(
             rich_text,
             editable: editable && !locked,
             locked,
+            toggle,
+            level,
         });
         if !leaf {
-            walk(store, &b.id, depth + 1, locked, rows)?;
+            walk(store, &b.id, depth + 1, locked, kids, rows)?;
         }
     }
     Ok(())
@@ -417,6 +537,7 @@ pub(crate) mod tests {
 
     fn r(id: &str, parent: &str, depth: usize, marker: Marker) -> Row {
         Row {
+            toggle: marker == Marker::Toggle,
             block_id: id.into(),
             parent: parent.into(),
             depth,
@@ -424,6 +545,7 @@ pub(crate) mod tests {
             rich_text: Vec::new(),
             editable: true,
             locked: false,
+            level: 0,
         }
     }
 
@@ -926,5 +1048,140 @@ pub(crate) mod tests {
         assert!(!r.editable);
         let r = one("unsupported", json!({}));
         assert_eq!(r.marker, Marker::Unsupported("unsupported".into()));
+    }
+
+    #[test]
+    fn toggles_collapse_their_subtree() {
+        // t, t/x, t/u (toggle), t/u/y, t/z, after, h (toggleable heading), h/k
+        let mut h = r("h", PID, 0, Marker::Heading(1));
+        h.toggle = true;
+        let rows = vec![
+            r("t", PID, 0, Marker::Toggle),
+            r("x", "t", 1, Marker::None),
+            r("u", "t", 1, Marker::Toggle),
+            r("y", "u", 2, Marker::None),
+            r("z", "t", 1, Marker::None),
+            r("after", PID, 0, Marker::None),
+            h,
+            r("k", "h", 1, Marker::None),
+        ];
+        let open = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        let vis = |o: &[&str]| -> Vec<&str> {
+            let sh = shown(&rows, &open(o));
+            rows.iter()
+                .zip(sh)
+                .filter(|(_, s)| *s)
+                .map(|(r, _)| r.block_id.as_str())
+                .collect()
+        };
+        assert_eq!(vis(&[]), ["t", "after", "h"], "all start collapsed");
+        assert_eq!(vis(&["u"]), ["t", "after", "h"], "inner open, outer shut");
+        assert_eq!(vis(&["t"]), ["t", "x", "u", "z", "after", "h"]);
+        assert_eq!(
+            vis(&["t", "u", "h"]),
+            ["t", "x", "u", "y", "z", "after", "h", "k"]
+        );
+        // revealing y means opening u and t
+        assert_eq!(ancestors(&rows, 3), ["u", "t"]);
+        assert_eq!(
+            vis(&ancestors(&rows, 3)),
+            ["t", "x", "u", "y", "z", "after", "h"]
+        );
+        assert!(ancestors(&rows, 5).is_empty());
+    }
+
+    #[test]
+    fn list_labels_by_depth() {
+        assert_eq!(
+            [bullet(0), bullet(1), bullet(2), bullet(3)],
+            ["•", "◦", "▪", "•"]
+        );
+        assert_eq!(number(3, 0), "3.");
+        assert_eq!(number(1, 1), "a.");
+        assert_eq!(number(26, 1), "z.");
+        assert_eq!(number(28, 1), "ab.");
+        assert_eq!(number(4, 2), "iv.");
+        assert_eq!(number(14, 2), "xiv.");
+        assert_eq!(number(2, 3), "2.");
+
+        // levels count same-kind list ancestors; other blocks reset them
+        let store = Store::open_in_memory().unwrap();
+        let b =
+            |id: &str, p: &str| blk(id, p, "bulleted_list_item", json!({ "rich_text": rt(id) }));
+        store
+            .replace_children(PID, PID, &[b("b0", PID), num("n0", PID)])
+            .unwrap();
+        store.replace_children(PID, "b0", &[b("b1", "b0")]).unwrap();
+        store
+            .replace_children(PID, "b1", &[b("b2", "b1"), num("n1", "b1")])
+            .unwrap();
+        store
+            .replace_children(PID, "n0", &[num("n01", "n0")])
+            .unwrap();
+        store
+            .replace_children(
+                PID,
+                "n01",
+                &[blk("t", "n01", "toggle", json!({ "rich_text": rt("t") }))],
+            )
+            .unwrap();
+        let rows = page_of(&store, "t", &[b("tb", "t")]);
+        let got: Vec<(&str, usize)> = rows
+            .iter()
+            .map(|r| (r.block_id.as_str(), r.level))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("b0", 0),
+                ("b1", 1),
+                ("b2", 2),
+                ("n1", 0),
+                ("n0", 0),
+                ("n01", 1),
+                ("t", 0),
+                ("tb", 0)
+            ]
+        );
+        assert!(rows.iter().find(|r| r.block_id == "t").unwrap().toggle);
+    }
+
+    #[test]
+    fn callout_icon_and_toggleable_headings() {
+        let c = one(
+            "callout",
+            json!({ "rich_text": rt("c"), "icon": { "type": "emoji", "emoji": "⭐" } }),
+        );
+        assert_eq!(c.marker, Marker::Callout("⭐".into()));
+        let c = one("callout", json!({ "rich_text": rt("c"), "icon": null }));
+        assert_eq!(c.marker, Marker::Callout("💡".into()));
+        assert!(
+            one(
+                "heading_2",
+                json!({ "rich_text": rt("h"), "is_toggleable": true })
+            )
+            .toggle
+        );
+        assert!(!one("heading_2", json!({ "rich_text": rt("h") })).toggle);
+        assert!(!c.toggle);
+    }
+
+    #[test]
+    fn column_ranges() {
+        // before, cl, c1, a, a/a1, c2, b, after
+        let rows = vec![
+            r("before", PID, 0, Marker::None),
+            r("cl", PID, 0, Marker::ColumnList),
+            r("c1", "cl", 1, Marker::Column),
+            r("a", "c1", 2, Marker::None),
+            r("a1", "a", 3, Marker::None),
+            r("c2", "cl", 1, Marker::Column),
+            r("b", "c2", 2, Marker::None),
+            r("after", PID, 0, Marker::None),
+        ];
+        assert_eq!(columns(&rows, 1), [3..5, 6..7]);
+        // an empty column is an empty range
+        let rows = &rows[..3];
+        assert_eq!(columns(rows, 1), vec![(3..3)]);
     }
 }
