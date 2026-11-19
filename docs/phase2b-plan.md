@@ -55,3 +55,10 @@ Notion can't change a block's type: a PATCH has to keep the same type. Conversio
 
 ## Shared pages: the access limit
 An internal integration only sees pages that have been shared with it: open the page or a parent page in Notion, then ••• → Connections → your integration. A page that someone else's workspace shares with you, such as a teacher's, is only reachable if someone in that workspace adds the integration. That is a limit of Notion's API, not of this app. A **public** integration with OAuth can't get around it either; it only makes adding the integration easier.
+
+## Known gaps after S3 (reviewed, deferred)
+1. **Notion-hosted file links expire.** Links to files stored in Notion use signed URLs that expire after about an hour. Pull the page again before opening an old one.
+2. **Only http and https links open.** Other link types, such as `file://`, are refused for safety.
+3. **Tab in a table cell leaves the cell.** It commits the edit and doesn't move to the next cell. You can't add or remove table rows or columns.
+4. **Columns aren't side by side yet.** Column content shows as nested rows; L2 puts it side by side.
+5. **Databases don't open.** Clicking a `child_database` shows "databases not supported yet".

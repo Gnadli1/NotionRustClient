@@ -23,7 +23,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::edit::{key_action, EditKey, Editing, KeyAction, EDITOR_ID};
 use crate::keys::{self, Chord, Command, Keymap};
-use crate::outline::{self, Marker, Row};
+use crate::outline::{self, Marker, Row, Table};
 use crate::slash::{self, Menu, MenuKey};
 use crate::worker::{Cmd, Event};
 
@@ -44,6 +44,12 @@ pub enum Message {
     WorkerGone,
     /// Row clicked: edit it if it is editable.
     Focus(String),
+    /// Table cell clicked (table_row id, column): edit it if it is editable.
+    FocusCell(String, usize),
+    /// Link card clicked: hand the URL to xdg-open.
+    OpenLink(String),
+    /// child_database / database link clicked: tried like a page.
+    OpenDatabase(String),
     EditorAction(text_editor::Action),
     /// A key the row editor hands to the app.
     EditKey(EditKey),
@@ -77,6 +83,8 @@ pub struct State {
     results: Vec<(String, String)>,
     /// Picked search result waiting for its pull.
     pending_open: Option<String>,
+    /// Last database opened; its pull failing gets a friendlier error.
+    pending_db: Option<String>,
     /// One entry per command sent and not yet answered (the worker answers
     /// each with one event, in order); true = Push.
     sent: VecDeque<bool>,
@@ -99,6 +107,7 @@ impl State {
             search: String::new(),
             results: Vec::new(),
             pending_open: None,
+            pending_db: None,
             sent: VecDeque::new(),
             editing: None,
             keys: Keymap::default(),
@@ -135,7 +144,9 @@ impl State {
         };
         // a push may have renamed a local-* block meanwhile
         let res = self.store.resolve_id(&e.block_id).and_then(|id| {
-            if e.equation {
+            if let Some((row, col)) = &e.cell {
+                sync::local_edit_table_cell(&self.store, row, *col, rt)?;
+            } else if e.equation {
                 sync::local_edit_equation(&self.store, &id, &plain_text(&rt))?;
             } else {
                 sync::local_edit_rich(&self.store, &id, rt)?;
@@ -176,6 +187,50 @@ impl State {
         operation::focus(EDITOR_ID)
     }
 
+    /// The editable cell `col` of table row `row_id`: (table id, its text).
+    fn cell(&self, row_id: &str, col: usize) -> Option<(&str, &[RichText])> {
+        self.rows.iter().find_map(|r| match &r.marker {
+            Marker::Table(t) if !r.locked => t
+                .rows
+                .iter()
+                .find(|tr| tr.id == row_id)
+                .and_then(|tr| tr.cells.get(col))
+                .filter(|c| c.editable)
+                .map(|c| (r.block_id.as_str(), c.rich_text.as_slice())),
+            _ => None,
+        })
+    }
+
+    /// The edited row, or cell, is still in the outline.
+    fn edited_exists(&self) -> bool {
+        match self.editing.as_ref().and_then(|e| e.cell.as_ref()) {
+            // editable or not: a cell that turned read-only keeps its typed text
+            Some((row, col)) => self.rows.iter().any(|r| match &r.marker {
+                Marker::Table(t) => t
+                    .rows
+                    .iter()
+                    .any(|tr| tr.id == *row && tr.cells.len() > *col),
+                _ => false,
+            }),
+            None => self.editing_row().is_some(),
+        }
+    }
+
+    /// Commit the current row and start editing a table cell, if it is editable.
+    fn focus_cell(&mut self, row_id: &str, col: usize) -> Task<Message> {
+        if !self.commit() {
+            return Task::none();
+        }
+        let found = self
+            .cell(row_id, col)
+            .map(|(table, rt)| Editing::cell(table, row_id, col, rt));
+        let Some(e) = found else {
+            return Task::none();
+        };
+        self.editing = Some(e);
+        operation::focus(EDITOR_ID)
+    }
+
     fn send(&mut self, cmd: Cmd) {
         let push = cmd == Cmd::Push;
         match self.cmds.send(cmd) {
@@ -202,7 +257,7 @@ impl State {
                 Err(err) => self.last_error = Some(err.to_string()),
             }
         }
-        if self.editing.is_some() && self.editing_row().is_none() {
+        if self.editing.is_some() && !self.edited_exists() {
             self.editing = None;
             self.last_error = Some("the edited block is gone; edit discarded".into());
         }
@@ -263,6 +318,8 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         // a push is modal: the worker may already have sent the ops an edit
         // would rewrite
         Message::Focus(_)
+        | Message::FocusCell(..)
+        | Message::OpenDatabase(_)
         | Message::EditorAction(_)
         | Message::EditKey(_)
         | Message::ToggleCheck(_)
@@ -278,6 +335,7 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
                 return Task::none();
             }
             s.pending_open = None;
+            s.pending_db = None;
             s.current = Some(id);
             s.refresh();
         }
@@ -299,6 +357,15 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             let q = s.search.trim().to_string();
             if !q.is_empty() {
                 s.send(Cmd::Search(q));
+            }
+        }
+        Message::OpenDatabase(id) => {
+            s.pending_db = Some(id.clone());
+            return update(s, Message::PickResult(id));
+        }
+        Message::OpenLink(url) => {
+            if let Err(e) = open_url(&url) {
+                s.last_error = Some(e);
             }
         }
         Message::PickResult(id) => {
@@ -330,6 +397,7 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             };
         }
         Message::Focus(id) => return s.focus(&id),
+        Message::FocusCell(row, col) => return s.focus_cell(&row, col),
         Message::EditorAction(a) => return on_editor_action(s, a),
         Message::SlashPick(i) => return slash_pick(s, i),
         // the message it maps to applies its own push rule
@@ -355,6 +423,7 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
                 Event::Pulled { id, .. } => {
                     if s.pending_open.as_ref() == Some(id) && s.leave() {
                         s.pending_open = None;
+                        s.pending_db = None;
                         s.current = Some(id.clone());
                     }
                     s.last_error = None;
@@ -378,10 +447,16 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
                 }
                 Event::SearchResults(r) => s.results = r.clone(),
                 Event::Error(e) => {
+                    let db = s.pending_open.is_some() && s.pending_open == s.pending_db;
                     s.pending_open = None;
+                    s.pending_db = None;
                     // a push can fail after applying some ops
                     s.refresh();
-                    s.last_error = Some(e.clone());
+                    s.last_error = Some(if db {
+                        "databases not supported yet".into()
+                    } else {
+                        e.clone()
+                    });
                 }
             }
         }
@@ -402,7 +477,7 @@ fn on_editor_action(s: &mut State, a: text_editor::Action) -> Task<Message> {
     let (line, col) = e.pos();
     if e.menu.is_some() {
         e.menu_query();
-    } else if typed == Some('/') && !e.code {
+    } else if typed == Some('/') && !e.code && e.cell.is_none() {
         e.menu = Some(Menu {
             line,
             slash: col - 1,
@@ -476,7 +551,13 @@ fn on_command(s: &mut State, c: Command) -> Task<Message> {
 /// Converts the edited block to `kind` and continues editing it with `buf`
 /// (cursor at `pos`). On refusal the buffer is left as typed.
 fn convert(s: &mut State, kind: TargetKind, buf: &str, pos: (usize, usize)) -> Task<Message> {
-    let Some(id) = s.editing.as_ref().map(|e| e.block_id.clone()) else {
+    // a table cell is not a block
+    let Some(id) = s
+        .editing
+        .as_ref()
+        .filter(|e| e.cell.is_none())
+        .map(|e| e.block_id.clone())
+    else {
         return Task::none();
     };
     if kind == TargetKind::Divider && !buf.trim().is_empty() {
@@ -584,6 +665,20 @@ fn on_edit_key(s: &mut State, k: EditKey) -> Task<Message> {
             }
             return Task::none();
         }
+    }
+    // a table cell: only text editing; the row/block keys commit and leave
+    if e.cell.is_some() {
+        match key_action(k, e.caret()) {
+            KeyAction::Pass(a) => e.content.perform(a),
+            KeyAction::NewBlockAfter
+            | KeyAction::Leave
+            | KeyAction::Indent
+            | KeyAction::Outdent => {
+                s.leave();
+            }
+            _ => {}
+        }
+        return Task::none();
     }
     let id = e.block_id.clone();
     let Some(idx) = s.rows.iter().position(|r| r.block_id == id) else {
@@ -698,7 +793,12 @@ fn toggle_check(s: &mut State, id: &str) -> Task<Message> {
     if !s.commit() {
         return Task::none();
     }
-    let Some(Marker::Todo(checked)) = s.rows.iter().find(|r| r.block_id == id).map(|r| &r.marker)
+    // a synced block's to-do is locked
+    let Some(Marker::Todo(checked)) = s
+        .rows
+        .iter()
+        .find(|r| r.block_id == id && !r.locked)
+        .map(|r| &r.marker)
     else {
         return Task::none();
     };
@@ -748,6 +848,48 @@ pub fn subscription(_: &State) -> Subscription<Message> {
     event::listen_with(shortcut)
 }
 
+/// Only web links go to xdg-open (a file:// one could start a local
+/// script or .desktop file).
+fn allowed_url(url: &str) -> bool {
+    let l = url.to_ascii_lowercase();
+    ["http://", "https://"].iter().any(|p| l.starts_with(p))
+}
+
+/// Starts `xdg-open url` without waiting for it.
+fn open_url(url: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    if !allowed_url(url) {
+        return Err(format!("not opening {url}: only http and https links"));
+    }
+    let mut child = Command::new("xdg-open")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("xdg-open: {e}"))?;
+    // reap it so it doesn't linger as a zombie
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+/// What clicking a read-only row does, if anything.
+fn click(r: &Row) -> Option<Message> {
+    Some(match &r.marker {
+        Marker::LinkCard { url, .. } => Message::OpenLink(url.clone()),
+        Marker::LinkToPage {
+            id,
+            database: false,
+            ..
+        } => Message::PickResult(id.clone()),
+        Marker::LinkToPage { id, .. } => Message::OpenDatabase(id.clone()),
+        // a child page's / database's block id is its own id
+        Marker::ChildPage(_) => Message::PickResult(r.block_id.clone()),
+        Marker::ChildDatabase(_) => Message::OpenDatabase(r.block_id.clone()),
+        _ => return None,
+    })
+}
+
 fn untitled(t: &str) -> &str {
     if t.is_empty() {
         "Untitled"
@@ -790,6 +932,72 @@ fn styled(t: &RichText) -> Span<'_, ()> {
         .color_maybe(t.href.as_ref().map(|_| LINK))
 }
 
+fn editor<'a>(e: &'a Editing, keys: &'a Keymap, size: u32) -> Element<'a, Message> {
+    text_editor(&e.content)
+        .id(EDITOR_ID)
+        .on_action(Message::EditorAction)
+        .key_binding(move |kp| crate::edit::binding(kp, keys))
+        .font(if e.code {
+            Font::MONOSPACE
+        } else {
+            Font::DEFAULT
+        })
+        .size(size)
+        .into()
+}
+
+/// A table as a grid; header row / column in bold, the edited cell as an editor.
+fn table_view<'a>(
+    t: &'a Table,
+    editing: Option<&'a Editing>,
+    keys: &'a Keymap,
+) -> Element<'a, Message> {
+    let rows = t.rows.iter().enumerate().map(|(i, tr)| {
+        let cells = tr.cells.iter().enumerate().map(|(j, c)| {
+            let bold = (t.column_header && i == 0) || (t.row_header && j == 0);
+            let edited = editing.filter(|e| {
+                e.cell
+                    .as_ref()
+                    .is_some_and(|(id, col)| *id == tr.id && *col == j)
+            });
+            let body: Element<_> = match edited {
+                Some(e) => editor(e, keys, 15),
+                None => {
+                    let spans: Vec<Span<'_, ()>> = c
+                        .rich_text
+                        .iter()
+                        .map(|rt| {
+                            let mut sp = styled(rt);
+                            if bold {
+                                sp.font = Some(Font {
+                                    weight: Weight::Bold,
+                                    ..sp.font.unwrap_or_default()
+                                });
+                            }
+                            sp
+                        })
+                        .collect();
+                    let cell = container(rich_text(spans).size(15)).width(Fill);
+                    if c.editable {
+                        mouse_area(cell)
+                            .on_press(Message::FocusCell(tr.id.clone(), j))
+                            .into()
+                    } else {
+                        cell.into()
+                    }
+                }
+            };
+            container(body)
+                .padding(4)
+                .width(Fill)
+                .style(container::bordered_box)
+                .into()
+        });
+        row(cells).into()
+    });
+    column(rows).into()
+}
+
 fn row_view<'a>(
     r: &'a Row,
     editing: Option<&'a Editing>,
@@ -804,23 +1012,27 @@ fn row_view<'a>(
     };
     let grey = matches!(
         r.marker,
-        Marker::Unsupported(_) | Marker::ChildPage(_) | Marker::ChildDatabase(_) | Marker::Divider
+        Marker::Unsupported(_)
+            | Marker::Divider
+            | Marker::Synced
+            | Marker::ColumnList
+            | Marker::Column
+            | Marker::TableOfContents
+            | Marker::Breadcrumb
     );
+    let link = click(r).is_some();
     let indent = iced::Padding::ZERO.left(r.depth as f32 * 24.0);
+    if let Marker::Table(t) = &r.marker {
+        let editing = editing.filter(|e| e.block_id == r.block_id);
+        return container(table_view(t, editing, keys))
+            .padding(indent)
+            .into();
+    }
     let label = r.marker.label();
     if let Some(e) = editing.filter(|e| e.block_id == r.block_id) {
-        let editor = text_editor(&e.content)
-            .id(EDITOR_ID)
-            .on_action(Message::EditorAction)
-            .key_binding(move |kp| crate::edit::binding(kp, keys))
-            .font(if e.code {
-                Font::MONOSPACE
-            } else {
-                Font::DEFAULT
-            })
-            .size(size);
+        let editor = editor(e, keys, size);
         let body: Element<_> = if label.is_empty() {
-            editor.into()
+            editor
         } else {
             let marker = mouse_area(text(label).size(size))
                 .on_press(Message::ToggleCheck(r.block_id.clone()));
@@ -840,12 +1052,17 @@ fn row_view<'a>(
             .on_press(Message::ToggleCheck(r.block_id.clone()))
     });
     if todo.is_none() && !label.is_empty() {
-        let sep = if matches!(r.marker, Marker::Code(_)) {
+        let sep = if matches!(r.marker, Marker::Code(_) | Marker::TableOfContents) {
             "\n"
         } else {
             " "
         };
-        spans.push(span(format!("{label}{sep}")).color_maybe(grey.then_some(GREY)));
+        let color = if link {
+            Some(LINK)
+        } else {
+            grey.then_some(GREY)
+        };
+        spans.push(span(format!("{label}{sep}")).color_maybe(color));
     }
     spans.extend(r.rich_text.iter().map(styled));
     let content: Element<_> = match todo {
@@ -859,6 +1076,11 @@ fn row_view<'a>(
     if r.editable {
         mouse_area(body)
             .on_press(Message::Focus(r.block_id.clone()))
+            .into()
+    } else if let Some(msg) = click(r) {
+        mouse_area(body)
+            .on_press(msg)
+            .interaction(iced::mouse::Interaction::Pointer)
             .into()
     } else {
         body.into()
@@ -1908,5 +2130,249 @@ mod tests {
             up(&mut s, Message::EditKey(EditKey::Escape));
             assert_eq!(expression(&s, &id), tex);
         }
+    }
+
+    /// Page "pg": s (synced: st to-do, sp, stbl table), card (image link),
+    /// tbl (r1 = [a, b], r2 = [mention, c]), b.
+    fn s3_state() -> (State, UnboundedReceiver<Cmd>) {
+        use crate::outline::tests::{blk, rt};
+        let (mut s, rx) = state();
+        s.store
+            .upsert_page(&page(
+                "pg",
+                json!({ "type": "workspace", "workspace": true }),
+            ))
+            .unwrap();
+        let mention = json!([{ "type": "mention", "mention": { "type": "date", "date": { "start": "2025-01-01" } },
+            "plain_text": "d", "annotations": {} }]);
+        let para = |id: &str, p: &str| blk(id, p, "paragraph", json!({ "rich_text": rt(id) }));
+        let table = |id: &str, p: &str| {
+            blk(
+                id,
+                p,
+                "table",
+                json!({ "table_width": 2, "has_column_header": true, "has_row_header": false }),
+            )
+        };
+        let trow = |id: &str, p: &str, cells: serde_json::Value| {
+            blk(id, p, "table_row", json!({ "cells": cells }))
+        };
+        let put = |s: &State, parent: &str, kids: &[notion_core::model::Block]| {
+            s.store.replace_children("pg", parent, kids).unwrap()
+        };
+        put(
+            &s,
+            "pg",
+            &[
+                blk("s", "pg", "synced_block", json!({ "synced_from": null })),
+                blk(
+                    "card",
+                    "pg",
+                    "image",
+                    json!({ "type": "external", "external": { "url": "https://x.example/a.png" }, "caption": [] }),
+                ),
+                table("tbl", "pg"),
+                para("b", "pg"),
+            ],
+        );
+        put(
+            &s,
+            "s",
+            &[
+                blk(
+                    "st",
+                    "s",
+                    "to_do",
+                    json!({ "rich_text": rt("st"), "checked": false }),
+                ),
+                para("sp", "s"),
+                table("stbl", "s"),
+            ],
+        );
+        put(&s, "stbl", &[trow("sr", "stbl", json!([rt("x"), rt("y")]))]);
+        put(
+            &s,
+            "tbl",
+            &[
+                trow("r1", "tbl", json!([rt("a"), rt("b")])),
+                trow("r2", "tbl", json!([mention, rt("c")])),
+            ],
+        );
+        up(&mut s, Message::Open("pg".into()));
+        (s, rx)
+    }
+
+    #[test]
+    fn synced_and_link_rows_are_read_only() {
+        let (mut s, _rx) = s3_state();
+        for id in ["s", "st", "sp", "card", "tbl"] {
+            up(&mut s, Message::Focus(id.into()));
+            assert_eq!(editing(&s), None, "{id} focused");
+            // without a focused row these do nothing
+            up(&mut s, Message::EditKey(EditKey::Backspace));
+            up(&mut s, Message::EditKey(EditKey::Indent));
+            up(
+                &mut s,
+                Message::Command(Command::Block(TargetKind::Heading1)),
+            );
+            type_text(&mut s, "/x");
+        }
+        up(&mut s, Message::ToggleCheck("st".into()));
+        up(&mut s, Message::FocusCell("sr".into(), 0));
+        assert_eq!(editing(&s), None, "cell of a synced table");
+
+        // from an editable neighbour: Up/Down skip them, Tab can't nest into them
+        up(&mut s, Message::Focus("b".into()));
+        up(&mut s, Message::EditKey(EditKey::Up));
+        assert_eq!(editing(&s), Some("b"), "nothing editable above");
+        up(&mut s, Message::EditKey(EditKey::Indent));
+        let b = s.rows.iter().find(|r| r.block_id == "b").unwrap();
+        assert_eq!(b.depth, 0);
+        assert!(s.store.queued_ops().unwrap().is_empty(), "{:?}", kinds(&s));
+        let st = s.rows.iter().find(|r| r.block_id == "st").unwrap();
+        assert_eq!(st.marker, Marker::Todo(false));
+    }
+
+    fn cell_text(s: &State, row: &str, col: usize) -> String {
+        s.rows
+            .iter()
+            .find_map(|r| match &r.marker {
+                Marker::Table(t) => t.rows.iter().find(|tr| tr.id == row),
+                _ => None,
+            })
+            .map(|tr| plain_text(&tr.cells[col].rich_text))
+            .unwrap()
+    }
+
+    #[test]
+    fn table_cells_edit_and_commit() {
+        let (mut s, _rx) = s3_state();
+        up(&mut s, Message::FocusCell("r2".into(), 0));
+        assert_eq!(editing(&s), None, "mention cell is read-only");
+
+        up(&mut s, Message::FocusCell("r1".into(), 1));
+        assert_eq!(editing(&s), Some("tbl"));
+        // no `/` menu, no conversion, Backspace never deletes the table
+        type_text(&mut s, "/");
+        assert!(s.editing.as_ref().unwrap().menu.is_none());
+        up(
+            &mut s,
+            Message::Command(Command::Block(TargetKind::Heading1)),
+        );
+        for _ in 0..3 {
+            up(&mut s, Message::EditKey(EditKey::Backspace));
+        }
+        assert_eq!(s.editing.as_ref().unwrap().content.text(), "");
+        type_text(&mut s, "**B**");
+        assert!(s.store.queued_ops().unwrap().is_empty());
+        up(&mut s, Message::EditKey(EditKey::Escape));
+        assert_eq!(editing(&s), None);
+        assert_eq!(cell_text(&s, "r1", 1), "B");
+        assert_eq!(kinds(&s), ["update_block"]);
+        let notion_core::ops::OpKind::UpdateBlock { block_id, body } =
+            &s.store.queued_ops().unwrap()[0].kind
+        else {
+            panic!()
+        };
+        assert_eq!(block_id, "r1");
+        assert_eq!(body["table_row"]["cells"][0][0]["plain_text"], "a");
+        assert_eq!(
+            body["table_row"]["cells"][1][0]["annotations"]["bold"],
+            true
+        );
+
+        // Enter and Tab commit too; clicking another cell commits the first
+        for key in [EditKey::Enter, EditKey::Indent] {
+            up(&mut s, Message::FocusCell("r1".into(), 0));
+            type_text(&mut s, "!");
+            up(&mut s, Message::EditKey(key));
+            assert_eq!(editing(&s), None);
+        }
+        up(&mut s, Message::FocusCell("r2".into(), 1));
+        type_text(&mut s, "?");
+        up(&mut s, Message::FocusCell("r1".into(), 1));
+        assert_eq!(cell_text(&s, "r1", 0), "a!!");
+        assert_eq!(cell_text(&s, "r2", 1), "c?");
+        assert_eq!(kinds(&s).len(), 4);
+        assert_eq!(ids(&s), ["s", "st", "sp", "stbl", "card", "tbl", "b"]);
+
+        // a pull makes the edited cell read-only (a mention): the text survives
+        use crate::outline::tests::{blk, rt};
+        let mention = json!([{ "type": "mention", "mention": { "type": "date", "date": { "start": "2025-01-01" } },
+            "plain_text": "d", "annotations": {} }]);
+        type_text(&mut s, "Z");
+        let row = |c0: serde_json::Value| {
+            blk(
+                "r1",
+                "tbl",
+                "table_row",
+                json!({ "cells": [c0, mention.clone()] }),
+            )
+        };
+        s.store
+            .replace_children("pg", "tbl", &[row(rt("a!!"))])
+            .unwrap();
+        s.refresh();
+        assert_eq!(editing(&s), Some("tbl"), "editor kept");
+        up(&mut s, Message::EditKey(EditKey::Escape));
+        assert_eq!(cell_text(&s, "r1", 1), "BZ");
+
+        // the edited row vanishes (a pull): the editor is dropped, not stuck
+        up(&mut s, Message::FocusCell("r1".into(), 0));
+        assert_eq!(editing(&s), Some("tbl"));
+        s.store.replace_children("pg", "tbl", &[]).unwrap();
+        s.refresh();
+        assert_eq!(editing(&s), None);
+        assert!(s.last_error.as_deref().unwrap().contains("gone"));
+    }
+
+    #[test]
+    fn link_clicks() {
+        let (mut s, mut rx) = s3_state();
+        let card = s.rows.iter().find(|r| r.block_id == "card").unwrap();
+        assert!(
+            matches!(click(card), Some(Message::OpenLink(u)) if u == "https://x.example/a.png")
+        );
+        assert!(allowed_url("https://a") && allowed_url("HTTP://a"));
+        for bad in [
+            "file:///tmp/x.desktop",
+            "javascript:alert(1)",
+            "-x",
+            "ftp://a",
+        ] {
+            assert!(!allowed_url(bad), "{bad}");
+        }
+        up(&mut s, Message::OpenLink("mailto:x@y".into()));
+        assert!(s.last_error.as_deref().unwrap().contains("only http"));
+
+        // a database: its pull fails with a friendly error
+        up(&mut s, Message::OpenDatabase("db".into()));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Cmd::Pull {
+                id: "db".into(),
+                force: false
+            }
+        );
+        up(
+            &mut s,
+            Message::Worker(Arc::new(Event::Error("400 validation_error".into()))),
+        );
+        assert_eq!(s.last_error.as_deref(), Some("databases not supported yet"));
+        // opening something else forgets the database
+        up(&mut s, Message::OpenDatabase("db".into()));
+        up(&mut s, Message::Open("pg".into()));
+        up(
+            &mut s,
+            Message::Worker(Arc::new(Event::Error("offline".into()))),
+        );
+        assert_eq!(s.last_error.as_deref(), Some("offline"));
+        // a page pull failing keeps its own error
+        up(&mut s, Message::PickResult("pg2".into()));
+        up(
+            &mut s,
+            Message::Worker(Arc::new(Event::Error("offline".into()))),
+        );
+        assert_eq!(s.last_error.as_deref(), Some("offline"));
     }
 }

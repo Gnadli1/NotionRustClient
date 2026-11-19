@@ -134,6 +134,8 @@ pub struct Editing {
     pub content: text_editor::Content,
     /// The open `/` menu.
     pub menu: Option<Menu>,
+    /// A table cell (table_row id, column); `block_id` is then the table's.
+    pub cell: Option<(String, usize)>,
 }
 
 impl Editing {
@@ -154,6 +156,23 @@ impl Editing {
             content,
             original,
             menu: None,
+            cell: None,
+        }
+    }
+
+    /// Cell `col` of table row `row_id` in table `table_id`, as Markdown.
+    pub fn cell(table_id: &str, row_id: &str, col: usize, rich_text: &[RichText]) -> Self {
+        let original = to_markdown(rich_text);
+        let mut content = text_editor::Content::with_text(&original);
+        content.perform(Action::Move(Motion::DocumentEnd));
+        Editing {
+            block_id: table_id.into(),
+            code: false,
+            equation: false,
+            content,
+            original,
+            menu: None,
+            cell: Some((row_id.into(), col)),
         }
     }
 

@@ -1,9 +1,10 @@
 //! Flattened, read-only outline of a cached page. No iced types here.
 
 use notion_core::markdown::is_markdown_editable;
-use notion_core::model::{BlockKind, RichText, RichTextKind};
+use notion_core::model::{plain_text, BlockKind, RichText, RichTextKind};
 use notion_core::store::Store;
 use notion_core::Result;
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Marker {
@@ -22,8 +23,48 @@ pub enum Marker {
     Equation,
     ChildPage(String),
     ChildDatabase(String),
+    /// bookmark, embed, link_preview, file, pdf, video, image, audio: opens
+    /// `url` with xdg-open.
+    LinkCard {
+        kind: String,
+        url: String,
+        label: String,
+    },
+    /// link_to_page; `title` is the cached title, "" if not cached.
+    LinkToPage {
+        id: String,
+        title: String,
+        database: bool,
+    },
+    /// synced_block: it and its subtree are locked.
+    Synced,
+    ColumnList,
+    Column,
+    TableOfContents,
+    Breadcrumb,
+    /// A table and its rows, as one outline row.
+    Table(Table),
     /// Any other block type, shown as a grey `[type]`.
     Unsupported(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Table {
+    pub column_header: bool,
+    pub row_header: bool,
+    pub rows: Vec<TableRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableRow {
+    pub id: String,
+    pub cells: Vec<Cell>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cell {
+    pub rich_text: Vec<RichText>,
+    pub editable: bool,
 }
 
 impl Marker {
@@ -42,6 +83,23 @@ impl Marker {
             Marker::Divider => "───".into(),
             Marker::ChildPage(t) => format!("[page: {t}]"),
             Marker::ChildDatabase(t) => format!("[database: {t}]"),
+            Marker::LinkCard { kind, label, .. } => format!("[{kind}] {label}"),
+            Marker::LinkToPage {
+                title, database, ..
+            } => {
+                let what = if *database { "database" } else { "page" };
+                if title.is_empty() {
+                    format!("→ [{what}]")
+                } else {
+                    format!("→ {title}")
+                }
+            }
+            Marker::Synced => "⟳ synced".into(),
+            Marker::ColumnList => "[columns]".into(),
+            Marker::Column => "[column]".into(),
+            Marker::TableOfContents => "[table of contents]".into(),
+            Marker::Breadcrumb => "[breadcrumb]".into(),
+            Marker::Table(_) => String::new(),
             Marker::Unsupported(t) => format!("[{t}]"),
         }
     }
@@ -57,6 +115,9 @@ pub struct Row {
     pub rich_text: Vec<RichText>,
     /// Text block whose rich text survives a Markdown round trip.
     pub editable: bool,
+    /// Inside a synced block: nothing may queue an op on it (to-do clicks
+    /// included).
+    pub locked: bool,
 }
 
 /// Blocks Notion lets hold children (headings only when toggleable, which a
@@ -104,19 +165,34 @@ pub fn indent_target(rows: &[Row], idx: usize) -> Option<(String, Option<String>
     Some((prev.block_id.clone(), last))
 }
 
-/// Shift+Tab: (new parent = grandparent, after = parent). None at top level.
+/// Shift+Tab: (new parent = grandparent, after = parent). None at top level
+/// and in a column (the block would land in the column_list).
 pub fn outdent_target(rows: &[Row], idx: usize) -> Option<(String, Option<String>)> {
     let d = rows[idx].depth.checked_sub(1)?;
     let parent = &rows[..idx].iter().rev().find(|r| r.depth == d)?;
+    if parent.marker == Marker::Column {
+        return None;
+    }
     Some((parent.parent.clone(), Some(parent.block_id.clone())))
 }
 
-/// First block in the subtree that push's copy-then-delete can't recreate.
+/// First block in the subtree that push's copy-then-delete can't recreate
+/// (anything not modelled in core).
 pub fn unmovable_in_subtree(rows: &[Row], idx: usize) -> Option<&Marker> {
     subtree(rows, idx).iter().map(|r| &r.marker).find(|m| {
-        matches!(
+        !matches!(
             m,
-            Marker::Unsupported(_) | Marker::ChildPage(_) | Marker::ChildDatabase(_)
+            Marker::None
+                | Marker::Bullet
+                | Marker::Number(_)
+                | Marker::Todo(_)
+                | Marker::Toggle
+                | Marker::Heading(_)
+                | Marker::Quote
+                | Marker::Callout
+                | Marker::Code(_)
+                | Marker::Divider
+                | Marker::Equation
         )
     })
 }
@@ -125,11 +201,124 @@ pub fn unmovable_in_subtree(rows: &[Row], idx: usize) -> Option<&Marker> {
 /// databases are leaves.
 pub fn flatten(store: &Store, page_id: &str) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
-    walk(store, page_id, 0, &mut rows)?;
+    walk(store, page_id, 0, false, &mut rows)?;
+    // a table of contents lists the page's headings
+    let toc: String = rows
+        .iter()
+        .filter_map(|r| match r.marker {
+            Marker::Heading(n) => Some(format!(
+                "{}{}\n",
+                "  ".repeat(n as usize - 1),
+                plain_text(&r.rich_text)
+            )),
+            _ => None,
+        })
+        .collect();
+    for r in rows
+        .iter_mut()
+        .filter(|r| r.marker == Marker::TableOfContents)
+    {
+        r.rich_text = vec![RichText::plain(toc.trim_end())];
+    }
     Ok(rows)
 }
 
-fn walk(store: &Store, parent: &str, depth: usize, rows: &mut Vec<Row>) -> Result<()> {
+/// The marker for a block core keeps as raw JSON (`raw` = the full block).
+fn raw_marker(store: &Store, raw: &Value, locked: bool) -> Result<Marker> {
+    let t = raw["type"].as_str().unwrap_or("unsupported");
+    let p = &raw[t];
+    Ok(match t {
+        "bookmark" | "embed" | "link_preview" | "file" | "pdf" | "video" | "image" | "audio" => {
+            // `url` directly, or under the file's source (external / file)
+            let src = p["type"].as_str().unwrap_or_default();
+            let url = p["url"].as_str().or(p[src]["url"].as_str());
+            let Some(url) = url.filter(|u| !u.is_empty()) else {
+                return Ok(Marker::Unsupported(t.into()));
+            };
+            let caption = p["caption"]
+                .as_array()
+                .map(|c| {
+                    c.iter()
+                        .filter_map(|r| r["plain_text"].as_str())
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            let label = [p["name"].as_str().unwrap_or_default(), &caption, url]
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .unwrap_or(url)
+                .to_string();
+            Marker::LinkCard {
+                kind: t.into(),
+                url: url.into(),
+                label,
+            }
+        }
+        "link_to_page" => {
+            let database = p["type"] == "database_id";
+            let Some(id) = p[if database { "database_id" } else { "page_id" }].as_str() else {
+                return Ok(Marker::Unsupported(t.into()));
+            };
+            let title = store.get_page(id)?.map(|p| p.title()).unwrap_or_default();
+            Marker::LinkToPage {
+                id: id.into(),
+                title,
+                database,
+            }
+        }
+        "synced_block" => Marker::Synced,
+        "column_list" => Marker::ColumnList,
+        "column" => Marker::Column,
+        "table_of_contents" => Marker::TableOfContents,
+        "breadcrumb" => Marker::Breadcrumb,
+        "table" => {
+            let mut rows = Vec::new();
+            for b in store.children(raw["id"].as_str().unwrap_or_default())? {
+                let BlockKind::Unsupported { raw } = &b.kind else {
+                    continue;
+                };
+                // a cell that doesn't parse is shown empty and read-only
+                let cells = raw["table_row"]["cells"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(
+                        |c| match serde_json::from_value::<Vec<RichText>>(c.clone()) {
+                            Ok(rt) => Cell {
+                                editable: !locked && is_markdown_editable(&rt),
+                                rich_text: rt,
+                            },
+                            Err(_) => Cell {
+                                rich_text: Vec::new(),
+                                editable: false,
+                            },
+                        },
+                    )
+                    .collect();
+                rows.push(TableRow {
+                    id: b.id.clone(),
+                    cells,
+                });
+            }
+            Marker::Table(Table {
+                column_header: p["has_column_header"].as_bool().unwrap_or(false),
+                row_header: p["has_row_header"].as_bool().unwrap_or(false),
+                rows,
+            })
+        }
+        _ => Marker::Unsupported(t.into()),
+    })
+}
+
+/// `locked`: under a synced block.
+fn walk(
+    store: &Store,
+    parent: &str,
+    depth: usize,
+    locked: bool,
+    rows: &mut Vec<Row>,
+) -> Result<()> {
     let mut number = 0;
     for b in store.children(parent)? {
         number = match b.kind {
@@ -152,7 +341,7 @@ fn walk(store: &Store, parent: &str, depth: usize, rows: &mut Vec<Row>) -> Resul
             BlockKind::Equation { .. } => Marker::Equation,
             BlockKind::ChildPage { title } => Marker::ChildPage(title.clone()),
             BlockKind::ChildDatabase { title } => Marker::ChildDatabase(title.clone()),
-            BlockKind::Unsupported { .. } => Marker::Unsupported(b.kind.type_name().into()),
+            BlockKind::Unsupported { raw } => raw_marker(store, raw, locked)?,
         };
         let (rich_text, editable) = match &b.kind {
             // shown and edited as one equation run
@@ -173,20 +362,23 @@ fn walk(store: &Store, parent: &str, depth: usize, rows: &mut Vec<Row>) -> Resul
                 (rt, ok)
             }
         };
+        // a table's rows live in its marker
         let leaf = matches!(
             b.kind,
             BlockKind::ChildPage { .. } | BlockKind::ChildDatabase { .. }
-        );
+        ) || matches!(marker, Marker::Table(_));
+        let locked = locked || marker == Marker::Synced;
         rows.push(Row {
             block_id: b.id.clone(),
             parent: parent.to_string(),
             depth,
             marker,
             rich_text,
-            editable,
+            editable: editable && !locked,
+            locked,
         });
         if !leaf {
-            walk(store, &b.id, depth + 1, rows)?;
+            walk(store, &b.id, depth + 1, locked, rows)?;
         }
     }
     Ok(())
@@ -231,6 +423,7 @@ pub(crate) mod tests {
             marker,
             rich_text: Vec::new(),
             editable: true,
+            locked: false,
         }
     }
 
@@ -354,5 +547,384 @@ pub(crate) mod tests {
         assert!(!editable("cp"));
         assert_eq!(rows[7].marker.label(), "[image]");
         assert_eq!(rows[3].marker.label(), "☑");
+    }
+
+    /// Caches `kids` under `parent` and returns the flattened page.
+    fn page_of(store: &Store, parent: &str, kids: &[Block]) -> Vec<Row> {
+        store.replace_children(PID, parent, kids).unwrap();
+        flatten(store, PID).unwrap()
+    }
+
+    fn one(t: &str, payload: Value) -> Row {
+        let store = Store::open_in_memory().unwrap();
+        let rows = page_of(&store, PID, &[blk("x", PID, t, payload)]);
+        assert_eq!(rows.len(), 1);
+        rows.into_iter().next().unwrap()
+    }
+
+    fn card(kind: &str, url: &str, label: &str) -> Marker {
+        Marker::LinkCard {
+            kind: kind.into(),
+            url: url.into(),
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn link_cards() {
+        let cap = |s: &str| json!({ "caption": rt(s) });
+        let mut bm = cap("");
+        bm["url"] = json!("https://a.example");
+        assert_eq!(
+            one("bookmark", bm).marker,
+            card("bookmark", "https://a.example", "https://a.example"),
+            "label falls back to the url"
+        );
+        let mut em = cap("Slides");
+        em["url"] = json!("https://e.example");
+        assert_eq!(
+            one("embed", em).marker,
+            card("embed", "https://e.example", "Slides")
+        );
+        assert_eq!(
+            one(
+                "image",
+                json!({ "type": "external", "external": { "url": "https://i.example/x.png" }, "caption": [] })
+            )
+            .marker,
+            card("image", "https://i.example/x.png", "https://i.example/x.png")
+        );
+        assert_eq!(
+            one(
+                "image",
+                json!({ "type": "file", "file": { "url": "https://s3.example/y.png", "expiry_time": "2025-01-01T01:00:00.000Z" },
+                    "caption": rt("Diagram") })
+            )
+            .marker,
+            card("image", "https://s3.example/y.png", "Diagram")
+        );
+        let pdf = one(
+            "pdf",
+            json!({ "type": "file", "file": { "url": "https://s3.example/a.pdf" }, "caption": rt("cap"), "name": "notes.pdf" }),
+        );
+        assert_eq!(
+            pdf.marker,
+            card("pdf", "https://s3.example/a.pdf", "notes.pdf"),
+            "name before caption"
+        );
+        assert!(!pdf.editable);
+        assert_eq!(pdf.marker.label(), "[pdf] notes.pdf");
+        assert_eq!(
+            one(
+                "video",
+                json!({ "type": "external", "external": { "url": "https://v.example/v" }, "caption": [] })
+            )
+            .marker,
+            card("video", "https://v.example/v", "https://v.example/v")
+        );
+        // no url (e.g. a file upload): stays a placeholder
+        assert_eq!(
+            one(
+                "image",
+                json!({ "type": "file_upload", "file_upload": { "id": "u" } })
+            )
+            .marker,
+            Marker::Unsupported("image".into())
+        );
+    }
+
+    #[test]
+    fn page_and_database_links() {
+        let store = Store::open_in_memory().unwrap();
+        let rows = page_of(
+            &store,
+            PID,
+            &[
+                blk(
+                    "l1",
+                    PID,
+                    "link_to_page",
+                    json!({ "type": "page_id", "page_id": "other" }),
+                ),
+                blk(
+                    "l2",
+                    PID,
+                    "link_to_page",
+                    json!({ "type": "database_id", "database_id": "db" }),
+                ),
+                blk("cd", PID, "child_database", json!({ "title": "Grades" })),
+            ],
+        );
+        let ms: Vec<_> = rows.iter().map(|r| r.marker.clone()).collect();
+        assert_eq!(
+            ms,
+            vec![
+                Marker::LinkToPage {
+                    id: "other".into(),
+                    title: String::new(),
+                    database: false
+                },
+                Marker::LinkToPage {
+                    id: "db".into(),
+                    title: String::new(),
+                    database: true
+                },
+                Marker::ChildDatabase("Grades".into()),
+            ]
+        );
+        assert_eq!(rows[0].marker.label(), "→ [page]");
+        assert!(rows.iter().all(|r| !r.editable));
+    }
+
+    #[test]
+    fn synced_block_and_its_subtree_are_locked() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .replace_children(
+                PID,
+                PID,
+                &[
+                    blk("s", PID, "synced_block", json!({ "synced_from": null })),
+                    blk(
+                        "dup",
+                        PID,
+                        "synced_block",
+                        json!({ "synced_from": { "type": "block_id", "block_id": "s" } }),
+                    ),
+                    blk(
+                        "after",
+                        PID,
+                        "paragraph",
+                        json!({ "rich_text": rt("after") }),
+                    ),
+                ],
+            )
+            .unwrap();
+        let todo = json!({ "rich_text": rt("t"), "checked": false });
+        store
+            .replace_children(
+                PID,
+                "s",
+                &[
+                    blk("t", "s", "to_do", todo.clone()),
+                    blk("tg", "s", "toggle", json!({ "rich_text": rt("tg") })),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_children(
+                PID,
+                "tg",
+                &[blk(
+                    "deep",
+                    "tg",
+                    "paragraph",
+                    json!({ "rich_text": rt("d") }),
+                )],
+            )
+            .unwrap();
+        store
+            .replace_children(PID, "dup", &[blk("t2", "dup", "to_do", todo)])
+            .unwrap();
+        let rows2 = flatten(&store, PID).unwrap();
+        let got: Vec<(&str, usize, bool, bool)> = rows2
+            .iter()
+            .map(|r| (r.block_id.as_str(), r.depth, r.editable, r.locked))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("s", 0, false, true),
+                ("t", 1, false, true),
+                ("tg", 1, false, true),
+                ("deep", 2, false, true),
+                ("dup", 0, false, true),
+                ("t2", 1, false, true),
+                ("after", 0, true, false),
+            ]
+        );
+        assert_eq!(rows2[0].marker, Marker::Synced);
+        assert_eq!(rows2[0].marker.label(), "⟳ synced");
+        assert_eq!(rows2[1].marker, Marker::Todo(false));
+    }
+
+    #[test]
+    fn columns_nest_editable_children() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .replace_children(PID, PID, &[blk("cl", PID, "column_list", json!({}))])
+            .unwrap();
+        store
+            .replace_children(
+                PID,
+                "cl",
+                &[
+                    blk("c1", "cl", "column", json!({})),
+                    blk("c2", "cl", "column", json!({})),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_children(
+                PID,
+                "c1",
+                &[blk("a", "c1", "paragraph", json!({ "rich_text": rt("a") }))],
+            )
+            .unwrap();
+        let rows = page_of(
+            &store,
+            "c2",
+            &[blk(
+                "b",
+                "c2",
+                "bulleted_list_item",
+                json!({ "rich_text": rt("b") }),
+            )],
+        );
+        let got: Vec<(&str, usize, Marker, bool)> = rows
+            .iter()
+            .map(|r| (r.block_id.as_str(), r.depth, r.marker.clone(), r.editable))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("cl", 0, Marker::ColumnList, false),
+                ("c1", 1, Marker::Column, false),
+                ("a", 2, Marker::None, true),
+                ("c2", 1, Marker::Column, false),
+                ("b", 2, Marker::Bullet, true),
+            ]
+        );
+        assert_eq!(outdent_target(&rows, 2), None, "out of a column: refused");
+        assert_eq!(indent_target(&rows, 4), None);
+        assert!(unmovable_in_subtree(&rows, 0).is_some());
+    }
+
+    #[test]
+    fn toc_and_breadcrumb() {
+        let store = Store::open_in_memory().unwrap();
+        let rows = page_of(
+            &store,
+            PID,
+            &[
+                blk("bc", PID, "breadcrumb", json!({})),
+                blk(
+                    "toc",
+                    PID,
+                    "table_of_contents",
+                    json!({ "color": "default" }),
+                ),
+                blk("h1", PID, "heading_1", json!({ "rich_text": rt("Intro") })),
+                blk("h2", PID, "heading_2", json!({ "rich_text": rt("Part") })),
+            ],
+        );
+        assert_eq!(rows[0].marker, Marker::Breadcrumb);
+        assert_eq!(rows[0].marker.label(), "[breadcrumb]");
+        assert_eq!(rows[1].marker, Marker::TableOfContents);
+        assert_eq!(plain_text(&rows[1].rich_text), "Intro\n  Part");
+        assert!(!rows[0].editable && !rows[1].editable);
+    }
+
+    fn trow(id: &str, cells: Value) -> Block {
+        blk(id, "tbl", "table_row", json!({ "cells": cells }))
+    }
+
+    #[test]
+    fn table_is_one_row() {
+        let store = Store::open_in_memory().unwrap();
+        let mention = json!([{ "type": "mention", "mention": { "type": "date", "date": { "start": "2025-01-01" } },
+            "plain_text": "d", "annotations": {} }]);
+        store
+            .replace_children(
+                PID,
+                PID,
+                &[
+                    blk(
+                        "tbl",
+                        PID,
+                        "table",
+                        json!({ "table_width": 2, "has_column_header": true, "has_row_header": false }),
+                    ),
+                    blk("after", PID, "paragraph", json!({ "rich_text": rt("x") })),
+                ],
+            )
+            .unwrap();
+        let rows = page_of(
+            &store,
+            "tbl",
+            &[
+                trow("r1", json!([rt("Name"), rt("Grade")])),
+                trow("r2", json!([rt("Anna"), mention])),
+            ],
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.block_id.as_str()).collect::<Vec<_>>(),
+            ["tbl", "after"],
+            "no table_row rows"
+        );
+        let Marker::Table(t) = &rows[0].marker else {
+            panic!("{:?}", rows[0].marker)
+        };
+        assert!(t.column_header && !t.row_header);
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[1].id, "r2");
+        assert_eq!(plain_text(&t.rows[0].cells[1].rich_text), "Grade");
+        let editable: Vec<Vec<bool>> = t
+            .rows
+            .iter()
+            .map(|r| r.cells.iter().map(|c| c.editable).collect())
+            .collect();
+        assert_eq!(
+            editable,
+            vec![vec![true, true], vec![true, false]],
+            "mention"
+        );
+        assert!(!rows[0].editable);
+    }
+
+    #[test]
+    fn table_in_synced_block_is_read_only() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .replace_children(
+                PID,
+                PID,
+                &[blk(
+                    "s",
+                    PID,
+                    "synced_block",
+                    json!({ "synced_from": null }),
+                )],
+            )
+            .unwrap();
+        store
+            .replace_children(
+                PID,
+                "s",
+                &[blk(
+                    "tbl",
+                    "s",
+                    "table",
+                    json!({ "table_width": 1, "has_column_header": false, "has_row_header": true }),
+                )],
+            )
+            .unwrap();
+        let rows = page_of(&store, "tbl", &[trow("r1", json!([rt("a")]))]);
+        let Marker::Table(t) = &rows[1].marker else {
+            panic!()
+        };
+        assert!(t.row_header);
+        assert!(!t.rows[0].cells[0].editable);
+        assert!(rows[1].locked);
+    }
+
+    #[test]
+    fn unknown_type_stays_a_placeholder() {
+        let r = one("ai_block", json!({}));
+        assert_eq!(r.marker, Marker::Unsupported("ai_block".into()));
+        assert_eq!(r.marker.label(), "[ai_block]");
+        assert!(!r.editable);
+        let r = one("unsupported", json!({}));
+        assert_eq!(r.marker, Marker::Unsupported("unsupported".into()));
     }
 }

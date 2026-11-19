@@ -286,9 +286,24 @@ async fn check_block(
 ) -> Result<(Block, Option<String>)> {
     let remote = client.get_block(id).await?;
     let c = conflict(op, id, remote.last_edited_time, own, |raw| {
-        Ok(serde_json::from_value::<Block>(raw.clone())?.kind == remote.kind)
+        Ok(same_content(
+            &serde_json::from_value::<Block>(raw.clone())?.kind,
+            &remote.kind,
+        ))
     })?;
     Ok((remote, c))
+}
+
+/// Raw-backed kinds hold the whole block, which a single GET pads with fields
+/// a listed copy lacks (`request_id`): compare only their type payload.
+fn same_content(a: &BlockKind, b: &BlockKind) -> bool {
+    match (a, b) {
+        (BlockKind::Unsupported { raw: x }, BlockKind::Unsupported { raw: y }) => {
+            let t = x["type"].as_str().unwrap_or_default();
+            x["type"] == y["type"] && x[t] == y[t]
+        }
+        _ => a == b,
+    }
 }
 
 fn unmovable(kind: &BlockKind) -> bool {
@@ -514,6 +529,32 @@ pub fn local_edit_rich(store: &Store, block_id: &str, rich_text: Vec<RichText>) 
     if let Some(o) = body.as_object_mut() {
         o.remove("type");
     }
+    enqueue_update(store, &base, &block, body)
+}
+
+/// Replaces cell `col` of a cached `table_row` and queues
+/// `{"table_row":{"cells":[..all cells..]}}`. Returns the op id.
+pub fn local_edit_table_cell(
+    store: &Store,
+    row_id: &str,
+    col: usize,
+    rich: Vec<RichText>,
+) -> Result<i64> {
+    let base = cached(store, row_id)?;
+    let mut raw = serde_json::to_value(&base)?;
+    if raw["type"] != "table_row" {
+        return Err(Error::Invalid(format!(
+            "block type `{}` is not a table row",
+            base.kind.type_name()
+        )));
+    }
+    // untouched cells stay as received
+    let cell = raw["table_row"]["cells"]
+        .get_mut(col)
+        .ok_or_else(|| Error::Invalid(format!("table row {row_id} has no cell {col}")))?;
+    *cell = serde_json::to_value(split_runs(rich))?;
+    let body = json!({ "table_row": { "cells": raw["table_row"]["cells"] } });
+    let block: Block = serde_json::from_value(raw)?;
     enqueue_update(store, &base, &block, body)
 }
 
@@ -898,7 +939,7 @@ mod tests {
     use crate::api::ClientConfig;
     use crate::model::plain_text;
     use std::time::Duration;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const T: &str = "2025-01-01T00:00:00.000Z";
@@ -2685,5 +2726,111 @@ mod tests {
         };
         assert_eq!(block_id, "e");
         assert_eq!(body, &json!({ "equation": { "expression": "b" } }));
+    }
+
+    fn table_row(id: &str, cells: &[&str], time: &str) -> Value {
+        let cells: Vec<Value> = cells
+            .iter()
+            .map(|c| {
+                json!([{ "type": "text", "text": { "content": c, "link": null },
+                "plain_text": c, "annotations": {}, "href": null }])
+            })
+            .collect();
+        json!({
+            "object": "block", "id": id, "parent": bp("tbl"), "type": "table_row",
+            "table_row": { "cells": cells }, "has_children": false, "in_trash": false,
+            "created_time": T, "last_edited_time": time,
+        })
+    }
+
+    /// Cache page "p" holding table "tbl" with row "r1" = [a, b].
+    async fn seed_table(s: &MockServer, store: &Store) {
+        get(s, "/v1/pages/p", ok(page("p", pp("root"), T))).await;
+        let tbl = json!({
+            "object": "block", "id": "tbl", "parent": pp("p"), "type": "table",
+            "table": { "table_width": 2, "has_column_header": true, "has_row_header": false },
+            "has_children": true, "in_trash": false, "created_time": T, "last_edited_time": T,
+        });
+        get(s, "/v1/blocks/p/children", list(vec![tbl])).await;
+        get(
+            s,
+            "/v1/blocks/tbl/children",
+            list(vec![table_row("r1", &["a", "b"], T)]),
+        )
+        .await;
+        pull_page(&client(s), store, "p", true).await.unwrap();
+        s.reset().await;
+    }
+
+    fn cells(store: &Store, id: &str) -> Value {
+        serde_json::to_value(store.get_block(id).unwrap().unwrap()).unwrap()["table_row"]["cells"]
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn table_cell_edit_updates_cache_and_queues_all_cells() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed_table(&s, &store).await;
+        local_edit_table_cell(&store, "r1", 1, vec![RichText::plain("B")]).unwrap();
+        assert_eq!(cells(&store, "r1")[0][0]["plain_text"], "a");
+        assert_eq!(cells(&store, "r1")[1][0]["plain_text"], "B");
+        let OpKind::UpdateBlock { block_id, body } = &queue(&store)[0] else {
+            panic!()
+        };
+        assert_eq!(block_id, "r1");
+        assert_eq!(body["table_row"]["cells"], cells(&store, "r1"));
+
+        // no coalescing (same as text edits): a second op carrying both edits
+        local_edit_table_cell(&store, "r1", 0, vec![RichText::plain("A")]).unwrap();
+        let q = queue(&store);
+        assert_eq!(q.len(), 2);
+        let OpKind::UpdateBlock { body, .. } = &q[1] else {
+            panic!()
+        };
+        assert_eq!(body["table_row"]["cells"][0][0]["plain_text"], "A");
+        assert_eq!(body["table_row"]["cells"][1][0]["plain_text"], "B");
+
+        assert!(local_edit_table_cell(&store, "r1", 2, vec![]).is_err());
+        assert!(local_edit_table_cell(&store, "tbl", 0, vec![]).is_err());
+        assert_eq!(queue(&store).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn push_table_cell_sends_every_cell() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed_table(&s, &store).await;
+        local_edit_table_cell(&store, "r1", 0, vec![RichText::plain("new")]).unwrap();
+        // a single-object GET carries fields the listed copy doesn't
+        let mut remote = table_row("r1", &["a", "b"], T);
+        remote["request_id"] = json!("req-1");
+        get(&s, "/v1/blocks/r1", ok(remote)).await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/r1"))
+            .and(body_partial_json(json!({ "table_row": { "cells": [
+                [{ "type": "text", "text": { "content": "new" } }],
+                [{ "type": "text", "text": { "content": "b" } }],
+            ] } })))
+            .respond_with(ok(table_row("r1", &["new", "b"], T2)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!(r.applied, 1, "{r:?}");
+        assert!(store.queued_ops().unwrap().is_empty());
+        assert_eq!(cells(&store, "r1")[0][0]["plain_text"], "new");
+
+        // someone else changed a cell within the same minute: conflict
+        s.reset().await;
+        local_edit_table_cell(&store, "r1", 1, vec![RichText::plain("mine")]).unwrap();
+        get(
+            &s,
+            "/v1/blocks/r1",
+            ok(table_row("r1", &["new", "theirs"], T2)),
+        )
+        .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!(r.conflicts, 1, "{r:?}");
     }
 }
