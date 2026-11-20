@@ -18,88 +18,108 @@ pub const ITEMS: &[Item] = &[
         kind: TargetKind::Paragraph,
         name: "Text",
         hint: "Plain text",
-        aliases: &["paragraph", "p", "plain"],
+        aliases: &["paragraph", "p", "plain", "Text", "Absatz"],
     },
     Item {
         kind: TargetKind::Heading1,
         name: "Heading 1",
         hint: "Big section heading",
-        aliases: &["h1", "#"],
+        aliases: &["h1", "#", "Überschrift 1", "Überschrift"],
     },
     Item {
         kind: TargetKind::Heading2,
         name: "Heading 2",
         hint: "Medium section heading",
-        aliases: &["h2", "##"],
+        aliases: &["h2", "##", "Überschrift 2", "Überschrift"],
     },
     Item {
         kind: TargetKind::Heading3,
         name: "Heading 3",
         hint: "Small section heading",
-        aliases: &["h3", "###"],
+        aliases: &["h3", "###", "Überschrift 3", "Überschrift"],
     },
     Item {
         kind: TargetKind::Bulleted,
         name: "Bulleted list",
         hint: "Simple bulleted list",
-        aliases: &["bullet", "ul", "-"],
+        aliases: &["bullet", "ul", "-", "Aufzählung", "Liste", "Stichpunkte"],
     },
     Item {
         kind: TargetKind::Numbered,
         name: "Numbered list",
         hint: "List with numbering",
-        aliases: &["number", "ol", "1."],
+        aliases: &["number", "ol", "1.", "Nummerierte Liste", "Nummerierung"],
     },
     Item {
         kind: TargetKind::ToDo,
         name: "To-do list",
         hint: "Track tasks with a checkbox",
-        aliases: &["todo", "checkbox", "[]"],
+        aliases: &["todo", "checkbox", "[]", "To-do", "Aufgabe", "Checkliste"],
     },
     Item {
         kind: TargetKind::Toggle,
         name: "Toggle list",
         hint: "Hide content inside",
-        aliases: &["toggle", ">"],
+        aliases: &["toggle", ">", "Aufklappen", "Aufklappbar"],
     },
     Item {
         kind: TargetKind::Quote,
         name: "Quote",
         hint: "Capture a quote",
-        aliases: &["blockquote", "\""],
+        aliases: &["blockquote", "\"", "Zitat"],
     },
     Item {
         kind: TargetKind::Callout,
         name: "Callout",
         hint: "Make writing stand out",
-        aliases: &["note", "info"],
+        aliases: &["note", "info", "Hinweis", "Callout"],
     },
     Item {
         kind: TargetKind::Code,
         name: "Code",
         hint: "Code snippet",
-        aliases: &["```", "snippet"],
+        aliases: &["```", "snippet", "Code", "Programmcode"],
     },
     Item {
         kind: TargetKind::Divider,
         name: "Divider",
         hint: "Separate blocks",
-        aliases: &["hr", "---", "line"],
+        aliases: &["hr", "---", "line", "Trennlinie", "Trenner"],
     },
     Item {
         kind: TargetKind::Equation,
         name: "Equation",
         hint: "Display TeX formula",
-        aliases: &["math", "tex", "katex", "$$"],
+        aliases: &["math", "tex", "katex", "$$", "Block-Gleichung", "Gleichung", "Formel"],
     },
 ];
 
-/// Items whose name or an alias contains `query` (case-insensitive).
+/// Lower-case with umlauts folded (`ä`→`ae`, `ö`→`oe`, `ü`→`ue`, `ß`→`ss`), so
+/// `ueberschrift` and `Überschrift` are the same word.
+pub fn fold(s: &str) -> String {
+    s.to_lowercase()
+        .replace('ä', "ae")
+        .replace('ö', "oe")
+        .replace('ü', "ue")
+        .replace('ß', "ss")
+}
+
+/// True if `query` is a prefix of `name` or of any word of it (a word starts
+/// at the beginning, after a space, or after a `-`); both folded. So `glei`
+/// finds `Block-Gleichung` and `liste` finds `Nummerierte Liste`, but not
+/// `Checkliste`. An empty query matches everything.
+pub fn word_prefix(query: &str, name: &str) -> bool {
+    let (q, n) = (fold(query), fold(name));
+    std::iter::once(0)
+        .chain(n.match_indices([' ', '-']).map(|(i, _)| i + 1))
+        .any(|i| n[i..].starts_with(&q))
+}
+
+/// Items whose name or an alias matches `query` ([`word_prefix`]).
 pub fn filter(query: &str) -> Vec<&'static Item> {
-    let q = query.to_lowercase();
     ITEMS
         .iter()
-        .filter(|i| i.name.to_lowercase().contains(&q) || i.aliases.iter().any(|a| a.contains(&q)))
+        .filter(|i| word_prefix(query, i.name) || i.aliases.iter().any(|a| word_prefix(query, a)))
         .collect()
 }
 
@@ -202,6 +222,32 @@ mod tests {
             names("h1 ").is_empty(),
             "a space after a full word closes it too"
         );
+    }
+
+    #[test]
+    fn german_and_folded_queries_match() {
+        let kinds = |q: &str| filter(q).iter().map(|i| i.kind).collect::<Vec<_>>();
+        use TargetKind::*;
+        assert_eq!(kinds("Glei"), [Equation]);
+        assert_eq!(kinds("formel"), [Equation]);
+        assert_eq!(kinds("ueberschrift"), [Heading1, Heading2, Heading3]);
+        assert_eq!(kinds("Überschrift"), [Heading1, Heading2, Heading3]);
+        assert_eq!(kinds("überschrift 2"), [Heading2]);
+        assert_eq!(kinds("UEBERSCHRIFT 3"), [Heading3]);
+        assert_eq!(kinds("liste"), [Bulleted, Numbered], "not Checkliste");
+        assert_eq!(kinds("aufz"), [Bulleted]);
+        assert_eq!(kinds("Aufzählung"), [Bulleted]);
+        assert_eq!(kinds("aufzaehlung"), [Bulleted]);
+        assert_eq!(kinds("nummer"), [Numbered]);
+        assert_eq!(kinds("aufgabe"), [ToDo]);
+        assert_eq!(kinds("check"), [ToDo]);
+        assert_eq!(kinds("do"), [ToDo], "after the hyphen of To-do");
+        assert_eq!(kinds("aufklapp"), [Toggle]);
+        assert_eq!(kinds("zit"), [Quote]);
+        assert_eq!(kinds("hinw"), [Callout]);
+        assert_eq!(kinds("trenn"), [Divider]);
+        assert_eq!(kinds("gleichung"), [Equation]);
+        assert!(kinds("leichung").is_empty(), "word prefixes, not substrings");
     }
 
     #[test]

@@ -1,13 +1,19 @@
 //! Rich text <-> a small Markdown subset: `**bold**`, `*italic*`, `` `code` ``,
-//! `~~strike~~`, `[text](url)`, `$equation$`.
+//! `~~strike~~`, `[text](url)`, `$equation$`, and mentions as
+//! `@[label](page:<id>)`, `@[label](database:<id>)`, `@[label](user:<id>)`,
+//! `@[label](date:<start>[/<end>])`.
 //!
-//! Limitations: underline and colour are dropped; mentions are written as
-//! their plain text (callers should treat such text as read-only, see
-//! [`is_markdown_editable`]). Inside code spans only `\` and `` ` `` are
+//! Limitations: underline and colour are dropped; other mention types
+//! (link_preview, template_mention, custom emoji, a date with a time zone)
+//! can't be written, so such text is read-only, see
+//! [`is_markdown_editable`]. A mention's `href` is dropped (Notion derives it)
+//! and its `plain_text` is the label. Inside code spans only `\` and `` ` `` are
 //! escaped; in link URLs `(` and `)` are escaped too. An equation's TeX is
 //! written raw: `$` must be followed by a non-space and the closing `$`
 //! preceded by one, and `\$` inside it doesn't close it. Equations keep
 //! bold/italic/strike; link and code marks are dropped.
+
+use serde_json::{json, Value};
 
 use crate::model::{Annotations, RichText, RichTextKind, TargetKind};
 
@@ -27,6 +33,9 @@ struct Style {
     code: bool,
     /// An inline equation; its text is the TeX expression. Never merged.
     eq: bool,
+    /// A mention's `kind:target` (see [`mention_target`]); its text is the
+    /// label. Never merged.
+    mention: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,12 +72,15 @@ impl Style {
 fn normalize(rt: &[RichText]) -> Vec<(String, Style)> {
     let mut out: Vec<(String, Style)> = Vec::new();
     for r in rt {
-        let (text, link, eq) = match &r.kind {
-            RichTextKind::Text { content, link } => (content.clone(), link.clone(), false),
-            RichTextKind::Equation { expression } => (expression.clone(), None, true),
-            _ => (r.plain_text.clone(), r.href.clone(), false),
+        let (text, link, eq, mention) = match &r.kind {
+            RichTextKind::Text { content, link } => (content.clone(), link.clone(), false, None),
+            RichTextKind::Equation { expression } => (expression.clone(), None, true, None),
+            RichTextKind::Mention(v) => match mention_target(v) {
+                Some(t) => (r.plain_text.clone(), None, false, Some(t)),
+                None => (r.plain_text.clone(), r.href.clone(), false, None),
+            },
         };
-        if text.is_empty() {
+        if text.is_empty() && mention.is_none() {
             continue;
         }
         let a = &r.annotations;
@@ -79,9 +91,12 @@ fn normalize(rt: &[RichText]) -> Vec<(String, Style)> {
             strike: a.strikethrough,
             code: a.code && !eq,
             eq,
+            mention,
         };
         match out.last_mut() {
-            Some((t, s)) if *s == style && !eq => t.push_str(&text),
+            Some((t, s)) if *s == style && !style.eq && style.mention.is_none() => {
+                t.push_str(&text)
+            }
             _ => out.push((text, style)),
         }
     }
@@ -131,7 +146,13 @@ pub fn to_markdown(rt: &[RichText]) -> String {
             out.push_str(open_str(m));
             open.push(m.clone());
         }
-        if style.eq {
+        if let Some(t) = &style.mention {
+            out.push_str("@[");
+            push_escaped(&mut out, &text, ESCAPED);
+            out.push_str("](");
+            push_escaped(&mut out, t, URL_ESCAPED);
+            out.push(')');
+        } else if style.eq {
             out.push('$');
             out.push_str(&text);
             out.push('$');
@@ -149,8 +170,105 @@ pub fn to_markdown(rt: &[RichText]) -> String {
     out
 }
 
+fn id_of<'a>(v: &'a Value, kind: &str) -> Option<&'a str> {
+    let id = v.get(kind)?.get("id")?.as_str()?;
+    (!id.is_empty() && !id.chars().any(char::is_whitespace)).then_some(id)
+}
+
+/// The `kind:target` of a mention the token can express: page, database and
+/// user by id, date by `start[/end]`. None for everything else (and for a
+/// date with a time zone, which the token has no room for).
+fn mention_target(v: &Value) -> Option<String> {
+    let t = raw_target(v)?;
+    // only targets that parse back to themselves
+    let back = mention_from_target(&t)?;
+    (raw_target(&back).as_deref() == Some(&t)).then_some(t)
+}
+
+fn raw_target(v: &Value) -> Option<String> {
+    Some(match v.get("type")?.as_str()? {
+        k @ ("page" | "database" | "user") => format!("{k}:{}", id_of(v, k)?),
+        "date" => {
+            let d = v.get("date")?;
+            if d.get("time_zone").is_some_and(|z| !z.is_null()) {
+                return None;
+            }
+            let start = d.get("start")?.as_str()?;
+            match d.get("end").and_then(Value::as_str) {
+                Some(end) => format!("date:{start}/{end}"),
+                None => format!("date:{start}"),
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// The local date `offset_days` from today, as `YYYY-MM-DD` (for date mentions).
+pub fn local_date_iso(offset_days: i64) -> String {
+    (chrono::Local::now().date_naive() + chrono::TimeDelta::days(offset_days))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// The API's mention JSON for a `kind:target`.
+fn mention_from_target(t: &str) -> Option<Value> {
+    let (kind, rest) = t.split_once(':')?;
+    if rest.is_empty() || rest.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(match kind {
+        "page" | "database" => json!({ "type": kind, kind: { "id": rest } }),
+        "user" => json!({ "type": "user", "user": { "object": "user", "id": rest } }),
+        "date" => {
+            let (start, end) = match rest.split_once('/') {
+                Some((s, e)) if !s.is_empty() && !e.is_empty() => (s, Some(e)),
+                Some(_) => return None,
+                None => (rest, None),
+            };
+            // a real calendar date (`YYYY-MM-DD`) or an RFC 3339 datetime
+            let dated = |s: &str| {
+                (s.len() == 10 && chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok())
+                    || chrono::DateTime::parse_from_rfc3339(s).is_ok()
+            };
+            if !dated(start) || end.is_some_and(|e| !dated(e)) {
+                return None;
+            }
+            json!({ "type": "date", "date": { "start": start, "end": end } })
+        }
+        _ => return None,
+    })
+}
+
+/// `@[label](kind:target)` at `cs[i]` (the `@`): (label, target, index past `)`).
+fn scan_mention(cs: &[char], i: usize) -> Option<(String, String, usize)> {
+    if cs.get(i + 1) != Some(&'[') {
+        return None;
+    }
+    let (mut label, mut j) = (String::new(), i + 2);
+    loop {
+        match *cs.get(j)? {
+            '\\' if cs.get(j + 1).is_some_and(|n| ESCAPED.contains(n)) => {
+                label.push(cs[j + 1]);
+                j += 2;
+            }
+            ']' => break,
+            c => {
+                label.push(c);
+                j += 1;
+            }
+        }
+    }
+    if cs.get(j + 1) != Some(&'(') {
+        return None;
+    }
+    let (target, end) = scan(cs, j + 2, ')', URL_ESCAPED)?;
+    mention_from_target(&target)?;
+    Some((label, target, end))
+}
+
 enum Item {
     Ch(char),
+    Mention(String, String),
     Lit(&'static str),
     Code(String),
     Eq(String),
@@ -250,6 +368,14 @@ pub fn from_markdown(s: &str) -> Vec<RichText> {
                 }
                 None
             }
+            ('@', _) => {
+                if let Some((label, target, end)) = scan_mention(&cs, i) {
+                    items.push(Item::Mention(label, target));
+                    i = end;
+                    continue;
+                }
+                None
+            }
             ('$', _) => {
                 if let Some((tex, end)) = scan_eq(&cs, i + 1) {
                     items.push(Item::Eq(tex));
@@ -302,15 +428,17 @@ pub fn from_markdown(s: &str) -> Vec<RichText> {
 
     let mut runs: Vec<(String, Style)> = Vec::new();
     let mut active: Vec<Mark> = Vec::new();
-    let mut push = |text: &str, code: bool, eq: bool, active: &[Mark]| {
+    let mut push = |text: &str, code: bool, eq: bool, mention: Option<String>, active: &[Mark]| {
+        let atom = eq || mention.is_some();
         let mut st = Style {
             code,
             eq,
+            mention,
             ..Style::default()
         };
         for m in active {
             match m {
-                Mark::Link(_) if eq => {}
+                Mark::Link(_) if atom => {}
                 Mark::Link(u) => st.link = Some(u.clone()),
                 Mark::Bold => st.bold = true,
                 Mark::Italic => st.italic = true,
@@ -319,16 +447,17 @@ pub fn from_markdown(s: &str) -> Vec<RichText> {
             }
         }
         match runs.last_mut() {
-            Some((t, s)) if *s == st && !eq => t.push_str(text),
+            Some((t, s)) if *s == st && !atom => t.push_str(text),
             _ => runs.push((text.to_string(), st)),
         }
     };
     for it in items {
         match it {
-            Item::Ch(c) => push(c.encode_utf8(&mut [0; 4]), false, false, &active),
-            Item::Lit(s) => push(s, false, false, &active),
-            Item::Code(t) => push(&t, true, false, &active),
-            Item::Eq(t) => push(&t, false, true, &active),
+            Item::Ch(c) => push(c.encode_utf8(&mut [0; 4]), false, false, None, &active),
+            Item::Lit(s) => push(s, false, false, None, &active),
+            Item::Code(t) => push(&t, true, false, None, &active),
+            Item::Eq(t) => push(&t, false, true, None, &active),
+            Item::Mention(l, t) => push(&l, false, false, Some(t), &active),
             Item::Open(m) => active.push(m),
             Item::Close => {
                 active.pop();
@@ -349,6 +478,8 @@ pub fn from_markdown(s: &str) -> Vec<RichText> {
                 },
                 kind: if st.eq {
                     RichTextKind::Equation { expression: t }
+                } else if let Some(m) = st.mention.as_deref().and_then(mention_from_target) {
+                    RichTextKind::Mention(m)
                 } else {
                     RichTextKind::Text {
                         content: t,
@@ -361,11 +492,12 @@ pub fn from_markdown(s: &str) -> Vec<RichText> {
 }
 
 /// True if editing `rt` as Markdown loses nothing beyond underline/colour:
-/// no mentions, and it survives `to_markdown` → `from_markdown` (an equation
-/// with a bare `$`, edge spaces, or a digit right after it doesn't).
+/// every mention is one the `@[label](kind:id)` token carries, and it survives
+/// `to_markdown` → `from_markdown` (an equation with a bare `$`, edge spaces,
+/// or a digit right after it doesn't).
 pub fn is_markdown_editable(rt: &[RichText]) -> bool {
-    !rt.iter()
-        .any(|r| matches!(r.kind, RichTextKind::Mention(_)))
+    rt.iter()
+        .all(|r| !matches!(&r.kind, RichTextKind::Mention(v) if mention_target(v).is_none()))
         && normalize(&from_markdown(&to_markdown(rt))) == normalize(rt)
 }
 
@@ -588,6 +720,9 @@ mod tests {
             "a\nb **c\nd**",
             "$a$$b$ $ $$ $c\\$ d$",
             "**$x** $y$",
+            "@[a](page:1) @[b",
+            "[@[a](page:1)](u) @[](",
+            "`@[a](page:1)` @[a\\]b](user:2)",
         ];
         for s in nasty {
             let m = to_markdown(&from_markdown(s));
@@ -605,16 +740,186 @@ mod tests {
         assert!(long.iter().all(|r| r.annotations.bold));
     }
 
+    fn mention(label: &str, m: serde_json::Value) -> RichText {
+        RichText {
+            plain_text: label.into(),
+            href: None,
+            annotations: Annotations::default(),
+            kind: RichTextKind::Mention(m),
+        }
+    }
+
+    fn page(label: &str, id: &str) -> RichText {
+        mention(
+            label,
+            serde_json::json!({ "type": "page", "page": { "id": id } }),
+        )
+    }
+
     #[test]
-    fn mentions_are_not_editable() {
+    fn mentions_are_editable_only_when_the_token_carries_them() {
+        use serde_json::json;
         assert!(is_markdown_editable(&[p("x")]));
-        let mut m = p("@bob");
-        m.kind = RichTextKind::Mention(serde_json::json!({ "type": "user" }));
-        assert!(!is_markdown_editable(&[p("x"), m]));
         assert!(is_markdown_editable(&[p("x"), eq("x^2")]));
+        assert!(is_markdown_editable(&[p("x"), page("P", "abc")]));
+        let date = json!({ "type": "date", "date": { "start": "2026-11-20", "end": null, "time_zone": null } });
+        assert!(is_markdown_editable(&[mention("2026-11-20", date)]));
+        // as the API returns a user mention (extra fields are metadata)
+        let user =
+            json!({ "type": "user", "user": { "object": "user", "id": "u1", "name": "Bob" } });
+        assert!(is_markdown_editable(&[mention("@Bob", user)]));
+        // what the token can't carry stays read-only
+        for bad in [
+            json!({ "type": "user" }),
+            json!({ "type": "link_preview", "link_preview": { "url": "https://x" } }),
+            json!({ "type": "template_mention", "template_mention": { "type": "template_mention_date", "template_mention_date": "today" } }),
+            json!({ "type": "custom_emoji", "custom_emoji": { "id": "e", "name": "n" } }),
+            json!({ "type": "link_mention", "link_mention": { "href": "https://x" } }),
+            json!({ "type": "page", "page": {} }),
+            json!({ "type": "date", "date": { "start": "2026-11-20T10:00:00", "time_zone": "Europe/Vienna" } }),
+        ] {
+            assert!(
+                !is_markdown_editable(&[p("x"), mention("m", bad.clone())]),
+                "{bad}"
+            );
+        }
         // TeX that `$…$` can't carry stays read-only
         for bad in ["a$", " x", "x ", "x\\"] {
             assert!(!is_markdown_editable(&[eq(bad)]), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn mentions_round_trip() {
+        use serde_json::json;
+        let range =
+            json!({ "type": "date", "date": { "start": "2026-11-20", "end": "2026-11-22" } });
+        let day = json!({ "type": "date", "date": { "start": "2026-11-20", "end": null } });
+        let mut bold = page("B", "id9");
+        bold.annotations.bold = true;
+        let mut it = page("I", "id8");
+        it.annotations.italic = true;
+        let cases: Vec<(Vec<RichText>, &str)> = vec![
+            (vec![page("Home", "p-1")], "@[Home](page:p-1)"),
+            (
+                vec![mention(
+                    "DB",
+                    json!({ "type": "database", "database": { "id": "d1" } }),
+                )],
+                "@[DB](database:d1)",
+            ),
+            (
+                vec![mention(
+                    "@Bob",
+                    json!({ "type": "user", "user": { "object": "user", "id": "u1" } }),
+                )],
+                "@[@Bob](user:u1)",
+            ),
+            (vec![mention("20 Nov", day)], "@[20 Nov](date:2026-11-20)"),
+            (
+                vec![mention("range", range)],
+                "@[range](date:2026-11-20/2026-11-22)",
+            ),
+            (
+                vec![p("see "), bold, p(" and "), it],
+                "see **@[B](page:id9)** and *@[I](page:id8)*",
+            ),
+            // `]`, `\`, `*` and `[` in the label are escaped
+            (
+                vec![page("a]b [c] *d* \\e", "x")],
+                "@[a\\]b \\[c\\] \\*d\\* \\\\e](page:x)",
+            ),
+            (vec![page("", "empty")], "@[](page:empty)"),
+            (
+                vec![page("a", "1"), page("b", "2")],
+                "@[a](page:1)@[b](page:2)",
+            ),
+            // literal text that looks like a token stays text
+            (vec![p("@[x](page:id)")], "@\\[x\\](page:id)"),
+        ];
+        for (rt, md) in cases {
+            assert_eq!(to_markdown(&rt), md);
+            assert!(is_markdown_editable(&rt), "{md}");
+            let back = from_markdown(md);
+            assert_eq!(back.len(), rt.len(), "{md}");
+            for (a, b) in back.iter().zip(&rt) {
+                assert_eq!(a.plain_text, b.plain_text, "{md}");
+                assert_eq!(a.annotations, b.annotations, "{md}");
+            }
+            assert_eq!(to_markdown(&back), md);
+        }
+    }
+
+    #[test]
+    fn date_mentions_need_real_dates() {
+        let ok = |t: &str| matches!(from_markdown(t)[0].kind, RichTextKind::Mention(_));
+        assert!(ok("@[x](date:2024-02-29)"));
+        assert!(ok(
+            "@[x](date:2026-11-20T10:00:00.000+01:00/2026-11-20T11:00:00Z)"
+        ));
+        assert!(ok("@[x](date:2026-11-20/2026-11-22)"));
+        for bad in [
+            "2026-13-45",
+            "2026-11-20xyz",
+            "2025-02-29",
+            "2026-11-20/2026-11-31",
+            "2026-11-20T10:00",
+        ] {
+            assert!(!ok(&format!("@[x](date:{bad})")), "{bad}");
+        }
+        let d = local_date_iso(0);
+        assert!(chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d").is_ok());
+        assert_ne!(local_date_iso(1), d);
+    }
+
+    #[test]
+    fn parsed_mentions_have_the_api_shape() {
+        use serde_json::json;
+        let r = from_markdown("**@[Home](page:p1)**");
+        assert!(r[0].annotations.bold);
+        assert_eq!(
+            serde_json::to_value(&r[0]).unwrap()["mention"],
+            json!({ "type": "page", "page": { "id": "p1" } })
+        );
+        assert_eq!(serde_json::to_value(&r[0]).unwrap()["type"], "mention");
+        assert_eq!(r[0].plain_text, "Home");
+        let r = from_markdown("@[x](date:2026-11-20/2026-11-22)");
+        assert_eq!(
+            r[0].kind,
+            RichTextKind::Mention(
+                json!({ "type": "date", "date": { "start": "2026-11-20", "end": "2026-11-22" } })
+            )
+        );
+        let r = from_markdown("@[x](date:2026-11-20)");
+        assert_eq!(
+            r[0].kind,
+            RichTextKind::Mention(
+                json!({ "type": "date", "date": { "start": "2026-11-20", "end": null } })
+            )
+        );
+        assert_eq!(
+            from_markdown("@[x](user:u)")[0].kind,
+            RichTextKind::Mention(
+                json!({ "type": "user", "user": { "object": "user", "id": "u" } })
+            )
+        );
+        // malformed or unknown tokens are plain text
+        for lit in [
+            "@[x](bogus:1)",
+            "@[x](page:)",
+            "@[x](page:a b)",
+            "@[x]",
+            "@[x](date:/b)",
+            "@[x](date:foo)",
+            "@[x](date:2026-1-2)",
+            "a @ b",
+        ] {
+            let r = from_markdown(lit);
+            assert!(
+                r.iter()
+                    .all(|r| matches!(r.kind, RichTextKind::Text { .. })),
+                "{lit}"
+            );
         }
     }
 

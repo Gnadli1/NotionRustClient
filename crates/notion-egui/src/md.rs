@@ -12,6 +12,8 @@ use crate::tex::pretty_tex;
 
 const LINK: Color32 = Color32::from_rgb(70, 130, 220);
 const CODE_BG: Color32 = Color32::from_rgba_premultiplied(40, 40, 40, 40);
+/// A mention's pill.
+const MENTION_BG: Color32 = Color32::from_rgba_premultiplied(30, 50, 80, 50);
 
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct Style {
@@ -22,6 +24,8 @@ pub struct Style {
     pub underline: bool,
     pub link: bool,
     pub math: bool,
+    /// A mention's label: a pill.
+    pub mention: bool,
 }
 
 /// Registered in `main::setup_fonts` (falls back to the normal face).
@@ -42,6 +46,8 @@ pub fn format(size: f32, s: Style) -> TextFormat {
         color: if s.link { LINK } else { Color32::PLACEHOLDER },
         background: if s.code {
             CODE_BG
+        } else if s.mention {
+            MENTION_BG
         } else {
             Color32::TRANSPARENT
         },
@@ -73,6 +79,7 @@ pub fn rich_job(rt: &[RichText], size: f32, bold: bool) -> LayoutJob {
             underline: a.underline,
             link: r.href.is_some(),
             math: false,
+            mention: matches!(r.kind, RichTextKind::Mention(_)),
         };
         let text = match &r.kind {
             RichTextKind::Equation { expression } => {
@@ -87,6 +94,32 @@ pub fn rich_job(rt: &[RichText], size: f32, bold: bool) -> LayoutJob {
         job.append(" ", 0.0, format(size, Style::default())); // keeps the row's height
     }
     job
+}
+
+/// For `@[label](kind:id)` at the start of `s`: the byte where the label ends
+/// (at its `]`) and where the token ends. Backslash escapes the next char.
+fn mention_span(s: &str) -> Option<(usize, usize)> {
+    let mut it = s.char_indices().skip(2);
+    let close = loop {
+        match it.next()? {
+            (_, '\\') => {
+                it.next();
+            }
+            (i, ']') => break i,
+            _ => {}
+        }
+    };
+    s[close..].starts_with("](").then_some(())?;
+    let mut it = s[close + 2..].char_indices();
+    loop {
+        match it.next()? {
+            (_, '\\') => {
+                it.next();
+            }
+            (i, ')') => return Some((close, close + 2 + i + 1)),
+            _ => {}
+        }
+    }
 }
 
 fn flag<'a>(s: &'a mut Style, d: &str) -> &'a mut bool {
@@ -137,6 +170,18 @@ pub fn md_job(src: &str, size: f32, bold: bool, dim: Color32) -> LayoutJob {
                 .into_iter()
                 .find(|d| rest.starts_with(d)),
         };
+        if raw.is_none() && rest.starts_with("@[") {
+            // @[label](kind:id): the label is a pill, the rest stays visible, dimmed
+            if let Some((label, end)) = mention_span(rest) {
+                put(&mut job, st, start, i, false);
+                put(&mut job, st, i, i + 2, true);
+                put(&mut job, Style { mention: true, ..st }, i + 2, i + label, false);
+                put(&mut job, st, i + label, i + end, true);
+                i += end;
+                start = i;
+                continue;
+            }
+        }
         if raw.is_none() && rest.starts_with('[') {
             // [label](url)
             if let Some(end) = rest
@@ -208,6 +253,26 @@ mod tests {
         assert!(get("g").italics);
         assert_eq!(get("**").color, dim, "markers stay visible, dimmed");
         assert_eq!(get("a ").font_id.family, FontFamily::Proportional);
+    }
+
+    #[test]
+    fn mention_tokens_are_a_dimmed_frame_around_a_pill() {
+        let src = "a **@[x\\]y](page:p1)** b";
+        let dim = Color32::GRAY;
+        let job = md_job(src, 16.0, false, dim);
+        assert_eq!(job.text, src, "layouter must not change the text");
+        let p = parts(&job);
+        let get = |t: &str| p.iter().find(|(s, _)| *s == t).unwrap().1;
+        assert_eq!(get("x\\]y").background, MENTION_BG);
+        assert_eq!(get("x\\]y").font_id.family, bold_family(), "marks around it apply");
+        assert_eq!(get("@[").color, dim);
+        // egui merges equal neighbours: the closing `**` joins it
+        assert_eq!(get("](page:p1)**").color, dim);
+        assert_ne!(get("a ").background, MENTION_BG);
+        // not a token: styled as the link it looks like
+        let job = md_job("@[x] [y](u)", 16.0, false, dim);
+        assert_eq!(job.text, "@[x] [y](u)");
+        assert!(parts(&job).iter().all(|(_, f)| f.background != MENTION_BG));
     }
 
     #[test]

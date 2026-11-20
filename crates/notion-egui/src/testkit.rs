@@ -13,7 +13,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 use crate::app::{Action, App, Grab};
 use crate::outline::tests::{blk, rt};
-use crate::slash::Menu;
+use crate::menu::Menu;
 use crate::worker::{Cmd, Event as WEvent};
 
 pub fn page(id: &str, parent: Value) -> Page {

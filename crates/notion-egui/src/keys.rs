@@ -211,6 +211,8 @@ pub enum Command {
     PrevTab,
     Undo,
     Redo,
+    /// Ctrl+/: the "Turn into" menu for the edited row.
+    TurnInto,
 }
 
 impl Command {
@@ -268,6 +270,7 @@ const NAMES: &[(&str, Command)] = &[
     ("prev_tab", Command::PrevTab),
     ("undo", Command::Undo),
     ("redo", Command::Redo),
+    ("turn_into", Command::TurnInto),
 ];
 
 /// Notion's Linux keys (Ctrl+Shift+0-9 for block types; 9, "page", has no
@@ -305,6 +308,11 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("ctrl+shift+tab", "prev_tab"),
     ("ctrl+z", "undo"),
     ("ctrl+shift+z", "redo"),
+    // On German/Austrian layouts `/` is Shift+7, i.e. Ctrl+Shift+7 = toggle:
+    // rebind turn_into there
+    ("ctrl+/", "turn_into"),
+    // Ctrl+/ is Ctrl+Shift+7 on those layouts; Ctrl+. works anywhere
+    ("ctrl+.", "turn_into"),
 ];
 
 fn command(name: &str) -> Option<Command> {

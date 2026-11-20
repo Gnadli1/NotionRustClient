@@ -22,11 +22,11 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::edit::EditKey;
 use crate::keys::Keymap;
 use crate::links::{self, Link};
-use crate::menu::{menu_step, Outcome};
+use crate::menu::{self, menu_step, Kind, Menu, Outcome, Pick, Sources};
 use crate::outline::{self, Marker, Row};
 use crate::problems::Problem;
 use crate::session;
-use crate::slash::{self, Menu};
+use crate::slash;
 use crate::switcher::Switcher;
 use crate::tabs::Tab;
 use crate::undo::Step;
@@ -228,6 +228,8 @@ pub struct App {
     /// The window title last sent.
     pub(crate) shown_title: String,
     pub(crate) keylog: bool,
+    /// Today's date, asked when an `@` menu opens (tests swap it out).
+    pub(crate) clock: fn(i64) -> String,
 }
 
 /// The text edit's id for a block; it must not change while the row moves.
@@ -360,6 +362,7 @@ impl App {
             worker_gone: false,
             shown_title: String::new(),
             keylog,
+            clock: notion_core::markdown::local_date_iso,
         };
         app.refresh();
         app
@@ -860,11 +863,33 @@ impl App {
         let mut picked = None;
         let mut close = false;
         let mut enter = false;
+        let mut filtered = false;
         // not focused (e.g. a click elsewhere this frame): leave every key alone
         let focused = ctx.memory(|m| m.has_focus(id));
         if !focused {
         } else if let Some(menu) = f.menu.as_mut() {
-            let q = menu.query(&f.text, line, col).unwrap_or("").to_string();
+            if menu.kind == Kind::TurnInto {
+                // Ctrl+/ has no trigger text: what is typed filters the menu
+                // instead of going into the row
+                let (typed, backspaces) = ctx.input_mut(|i| {
+                    let mut typed = String::new();
+                    i.events.retain(|e| match e {
+                        egui::Event::Text(t) => {
+                            typed.push_str(t);
+                            false
+                        }
+                        _ => true,
+                    });
+                    (typed, i.count_and_consume_key(Modifiers::NONE, Key::Backspace))
+                });
+                menu.filter.push_str(&typed);
+                for _ in 0..backspaces {
+                    close |= menu.filter.pop().is_none();
+                }
+                filtered = !typed.is_empty() || backspaces > 0;
+            }
+            let q = menu.query(&f.text, line, col).unwrap_or_default();
+            let src = Sources { tree: &self.tree, recent: &self.recent };
             for (key, ek) in [
                 (Key::ArrowUp, EditKey::Up),
                 (Key::ArrowDown, EditKey::Down),
@@ -872,8 +897,8 @@ impl App {
                 (Key::Tab, EditKey::Indent),
             ] {
                 for _ in 0..take(key) {
-                    match menu_step(menu, &q, ek) {
-                        Outcome::Pick(k) => picked = Some(k),
+                    match menu_step(menu, &menu::entries(menu, &q, src), ek) {
+                        Outcome::Pick(p) => picked = Some(p),
                         Outcome::Close => close = true,
                         Outcome::Handled | Outcome::Pass => {}
                     }
@@ -910,6 +935,7 @@ impl App {
             act = self.editor_keys(&ctx, id).or(act);
         }
         let f = self.focus.as_mut()?;
+        let src = Sources { tree: &self.tree, recent: &self.recent };
         let mut layouter = |ui: &Ui, text: &dyn TextBuffer, wrap: f32| {
             let mut job = md::md_job(text.as_str(), size, bold, dim);
             job.wrap.max_width = wrap;
@@ -942,12 +968,15 @@ impl App {
         let mut new_cursor = None;
 
         if let Some(m) = f.menu.as_mut() {
-            match m.query(&f.text, line, col).map(slash::filter) {
-                Some(items) if !items.is_empty() && !close => {
-                    m.selected = if resp.changed() {
+            let n = m
+                .query(&f.text, line, col)
+                .map(|q| menu::entries(m, &q, src).len());
+            match n {
+                Some(n) if n > 0 && !close => {
+                    m.selected = if resp.changed() || filtered {
                         0
                     } else {
-                        m.selected.min(items.len() - 1)
+                        m.selected.min(n - 1)
                     };
                 }
                 _ => f.menu = None, // Esc, no match, or the cursor left the query
@@ -956,39 +985,64 @@ impl App {
         if enter {
             // the query as it stands after this frame's typing
             if let Some(m) = f.menu.as_mut() {
-                let q = m.query(&f.text, line, col).unwrap_or("").to_string();
-                if let Outcome::Pick(k) = menu_step(m, &q, EditKey::Enter) {
-                    picked = Some(k);
+                let q = m.query(&f.text, line, col).unwrap_or_default();
+                if let Outcome::Pick(p) = menu_step(m, &menu::entries(m, &q, src), EditKey::Enter) {
+                    picked = Some(p);
                 }
             }
         }
         let mut convert = None;
-        if let Some(kind) = picked {
+        let was_picked = picked.is_some();
+        let pick_in = picked.and_then(|p| f.menu.take().map(|m| (p, m)));
+        if let Some((pick, m)) = pick_in {
             let before = f.text.clone();
-            if let Some(m) = &f.menu {
-                f.text = m.strip(&f.text, col);
-                new_cursor = Some(f.text[..byte_at(&f.text, m.line, m.slash)].chars().count());
+            let trigger_chars = |text: &str| text[..byte_at(text, m.line, m.trigger)].chars().count();
+            match pick {
+                Pick::Block(kind) => {
+                    if m.kind == Kind::TurnInto {
+                        new_cursor = Some(cur);
+                    } else {
+                        f.text = m.replace(&f.text, col, "");
+                        new_cursor = Some(trigger_chars(&f.text));
+                    }
+                    convert = Some((kind, before));
+                }
+                // a mention goes in as its Markdown token and is committed
+                // with the row
+                Pick::Insert(md) => {
+                    let at = trigger_chars(&f.text) + md.chars().count();
+                    f.text = m.replace(&f.text, col, &md);
+                    new_cursor = Some(at);
+                }
             }
-            f.menu = None;
-            convert = Some((kind, before));
-        } else if f.menu.is_none()
-            && typed
-            && !f.code
-            && f.text[..byte_at(&f.text, line, col)].ends_with('/')
-        {
-            let slash = col - 1;
-            let before = f.text[..byte_at(&f.text, line, col)].chars().rev().nth(1);
-            if before.is_none_or(char::is_whitespace) {
-                f.menu = Some(Menu {
-                    line,
-                    slash,
-                    selected: 0,
-                });
+        } else if f.menu.is_none() && typed && !f.code {
+            let head = &f.text[..byte_at(&f.text, line, col)];
+            // `/` and `@` open after whitespace (not in `a@b.c`), `[[` anywhere
+            let after_space = head.chars().rev().nth(1).is_none_or(char::is_whitespace);
+            // not inside `inline code`: an odd number of unescaped backticks so far
+            let in_code = head
+                .char_indices()
+                .filter(|&(i, c)| c == '`' && !head[..i].ends_with('\\'))
+                .count()
+                % 2
+                == 1;
+            let open = if head.ends_with("[[") && !in_code {
+                Some((Kind::PageLink, 2))
+            } else if head.ends_with('@') && after_space && !in_code {
+                Some((Kind::Mention, 1))
+            } else if head.ends_with('/') && after_space {
+                Some((Kind::Slash, 1))
+            } else {
+                None
+            };
+            if let Some((kind, len)) = open {
+                let days = if kind == Kind::Mention { menu::days(self.clock) } else { Default::default() };
+                f.menu = Some(Menu::new(kind, line, col - len, days));
             }
         }
         // Markdown shortcut: Space right after `# `, `- `, `1. ` at the row start
         if f.menu.is_none()
-            && picked.is_none()
+            && !was_picked
             && typed
             && !f.code
             && f.text[..byte_at(&f.text, line, col)].ends_with(' ')
@@ -1017,30 +1071,16 @@ impl App {
         }
 
         if let Some(m) = &f.menu {
-            let items = slash::filter(m.query(&f.text, line, col).unwrap_or(""));
-            let slash_char = f.text[..byte_at(&f.text, m.line, m.slash)].chars().count();
+            let q = m.query(&f.text, line, col).unwrap_or_default();
+            // under the trigger, or the cursor for Ctrl+/
+            let at = if m.kind == Kind::TurnInto {
+                cur
+            } else {
+                f.text[..byte_at(&f.text, m.line, m.trigger)].chars().count()
+            };
             let pos = out.galley_pos
-                + out
-                    .galley
-                    .pos_from_cursor(CCursor::new(slash_char))
-                    .left_bottom()
-                    .to_vec2();
-            let hl = ui.visuals().selection.bg_fill;
-            egui::Area::new(Id::unique("slash-menu"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(pos)
-                .show(&ctx, |ui| {
-                    Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.set_min_width(240.0);
-                        for (n, it) in items.iter().enumerate() {
-                            let mut t = RichText::new(format!("{}   {}", it.name, it.hint));
-                            if n == m.selected {
-                                t = t.strong().background_color(hl);
-                            }
-                            ui.add(Label::new(t).selectable(false));
-                        }
-                    });
-                });
+                + out.galley.pos_from_cursor(CCursor::new(at)).left_bottom().to_vec2();
+            menu::show(&ctx, pos, m, &menu::entries(m, &q, src));
         }
         act
     }
@@ -1114,7 +1154,7 @@ mod tests {
             set_cursor(&w.ctx, edit_id("p-0"), st, 2); // start of line 1
             w.frames(vec![]);
             w.send(Event::Text("/".into()));
-            assert_eq!(w.menu().map(|m| (m.line, m.slash)), Some((1, 0)));
+            assert_eq!(w.menu().map(|m| (m.line, m.trigger)), Some((1, 0)));
             w.send(Event::Text("h1".into()));
             assert_eq!(w.text(), "x\n/h1 äö");
             w.send(key(Key::Enter));
@@ -1142,6 +1182,266 @@ mod tests {
                 .memory_mut(|m| m.surrender_focus(edit_id("p-0")));
             w.send(key(Key::Enter));
             assert_eq!(w.app.rows[0].marker, Marker::None, "no pick without focus");
+        }
+
+        // ----------------------------------------------- @, [[ and Ctrl+/
+
+        use crate::testkit::add_page;
+        use notion_core::ops::OpKind;
+        use notion_core::store::Store;
+        use serde_json::json;
+
+        /// Page "p" (rows "" and "x"), pages "Alpha" and "Beta"; today is 2026-11-20.
+        fn win_with_pages() -> Win {
+            let store = Store::open_in_memory().unwrap();
+            add_page(&store, "p", None, &["", "x"]);
+            add_page(&store, "Alpha", None, &["a"]);
+            add_page(&store, "Beta", None, &[]);
+            let mut w = Win::new(store);
+            w.app.clock = |n| ["2026-11-20", "2026-11-21", "2026-11-19"][if n < 0 { 2 } else { n as usize }].into();
+            w.app.apply(Action::Open("p".into()));
+            w.frames(vec![]);
+            w
+        }
+
+        /// The body of the one queued block update.
+        fn queued_body(w: &Win) -> serde_json::Value {
+            let ops = w.app.store.queued_ops().unwrap();
+            assert_eq!(ops.len(), 1);
+            let OpKind::UpdateBlock { body, .. } = &ops[0].kind else { panic!() };
+            body.clone()
+        }
+
+        #[test]
+        fn slash_menu_takes_german_and_umlaut_free_queries() {
+            for (q, want) in [
+                ("überschrift 2", Marker::Heading(2)),
+                ("ueberschrift 3", Marker::Heading(3)),
+                ("liste", Marker::Bullet),
+                ("Zitat", Marker::Quote),
+            ] {
+                let mut w = win(&[""]);
+                w.edit(0);
+                w.send(Event::Text("/".into()));
+                w.send(Event::Text(q.into()));
+                w.send(key(Key::Enter));
+                assert_eq!(w.app.rows[0].marker, want, "/{q}");
+            }
+            let mut w = win(&[""]);
+            w.edit(0);
+            w.send(Event::Text("/".into()));
+            w.send(Event::Text("Glei".into()));
+            w.send(key(Key::Enter));
+            assert_eq!(w.app.rows[0].marker, Marker::Equation);
+        }
+
+        #[test]
+        fn at_menu_picks_a_page_mention_with_the_keyboard_alone() {
+            let mut w = win_with_pages();
+            w.edit(0);
+            w.send(Event::Text("@".into()));
+            assert_eq!(w.menu().map(|m| m.kind), Some(Kind::Mention));
+            w.send(Event::Text("alp".into()));
+            assert_eq!(w.text(), "@alp", "typing filters, the text stays");
+            w.send(key(Key::Enter));
+            assert_eq!(w.text(), "@[Alpha](page:Alpha)");
+            assert!(w.menu().is_none());
+            assert_eq!(w.app.rows.len(), 2, "Enter picked, it added no block");
+            w.send(key(Key::Escape)); // commits the row
+            assert!(w.app.focus.is_none());
+            let r = &w.app.rows[0].rich_text;
+            assert_eq!(r.len(), 1);
+            assert!(matches!(&r[0].kind, notion_core::model::RichTextKind::Mention(_)));
+            let body = queued_body(&w);
+            let m = &body["paragraph"]["rich_text"][0];
+            assert_eq!(m["type"], "mention");
+            assert_eq!(m["mention"], json!({ "type": "page", "page": { "id": "Alpha" } }));
+            assert_eq!(m["plain_text"], "Alpha");
+        }
+
+        #[test]
+        fn at_menu_arrows_pick_a_date_mention() {
+            let mut w = win_with_pages();
+            w.edit(0);
+            w.type_text("see ");
+            w.send(Event::Text("@".into()));
+            assert!(w.menu().is_some());
+            // pages first (p, Alpha, Beta), then Heute, Morgen, Gestern: ↑ wraps to the last
+            w.send(key(Key::ArrowUp));
+            assert_eq!(w.menu().unwrap().selected, 5);
+            w.send(key(Key::Enter));
+            assert_eq!(w.text(), "see @[2026-11-19](date:2026-11-19)");
+            w.send(key(Key::Escape));
+            let body = queued_body(&w);
+            assert_eq!(body["paragraph"]["rich_text"][0]["plain_text"], "see ");
+            assert_eq!(
+                body["paragraph"]["rich_text"][1]["mention"],
+                json!({ "type": "date", "date": { "start": "2026-11-19", "end": null } })
+            );
+            // by name, in either language
+            w.edit(1);
+            w.send(Event::Text(" @".into()));
+            w.send(Event::Text("tomo".into()));
+            w.send(key(Key::Enter));
+            assert_eq!(w.text(), "x @[2026-11-21](date:2026-11-21)");
+        }
+
+        #[test]
+        fn at_needs_a_space_before_and_closes_like_the_slash_menu() {
+            let mut w = win_with_pages();
+            w.edit(0);
+            w.send(Event::Text("a@".into()));
+            assert!(w.menu().is_none(), "an e-mail address is no mention");
+            w.send(Event::Text(" @".into()));
+            assert!(w.menu().is_some());
+            w.send(key(Key::Backspace));
+            assert!(w.menu().is_none(), "backspace past the @ closes it");
+            assert_eq!(w.text(), "a@ ");
+            w.send(Event::Text("@".into()));
+            w.send(key(Key::Escape));
+            assert!(w.menu().is_none());
+            assert!(w.app.focus.is_some(), "the first Esc only closes the menu");
+            w.send(Event::Text("@".into()));
+            w.send(Event::Text("zzz".into()));
+            assert!(w.menu().is_none(), "no match closes it");
+        }
+
+        #[test]
+        fn at_and_double_bracket_stay_closed_in_inline_code_and_after_a_space() {
+            let mut w = win_with_pages();
+            w.edit(0);
+            w.send(Event::Text("`x @".into()));
+            assert!(w.menu().is_none(), "inside `code`");
+            w.send(Event::Text(" a[[".into()));
+            assert!(w.menu().is_none(), "inside `code`");
+            w.send(Event::Text("` and @".into()));
+            assert!(w.menu().is_some(), "the span is closed again");
+            w.send(Event::Text(" ".into()));
+            assert!(w.menu().is_none(), "a space right after @ closes it");
+            assert_eq!(w.text(), "`x @ a[[` and @ ");
+            // an escaped backtick opens no span; `/` is not affected
+            let mut w = win_with_pages();
+            w.edit(0);
+            w.send(Event::Text("\\` @".into()));
+            assert!(w.menu().is_some());
+            let mut w = win_with_pages();
+            w.edit(0);
+            w.send(Event::Text("`a /".into()));
+            assert!(w.menu().is_some(), "the slash menu is unchanged");
+            let mut w = win_with_pages();
+            w.edit(0);
+            w.send(Event::Text("[[".into()));
+            w.send(Event::Text(" ".into()));
+            assert!(w.menu().is_none(), "[[ plus a space closes too");
+        }
+
+        #[test]
+        fn ctrl_period_opens_turn_into_where_ctrl_slash_is_ctrl_shift_7() {
+            let mut w = win_with_pages();
+            w.edit(1);
+            w.press(Key::Period, Modifiers::CTRL);
+            assert_eq!(w.menu().map(|m| m.kind), Some(Kind::TurnInto));
+            w.send(Event::Text("zitat".into()));
+            w.send(key(Key::Enter));
+            assert_eq!(w.app.rows[1].marker, Marker::Quote);
+        }
+
+        #[test]
+        fn double_bracket_picks_a_page_link_and_lists_pages_only() {
+            let mut w = win_with_pages();
+            w.edit(0);
+            w.send(Event::Text("[[".into()));
+            assert_eq!(w.menu().map(|m| m.kind), Some(Kind::PageLink));
+            w.send(Event::Text("heu".into()));
+            assert!(w.menu().is_none(), "no dates in the page picker");
+            let mut w = win_with_pages();
+            w.edit(0);
+            w.send(Event::Text("[[".into()));
+            w.send(Event::Text("bet".into()));
+            w.send(key(Key::Enter));
+            assert_eq!(w.text(), "@[Beta](page:Beta)");
+            w.send(key(Key::Escape));
+            let body = queued_body(&w);
+            assert_eq!(
+                body["paragraph"]["rich_text"][0]["mention"],
+                json!({ "type": "page", "page": { "id": "Beta" } })
+            );
+        }
+
+        #[test]
+        fn a_row_with_a_page_mention_is_editable_and_commits_valid_json() {
+            let store = Store::open_in_memory().unwrap();
+            add_page(&store, "p", None, &[]);
+            let rich = json!([
+                { "type": "text", "text": { "content": "go " }, "plain_text": "go ", "annotations": {} },
+                { "type": "mention", "mention": { "type": "page", "page": { "id": "Alpha" } },
+                  "plain_text": "Alpha", "annotations": { "bold": true }, "href": "https://notion.so/Alpha" },
+            ]);
+            store
+                .replace_children("p", "p", &[crate::outline::tests::blk("m", "p", "paragraph", json!({ "rich_text": rich }))])
+                .unwrap();
+            let mut w = Win::new(store);
+            w.app.apply(Action::Open("p".into()));
+            w.frames(vec![]);
+            assert!(w.app.rows[0].editable, "a mention no longer makes the row read-only");
+            w.edit(0);
+            assert_eq!(w.text(), "go **@[Alpha](page:Alpha)**");
+            w.send(key(Key::Escape));
+            assert_eq!(w.queued(), 0, "unchanged: nothing written");
+            w.edit(0);
+            w.type_text("!");
+            w.send(key(Key::Escape));
+            let body = queued_body(&w);
+            let rt = &body["paragraph"]["rich_text"];
+            assert_eq!(rt[0]["text"]["content"], "go ");
+            assert_eq!(rt[1]["type"], "mention");
+            assert_eq!(rt[1]["mention"], json!({ "type": "page", "page": { "id": "Alpha" } }));
+            assert_eq!(rt[1]["annotations"]["bold"], true);
+            assert_eq!(rt[2]["text"]["content"], "!");
+        }
+
+        #[test]
+        fn ctrl_slash_turns_the_row_into_a_block_by_keyboard() {
+            let mut w = win_with_pages();
+            w.edit(1);
+            w.press(Key::Slash, Modifiers::CTRL);
+            assert_eq!(w.menu().map(|m| m.kind), Some(Kind::TurnInto));
+            assert_eq!(w.text(), "x", "the menu opens without touching the text");
+            // typing filters the menu, not the row; Backspace edits the filter
+            w.send(Event::Text("ueberschrift 2".into()));
+            assert_eq!(w.text(), "x");
+            assert_eq!(w.menu().unwrap().filter, "ueberschrift 2");
+            w.send(key(Key::Backspace));
+            w.send(Event::Text("2".into()));
+            w.send(key(Key::Enter));
+            assert_eq!(w.app.rows[1].marker, Marker::Heading(2));
+            assert_eq!(w.text(), "x");
+            assert!(w.menu().is_none());
+        }
+
+        #[test]
+        fn ctrl_slash_arrows_esc_and_empty_backspace() {
+            let mut w = win_with_pages();
+            w.edit(0); // an empty row: Backspace must not delete it
+            w.press(Key::Slash, Modifiers::CTRL);
+            w.send(key(Key::ArrowDown));
+            w.send(key(Key::ArrowDown));
+            assert_eq!(w.menu().unwrap().selected, 2);
+            w.send(key(Key::Backspace));
+            assert!(w.menu().is_none(), "Backspace on an empty filter closes it");
+            assert_eq!(w.app.rows.len(), 2, "and deleted nothing");
+            w.press(Key::Slash, Modifiers::CTRL);
+            w.send(Event::Text("code".into()));
+            w.send(key(Key::Escape));
+            assert!(w.menu().is_none() && w.app.focus.is_some(), "Esc only closes the menu");
+            w.press(Key::Slash, Modifiers::CTRL);
+            w.press(Key::Slash, Modifiers::CTRL);
+            assert!(w.menu().is_none(), "Ctrl+/ again closes it");
+            w.press(Key::Slash, Modifiers::CTRL);
+            w.send(Event::Text("liste".into()));
+            w.send(key(Key::ArrowDown));
+            w.send(key(Key::Enter));
+            assert_eq!(w.app.rows[0].marker, Marker::Number(1), "second of Bulleted, Numbered");
         }
 
         #[test]

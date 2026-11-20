@@ -1818,7 +1818,7 @@ mod tests {
                 json!({ "type": "workspace", "workspace": true }),
             ))
             .unwrap();
-        let mention = json!([{ "type": "mention", "mention": { "type": "date", "date": { "start": "2025-01-01" } },
+        let mention = json!([{ "type": "mention", "mention": { "type": "link_preview", "link_preview": { "url": "https://x.test" } },
             "plain_text": "d", "annotations": {} }]);
         let para =
             |id: &str, parent: &str| blk(id, parent, "paragraph", json!({ "rich_text": rt(id) }));
@@ -2811,7 +2811,7 @@ mod tests {
                 json!({ "type": "workspace", "workspace": true }),
             ))
             .unwrap();
-        let mention = json!([{ "type": "mention", "mention": { "type": "date", "date": { "start": "2025-01-01" } },
+        let mention = json!([{ "type": "mention", "mention": { "type": "link_preview", "link_preview": { "url": "https://x.test" } },
             "plain_text": "d", "annotations": {} }]);
         let para = |id: &str, p: &str| blk(id, p, "paragraph", json!({ "rich_text": rt(id) }));
         let table = |id: &str, p: &str| {
@@ -2966,7 +2966,7 @@ mod tests {
 
         // a pull makes the edited cell read-only (a mention): the text survives
         use crate::outline::tests::{blk, rt};
-        let mention = json!([{ "type": "mention", "mention": { "type": "date", "date": { "start": "2025-01-01" } },
+        let mention = json!([{ "type": "mention", "mention": { "type": "link_preview", "link_preview": { "url": "https://x.test" } },
             "plain_text": "d", "annotations": {} }]);
         type_text(&mut s, "Z");
         let row = |c0: serde_json::Value| {
@@ -3450,7 +3450,7 @@ mod tests {
         p.properties.insert(
             "Name".into(),
             PropertyValue::Title(vec![serde_json::from_value(json!({ "type": "mention",
-                "mention": { "type": "date", "date": { "start": "2025-01-01" } },
+                "mention": { "type": "link_preview", "link_preview": { "url": "https://x.test" } },
                 "plain_text": "d", "annotations": {} }))
             .unwrap()]),
         );

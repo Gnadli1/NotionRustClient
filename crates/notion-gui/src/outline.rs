@@ -601,7 +601,7 @@ pub(crate) mod tests {
     #[test]
     fn flattens_with_depth_numbering_and_markers() {
         let store = Store::open_in_memory().unwrap();
-        let mention = json!([{ "type": "mention", "mention": { "type": "date", "date": { "start": "2025-01-01" } },
+        let mention = json!([{ "type": "mention", "mention": { "type": "link_preview", "link_preview": { "url": "https://x.test" } },
             "plain_text": "2025-01-01", "annotations": {} }]);
         store
             .replace_children(
@@ -954,7 +954,7 @@ pub(crate) mod tests {
     #[test]
     fn table_is_one_row() {
         let store = Store::open_in_memory().unwrap();
-        let mention = json!([{ "type": "mention", "mention": { "type": "date", "date": { "start": "2025-01-01" } },
+        let mention = json!([{ "type": "mention", "mention": { "type": "link_preview", "link_preview": { "url": "https://x.test" } },
             "plain_text": "d", "annotations": {} }]);
         store
             .replace_children(

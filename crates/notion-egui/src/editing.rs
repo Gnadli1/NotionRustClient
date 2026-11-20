@@ -14,6 +14,7 @@ use crate::app::{neighbour, set_cursor, Action, App, Focus, Grab, TitleEdit};
 use crate::edit::{key_action, Caret, EditKey, KeyAction};
 use crate::keys::{self, Command};
 use crate::links::{self, Link};
+use crate::menu::{Kind, Menu};
 use crate::outline::{self, Marker, Row};
 
 const CTRL_SHIFT: Modifiers = Modifiers {
@@ -90,9 +91,14 @@ impl App {
                 act = Some(a);
             }
         }
+        let turn_into_open = f.menu.as_ref().is_some_and(|m| m.kind == Kind::TurnInto);
         for c in cmds {
             f.menu = None;
             match c {
+                // Ctrl+/ again closes it
+                Command::TurnInto if row && !turn_into_open => {
+                    f.menu = Some(Menu::new(Kind::TurnInto, 0, 0, Default::default()));
+                }
                 Command::Mark(m) if !f.code => {
                     let end = f.text.chars().count();
                     let sel = TextEditState::load(ctx, id)
@@ -818,7 +824,7 @@ mod tests {
     fn table_win() -> Win {
         let store = Store::open_in_memory().unwrap();
         add_page(&store, "p", None, &[]);
-        let mention = json!([{ "type": "mention", "mention": { "type": "date", "date": { "start": "2025-01-01" } },
+        let mention = json!([{ "type": "mention", "mention": { "type": "link_preview", "link_preview": { "url": "https://x.test" } },
             "plain_text": "d", "annotations": {} }]);
         let table = |id: &str, parent: &str| {
             blk(id, parent, "table", json!({ "table_width": 2, "has_column_header": true, "has_row_header": false }))
