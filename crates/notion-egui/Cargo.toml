@@ -1,0 +1,11 @@
+[package]
+name = "notion-egui"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+notion-core = { path = "../notion-core" }
+eframe.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
