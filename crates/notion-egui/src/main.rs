@@ -1,7 +1,9 @@
-//! egui spike: shows one cached page read-only on disk (edits live in memory
-//! only). Usage: `notion-egui [PAGE_ID] [DB_PATH]`; PAGE_ID defaults to the
-//! cached page with the most blocks, DB_PATH to the notion-cli cache.
-//! `NOTION_EGUI_KEYLOG=1` prints raw key/text/IME events to stderr.
+//! egui port of the Notion client, shell stage (E1): sidebar tree, tabs,
+//! Ctrl+K switcher, sync actions, status bar, session. The page body is the
+//! spike's. Usage: `notion-egui [DB_PATH]`; DB_PATH defaults to
+//! $XDG_DATA_HOME/notion-client/cache.db, else ~/.local/share/..., the cache
+//! notion-cli and notion-gui share. `NOTION_EGUI_KEYLOG=1` prints raw
+//! key/text/IME events to stderr.
 
 mod app;
 #[allow(dead_code)]
@@ -9,18 +11,33 @@ mod edit;
 mod keys;
 mod md;
 mod menu;
-// shared with notion-gui for now; E1 moves them into a crate of their own
+mod problems;
+mod shell;
+mod switcher;
+mod theme;
+mod view;
+mod worker;
+// shared with notion-gui for now; a crate of their own later
 #[allow(dead_code)]
 #[path = "../../notion-gui/src/outline.rs"]
 mod outline;
 #[allow(dead_code)]
+#[path = "../../notion-gui/src/session.rs"]
+mod session;
+#[allow(dead_code)]
+#[path = "../../notion-gui/src/sidebar.rs"]
+mod sidebar;
+#[allow(dead_code)]
 #[path = "../../notion-gui/src/slash.rs"]
 mod slash;
+#[allow(dead_code)]
+#[path = "../../notion-gui/src/tabs.rs"]
+mod tabs;
 #[allow(dead_code)]
 #[path = "../../notion-gui/src/tex.rs"]
 mod tex;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 use notion_core::store::Store;
@@ -34,6 +51,22 @@ fn db_path(arg: Option<PathBuf>) -> Option<PathBuf> {
         None => PathBuf::from(std::env::var_os("HOME")?).join(".local/share"),
     };
     Some(base.join("notion-client/cache.db"))
+}
+
+/// $XDG_CONFIG_HOME/notion-client, else ~/.config/notion-client.
+fn config_dir() -> Option<PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+    };
+    Some(base.join("notion-client"))
+}
+
+fn open_store(db: &Path) -> Result<Store, String> {
+    if let Some(dir) = db.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    Store::open(db).map_err(|e| e.to_string())
 }
 
 /// Noto Sans first (Latin, Greek, umlauts; a bold face for `md::bold_family`),
@@ -85,25 +118,24 @@ fn setup_fonts(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result {
-    let mut args = std::env::args_os().skip(1);
-    let page = args.next().and_then(|a| a.into_string().ok());
-    let Some(db) = db_path(args.next().map(PathBuf::from)) else {
-        eprintln!("HOME not set; pass the cache path as the second argument");
+    let Some(db) = db_path(std::env::args_os().nth(1).map(PathBuf::from)) else {
+        eprintln!("HOME not set; pass the cache path as the first argument");
         std::process::exit(2);
     };
-    if !db.exists() {
-        eprintln!("no cache at {}", db.display());
-        std::process::exit(1);
-    }
-    let store = Store::open(&db).unwrap_or_else(|e| {
+    let store = open_store(&db).unwrap_or_else(|e| {
         eprintln!("cannot open {}: {e}", db.display());
         std::process::exit(1);
     });
     let keylog = std::env::var_os("NOTION_EGUI_KEYLOG").is_some_and(|v| v == "1");
+    let dir = config_dir();
+    let (sess, problem) = dir
+        .as_deref()
+        .map(|d| session::load_from(d, shell::SESSION_FILE))
+        .unwrap_or_default();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 800.0])
-            .with_title("Notion (egui spike)"),
+            .with_inner_size([sess.window.0, sess.window.1])
+            .with_title(env!("CARGO_PKG_NAME")),
         ..Default::default()
     };
     eframe::run_native(
@@ -113,7 +145,17 @@ fn main() -> eframe::Result {
             // Ctrl+Plus/Minus would zoom; Ctrl+ß / Ctrl+\ are ours
             cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
             setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(app::App::new(store, page, keylog)))
+            theme::install(&cc.egui_ctx);
+            let (cmds, events, worker) = worker::spawn(db, cc.egui_ctx.clone());
+            let mut app = app::App::new(store, cmds, events, keylog);
+            app.set_worker(worker);
+            if let Some(dir) = dir {
+                app.restore(dir, sess, problem);
+            }
+            Ok(Box::new(app))
         }),
     )
 }
+
+#[cfg(test)]
+mod testkit;

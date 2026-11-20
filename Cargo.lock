@@ -3001,7 +3001,10 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "notion-core",
+ "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

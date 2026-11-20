@@ -6,6 +6,10 @@ version.workspace = true
 [dependencies]
 notion-core = { path = "../notion-core" }
 eframe.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
+# session.rs (shared with notion-gui) tests use it
+tempfile.workspace = true

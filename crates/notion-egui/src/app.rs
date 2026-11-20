@@ -1,5 +1,11 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+//! App state, the page body and the focused-row editor. The shell around it
+//! (sync, tabs, switcher, session, frame) is in `shell.rs`, drawing of the
+//! chrome in `view/`.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::{mpsc::Receiver, Arc};
+use std::time::Instant;
 
 use eframe::egui::{
     self,
@@ -8,98 +14,145 @@ use eframe::egui::{
     Color32, Frame, Galley, Id, Key, Label, Margin, Modifiers, RichText, Sense, TextBuffer, Ui,
 };
 use notion_core::markdown::{from_markdown, to_markdown};
-use notion_core::model::{plain_text, TargetKind};
+use notion_core::model::{plain_text, BlockKind, TargetKind, TextBlock};
+use notion_core::sync::{self, ChangeOutcome};
 use notion_core::store::{PageEntry, Store};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::edit::EditKey;
 use crate::menu::{menu_step, Outcome};
 use crate::outline::{self, Marker, Row};
+use crate::problems::Problem;
+use crate::session;
 use crate::slash::{self, Menu};
-use crate::{keys, md};
+use crate::switcher::Switcher;
+use crate::tabs::Tab;
+use crate::worker::{Cmd, Event};
+use crate::{md, theme};
 
 /// Where the cursor goes when a row's editor opens.
 #[derive(Clone, Copy)]
-enum Grab {
+pub(crate) enum Grab {
     Start,
     End,
+    /// A char index.
+    At(usize),
 }
 
-/// The row being edited: its Markdown source lives here until Esc or a move
-/// commits it back into `rows` (in memory only; nothing touches the store).
-struct Focus {
-    idx: usize,
-    text: String,
-    menu: Option<Menu>,
+/// The row being edited: its text lives here until Esc, a move or a sync
+/// command commits it to the store (`App::flush`).
+pub(crate) struct Focus {
+    pub(crate) idx: usize,
+    /// Survives a rebuild of `rows`, which can move `idx`.
+    pub(crate) block_id: String,
+    /// The text as the editor started (or was last written): an unchanged
+    /// commit writes nothing.
+    pub(crate) original: String,
+    pub(crate) text: String,
+    /// Code and equation rows are edited as raw text, not Markdown.
+    pub(crate) code: bool,
+    pub(crate) menu: Option<Menu>,
     galley: Option<Arc<Galley>>,
     /// Set until the editor has taken keyboard focus and its cursor.
     grab: Option<Grab>,
     prev_len: usize,
     scroll: bool,
+    /// The last write of this text failed: a second Esc leaves without it.
+    pub(crate) failed: bool,
 }
 
-enum Action {
+pub(crate) enum Action {
     Edit(usize, Grab),
     Blur,
+    /// A page link, sidebar row or breadcrumb: shown, or pulled if uncached.
     Open(String),
     Toggle(usize),
     Check(usize),
+    /// Expand or collapse a sidebar page.
+    ToggleTree(String),
+    Switch(usize),
+    CloseTab(usize),
+    NewTab,
+    /// Opens the Ctrl+K switcher.
+    Search,
+    ToggleProblems,
+    OpenProblem(i64),
+    Discard(i64),
+    /// A slash pick or Markdown shortcut on the edited row: `text` is the
+    /// editor's text without the trigger, `typed` as it was before, `at` the
+    /// cursor (a char index into `text`).
+    Convert {
+        kind: TargetKind,
+        text: String,
+        typed: String,
+        at: usize,
+    },
 }
 
 pub struct App {
-    store: Store,
-    pages: Vec<(PageEntry, usize)>,
-    page_id: String,
-    title: String,
-    rows: Vec<Row>,
-    shown: Vec<bool>,
-    open: HashSet<String>,
+    pub(crate) store: Store,
+    /// None once the worker is shut down.
+    pub(crate) cmds: Option<UnboundedSender<Cmd>>,
+    pub(crate) events: Receiver<Event>,
+    pub(crate) worker: Option<std::thread::JoinHandle<()>>,
+    /// Sidebar pages; [`crate::sidebar`] nests them.
+    pub(crate) tree: Vec<PageEntry>,
+    /// Expanded sidebar pages.
+    pub(crate) tree_open: HashSet<String>,
+    pub(crate) sidebar: bool,
+    pub(crate) current: Option<String>,
+    pub(crate) title: String,
+    pub(crate) rows: Vec<Row>,
+    pub(crate) shown: Vec<bool>,
+    /// Expanded toggles; every other toggle is collapsed (Notion's default).
+    pub(crate) open: HashSet<String>,
     /// Layout of each read-only row, built once (not per frame).
-    jobs: HashMap<usize, LayoutJob>,
+    pub(crate) jobs: HashMap<usize, LayoutJob>,
     /// Table cells by (row, table row, column).
-    table_jobs: HashMap<(usize, usize, usize), LayoutJob>,
-    focus: Option<Focus>,
-    sidebar: bool,
-    keylog: bool,
-    error: Option<String>,
+    pub(crate) table_jobs: HashMap<(usize, usize, usize), LayoutJob>,
+    pub(crate) focus: Option<Focus>,
+    /// The page's scroll offset, read back every frame.
+    pub(crate) scroll: f32,
+    /// An offset to apply on the next frame (tab switch, new page), once.
+    pub(crate) pending_scroll: Option<f32>,
+    /// Open tabs; `tabs[active]` is stale, `current`/`open`/`scroll` are its
+    /// live state.
+    pub(crate) tabs: Vec<Tab>,
+    pub(crate) active: usize,
+    /// Recently opened pages, most recent first.
+    pub(crate) recent: Vec<String>,
+    pub(crate) window: (f32, f32),
+    /// Where session-egui.json is written on exit; None (tests) writes nothing.
+    pub(crate) session_dir: Option<PathBuf>,
+    /// One entry per command sent and not yet answered (the worker answers
+    /// each with one event, in order); true = Push.
+    pub(crate) sent: VecDeque<bool>,
+    /// Page waiting for its pull, to be opened when it arrives.
+    pub(crate) pending_open: Option<String>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) info: Option<String>,
+    /// queued, conflict, failed
+    pub(crate) counts: [usize; 3],
+    /// Resolved targets of queued ops, and of conflict/failed ones.
+    pub(crate) queued_ids: HashSet<String>,
+    pub(crate) problem_ids: HashSet<String>,
+    pub(crate) problems: Vec<Problem>,
+    pub(crate) problems_open: bool,
+    pub(crate) switcher: Option<Switcher>,
+    pub(crate) last_auto: Option<Instant>,
+    /// The command in flight is an auto-pull.
+    pub(crate) auto_pulling: bool,
+    pub(crate) was_focused: bool,
+    pub(crate) next_tick: Instant,
+    pub(crate) worker_gone: bool,
+    /// The window title last sent.
+    pub(crate) shown_title: String,
+    pub(crate) keylog: bool,
 }
 
-/// The cached page with the most blocks.
-pub fn largest_page(store: &Store) -> Option<String> {
-    let counts = store.page_tree().ok()?.into_iter().filter_map(|p| {
-        let n = outline::flatten(store, &p.id).ok()?.len();
-        Some((n, p.id))
-    });
-    counts
-        .max_by_key(|(n, id)| (*n, std::cmp::Reverse(id.clone())))
-        .map(|(_, id)| id)
-}
-
-/// Depth-first by title; entries whose parent isn't listed are roots.
-fn sorted_tree(entries: Vec<PageEntry>) -> Vec<(PageEntry, usize)> {
-    let ids: HashSet<String> = entries.iter().map(|e| e.id.clone()).collect();
-    let mut kids: HashMap<Option<String>, Vec<PageEntry>> = HashMap::new();
-    for e in entries {
-        let key = e.parent.clone().filter(|p| ids.contains(p) && *p != e.id);
-        kids.entry(key).or_default().push(e);
-    }
-    for v in kids.values_mut() {
-        v.sort_by_key(|e| e.title.to_lowercase());
-    }
-    let mut out = Vec::new();
-    let mut stack: Vec<(PageEntry, usize)> = kids
-        .remove(&None)
-        .unwrap_or_default()
-        .into_iter()
-        .rev()
-        .map(|e| (e, 0))
-        .collect();
-    while let Some((e, d)) = stack.pop() {
-        if let Some(c) = kids.remove(&Some(e.id.clone())) {
-            stack.extend(c.into_iter().rev().map(|k| (k, d + 1)));
-        }
-        out.push((e, d));
-    }
-    out
+/// The text edit's id for a block; it must not change while the row moves.
+pub(crate) fn edit_id(block_id: &str) -> Id {
+    Id::unique(("edit", block_id))
 }
 
 /// (font size, bold) for a row's text.
@@ -113,28 +166,9 @@ fn look(m: &Marker) -> (f32, bool) {
     }
 }
 
-fn apply_kind(row: &mut Row, kind: TargetKind) {
-    row.marker = match kind {
-        TargetKind::Paragraph => Marker::None,
-        TargetKind::Heading1 => Marker::Heading(1),
-        TargetKind::Heading2 => Marker::Heading(2),
-        TargetKind::Heading3 => Marker::Heading(3),
-        TargetKind::Bulleted => Marker::Bullet,
-        TargetKind::Numbered => Marker::Number(1),
-        TargetKind::ToDo => Marker::Todo(false),
-        TargetKind::Toggle => Marker::Toggle,
-        TargetKind::Quote => Marker::Quote,
-        TargetKind::Callout => Marker::Callout("💡".into()),
-        TargetKind::Code => Marker::Code(String::new()),
-        TargetKind::Divider => Marker::Divider,
-        TargetKind::Equation => Marker::Equation,
-    };
-    row.toggle = kind == TargetKind::Toggle;
-}
-
 /// Blur first, then the rest in order: a Blur from the edited row must not be
 /// lost to (or undo) another row's action in the same frame.
-fn blur_first(acts: &mut [Action]) {
+pub(crate) fn blur_first(acts: &mut [Action]) {
     acts.sort_by_key(|a| !matches!(a, Action::Blur));
 }
 
@@ -175,14 +209,23 @@ fn neighbour(rows: &[Row], shown: &[bool], idx: usize, dir: isize) -> Option<usi
     None
 }
 
+
 impl App {
-    pub fn new(store: Store, page: Option<String>, keylog: bool) -> Self {
-        let pages = sorted_tree(store.page_tree().unwrap_or_default());
-        let id = page.or_else(|| largest_page(&store)).unwrap_or_default();
+    pub fn new(
+        store: Store,
+        cmds: UnboundedSender<Cmd>,
+        events: Receiver<Event>,
+        keylog: bool,
+    ) -> Self {
         let mut app = App {
             store,
-            pages,
-            page_id: String::new(),
+            cmds: Some(cmds),
+            events,
+            worker: None,
+            tree: Vec::new(),
+            tree_open: HashSet::new(),
+            sidebar: true,
+            current: None,
             title: String::new(),
             rows: Vec::new(),
             shown: Vec::new(),
@@ -190,65 +233,184 @@ impl App {
             jobs: HashMap::new(),
             table_jobs: HashMap::new(),
             focus: None,
-            sidebar: true,
+            scroll: 0.0,
+            pending_scroll: None,
+            tabs: vec![Tab::default()],
+            active: 0,
+            recent: Vec::new(),
+            window: session::Session::default().window,
+            session_dir: None,
+            sent: VecDeque::new(),
+            pending_open: None,
+            last_error: None,
+            info: None,
+            counts: [0; 3],
+            queued_ids: HashSet::new(),
+            problem_ids: HashSet::new(),
+            problems: Vec::new(),
+            problems_open: false,
+            switcher: None,
+            last_auto: None,
+            auto_pulling: false,
+            was_focused: false,
+            next_tick: Instant::now() + crate::shell::AUTO_PULL_EVERY,
+            worker_gone: false,
+            shown_title: String::new(),
             keylog,
-            error: None,
         };
-        app.open_page(&id);
+        app.refresh();
         app
     }
 
-    fn open_page(&mut self, id: &str) {
-        self.commit();
-        self.page_id = id.to_string();
-        self.jobs.clear();
-        self.table_jobs.clear();
-        self.error = None;
-        self.title = match self.store.get_page(id) {
-            Ok(Some(p)) => p.title(),
-            _ => self
-                .pages
-                .iter()
-                .find(|(p, _)| p.id == id)
-                .map(|(p, _)| p.title.clone())
-                .unwrap_or_default(),
+    /// Starts editing row `i`. Not while a push runs: the worker may already
+    /// have sent the queued ops an edit would rewrite.
+    pub(crate) fn start_edit(&mut self, i: usize, grab: Grab) {
+        if i >= self.rows.len() || self.pushing() || !self.commit() {
+            return;
+        }
+        self.open_editor(i, grab, None);
+    }
+
+    /// The editor on row `i`, with `typed` in it if the text differs from the
+    /// row's (a conversion keeps what was typed).
+    fn open_editor(&mut self, i: usize, grab: Grab, typed: Option<String>) {
+        let r = &self.rows[i];
+        let code = r.marker == Marker::Equation || matches!(r.marker, Marker::Code(_));
+        let original = if code {
+            plain_text(&r.rich_text)
+        } else {
+            to_markdown(&r.rich_text)
         };
-        match outline::flatten(&self.store, id) {
-            Ok(rows) => self.rows = rows,
-            Err(e) => {
-                self.rows.clear();
-                self.error = Some(format!("cannot read page {id}: {e}"));
+        let text = typed.unwrap_or_else(|| original.clone());
+        self.focus = Some(Focus {
+            idx: i,
+            block_id: r.block_id.clone(),
+            original,
+            prev_len: text.len(),
+            text,
+            code,
+            menu: None,
+            galley: None,
+            grab: Some(grab),
+            scroll: true,
+            failed: false,
+        });
+    }
+
+    /// A to-do's box: queues the change. Locked rows and pushes refuse.
+    fn check(&mut self, i: usize) {
+        let r = &self.rows[i];
+        let Marker::Todo(checked) = r.marker else { return };
+        if r.locked || self.pushing() || !self.flush() {
+            return;
+        }
+        let res = self
+            .store
+            .resolve_id(&self.rows[i].block_id)
+            .and_then(|id| sync::local_set_checked(&self.store, &id, !checked));
+        if let Err(e) = res {
+            self.last_error = Some(e.to_string());
+        }
+        self.refresh();
+    }
+
+    /// The edit is kept as typed, the trigger and all.
+    fn refuse(&mut self, typed: String, err: String) {
+        self.last_error = Some(err);
+        if let Some(f) = &mut self.focus {
+            f.prev_len = typed.len();
+            f.text = typed;
+            f.menu = None;
+            f.grab = Some(Grab::End);
+        }
+    }
+
+    /// Converts the edited block through core (a new id for a synced block)
+    /// and goes on editing it with `text`. Mirrors notion-gui's `convert`.
+    fn convert(&mut self, kind: TargetKind, text: String, typed: String, at: usize) {
+        if self.pushing() {
+            return self.refuse(typed, "editing is paused while a push runs".into());
+        }
+        let Some(f) = &mut self.focus else { return };
+        f.text = text.clone();
+        let (idx, old) = (f.idx, f.block_id.clone());
+        let row = self.rows[idx].clone();
+        // a divider after the text, which stays
+        if kind == TargetKind::Divider && !text.trim().is_empty() {
+            if !self.flush() {
+                return;
             }
+            match sync::local_create_block(&self.store, &row.parent, Some(&old), BlockKind::Divider)
+            {
+                Ok(_) => self.refresh(),
+                Err(e) => self.last_error = Some(e.to_string()),
+            }
+            return;
         }
-        self.shown = outline::shown(&self.rows, &self.open);
+        // code is raw text: no Markdown marks
+        // ponytail: the cursor goes to the start, not mapped through the marks
+        let (text, at) = if kind == TargetKind::Code {
+            (plain_text(&from_markdown(&text)), 0)
+        } else {
+            (text, at)
+        };
+        let new = match self
+            .store
+            .resolve_id(&old)
+            .and_then(|id| sync::local_change_type(&self.store, &id, kind).map(|o| (id, o)))
+        {
+            Ok((_, ChangeOutcome::Replaced(new))) => new,
+            Ok((id, ChangeOutcome::Kept)) => id,
+            Err(e) => return self.refuse(typed, e.to_string()),
+        };
+        // the old id may be gone: refresh must not discard the editor
+        self.focus = None;
+        self.refresh();
+        let Some(mut i) = self.rows.iter().position(|r| r.block_id == new) else {
+            return;
+        };
+        if !self.rows[i].editable {
+            // a divider has no text: go on in a new paragraph below it
+            let para = BlockKind::Paragraph(TextBlock {
+                rich_text: Vec::new(),
+                color: "default".into(),
+            });
+            match sync::local_create_block(&self.store, &row.parent, Some(&new), para) {
+                Ok(p) => {
+                    self.refresh();
+                    match self.rows.iter().position(|r| r.block_id == p) {
+                        Some(j) => i = j,
+                        None => return,
+                    }
+                    self.open_editor(i, Grab::End, None);
+                }
+                Err(e) => self.last_error = Some(e.to_string()),
+            }
+            return;
+        }
+        self.open_editor(i, Grab::At(at), Some(text));
+        self.flush();
     }
 
-    /// Esc or a move: the edited text goes back into the in-memory row.
-    fn commit(&mut self) {
-        if let Some(f) = self.focus.take() {
-            self.rows[f.idx].rich_text = from_markdown(&f.text);
-            self.jobs.remove(&f.idx);
-        }
-    }
-
-    fn apply(&mut self, act: Action) {
+    pub(crate) fn apply(&mut self, act: Action) {
         match act {
             Action::Edit(i, _) | Action::Toggle(i) | Action::Check(i) if i >= self.rows.len() => {}
-            Action::Edit(i, grab) => {
-                self.commit();
-                let text = to_markdown(&self.rows[i].rich_text);
-                self.focus = Some(Focus {
-                    idx: i,
-                    prev_len: text.len(),
-                    text,
-                    menu: None,
-                    galley: None,
-                    grab: Some(grab),
-                    scroll: true,
-                });
+            Action::Edit(i, grab) => self.start_edit(i, grab),
+            Action::Blur => {
+                // a write that keeps failing must not trap the editor: the
+                // second try leaves without the text
+                if !self.commit() {
+                    if let Some(f) = &mut self.focus {
+                        if f.failed {
+                            self.focus = None;
+                            self.last_error = Some("edit discarded: it could not be saved".into());
+                        } else {
+                            f.failed = true;
+                        }
+                    }
+                }
             }
-            Action::Blur => self.commit(),
-            Action::Open(id) => self.open_page(&id),
+            Action::Open(id) => self.open_or_pull(&id),
             Action::Toggle(i) => {
                 let id = self.rows[i].block_id.clone();
                 if !self.open.remove(&id) {
@@ -256,66 +418,64 @@ impl App {
                 }
                 self.shown = outline::shown(&self.rows, &self.open);
             }
-            Action::Check(i) => {
-                if let Marker::Todo(c) = &mut self.rows[i].marker {
-                    *c = !*c;
+            Action::Check(i) => self.check(i),
+            Action::Convert {
+                kind,
+                text,
+                typed,
+                at,
+            } => self.convert(kind, text, typed, at),
+            Action::ToggleTree(id) => {
+                if !self.tree_open.remove(&id) {
+                    self.tree_open.insert(id);
                 }
             }
+            Action::Switch(i) => self.switch_tab(i),
+            Action::CloseTab(i) => self.close_tab(i),
+            Action::NewTab => self.new_tab_with_switcher(),
+            Action::Search => self.open_switcher(),
+            Action::ToggleProblems => {
+                self.problems_open = !self.problems_open && !self.problems.is_empty();
+            }
+            Action::OpenProblem(op) => self.open_problem(op),
+            Action::Discard(op) => self.discard(op),
         }
     }
 
-    fn sidebar_ui(&self, ui: &mut Ui) -> Option<String> {
-        let mut go = None;
-        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for (p, depth) in &self.pages {
-                ui.horizontal(|ui| {
-                    ui.add_space(12.0 * *depth as f32);
-                    let title = if p.title.is_empty() {
-                        "Untitled"
-                    } else {
-                        &p.title
-                    };
-                    let text = format!(
-                        "{} {}",
-                        p.icon.as_deref().unwrap_or("📄"),
-                        title.replace('\n', " ")
-                    );
-                    if ui.selectable_label(p.id == self.page_id, text).clicked() {
-                        go = Some(p.id.clone());
-                    }
-                });
-            }
-        });
-        go
-    }
-
-    fn page_ui(&mut self, ui: &mut Ui) -> Vec<Action> {
+    pub(crate) fn page_ui(&mut self, ui: &mut Ui) -> Vec<Action> {
         let mut acts = Vec::new();
-        egui::ScrollArea::vertical()
-            .auto_shrink(false)
-            .show(ui, |ui| {
-                let w = ui.available_width();
-                let col = w.min(900.0);
-                ui.horizontal_top(|ui| {
-                    ui.add_space((w - col) / 2.0);
-                    ui.vertical(|ui| {
-                        ui.set_max_width(col);
-                        ui.add_space(16.0);
-                        ui.add(Label::new(RichText::new(&self.title).size(38.0).strong()).wrap());
-                        ui.add_space(12.0);
-                        if let Some(e) = &self.error {
-                            ui.colored_label(Color32::RED, e);
+        let c = theme::colors(ui);
+        // owned: the rows below borrow `self` mutably
+        let crumbs = self.breadcrumb();
+        let title = crate::view::untitled(&self.title).to_string();
+        let mut area = egui::ScrollArea::vertical()
+            .id_salt("page")
+            .auto_shrink(false);
+        if let Some(y) = self.pending_scroll.take() {
+            area = area.vertical_scroll_offset(y);
+        }
+        let out = area.show(ui, |ui| {
+            let w = ui.available_width();
+            let col = w.min(900.0);
+            ui.horizontal_top(|ui| {
+                ui.add_space((w - col) / 2.0);
+                ui.vertical(|ui| {
+                    ui.set_max_width(col);
+                    ui.add_space(16.0);
+                    acts.extend(crate::view::breadcrumb(ui, c, &crumbs, &title));
+                    ui.add_space(8.0);
+                    ui.add(Label::new(RichText::new(&title).size(38.0).strong()).wrap());
+                    ui.add_space(12.0);
+                    for idx in 0..self.rows.len() {
+                        if self.shown[idx] {
+                            acts.extend(self.row_ui(ui, idx));
                         }
-                        for idx in 0..self.rows.len() {
-                            if self.shown[idx] {
-                                acts.extend(self.row_ui(ui, idx));
-                            }
-                        }
-                        ui.add_space(200.0);
-                    });
+                    }
+                    ui.add_space(200.0);
                 });
             });
+        });
+        self.scroll = out.state.clamped_offset().y;
         acts
     }
 
@@ -348,8 +508,22 @@ impl App {
         let marker = self.rows[idx].marker.clone();
         let (size, _) = look(&marker);
         let grey = ui.visuals().weak_text_color();
+        // the sync gutter: red for a conflict/failed op, accent for a queued one
+        let c = theme::colors(ui);
+        let block = &self.rows[idx].block_id;
+        let dot = if self.problem_ids.contains(block) {
+            Some(c.error)
+        } else if self.queued_ids.contains(block) {
+            Some(c.accent)
+        } else {
+            None
+        };
         let mut act = None;
         ui.horizontal_top(|ui| {
+            let (gutter, _) = ui.allocate_exact_size(egui::vec2(12.0, 20.0), Sense::hover());
+            if let Some(col) = dot {
+                ui.painter().circle_filled(gutter.center(), 3.0, col);
+            }
             ui.add_space(26.0 * depth as f32);
             // the left-hand glyph: bullet, number, checkbox or toggle arrow
             let glyph = if toggle {
@@ -507,7 +681,7 @@ impl App {
 
     fn edit_body(&mut self, ui: &mut Ui, idx: usize) -> Option<Action> {
         let ctx = ui.ctx().clone();
-        let id = Id::unique(("edit", idx));
+        let id = edit_id(&self.focus.as_ref()?.block_id);
         let dim = ui.visuals().weak_text_color();
         let (size, bold) = look(&self.rows[idx].marker);
         let f = self.focus.as_mut()?;
@@ -515,10 +689,11 @@ impl App {
 
         if let Some(g) = f.grab.take() {
             ctx.memory_mut(|m| m.request_focus(id));
-            let at = if matches!(g, Grab::Start) {
-                0
-            } else {
-                f.text.chars().count()
+            let end = f.text.chars().count();
+            let at = match g {
+                Grab::Start => 0,
+                Grab::End => end,
+                Grab::At(n) => n.min(end),
             };
             set_cursor(&ctx, id, TextEditState::default(), at);
         }
@@ -630,18 +805,19 @@ impl App {
                 }
             }
         }
+        let mut convert = None;
         if let Some(kind) = picked {
+            let before = f.text.clone();
             if let Some(m) = &f.menu {
                 f.text = m.strip(&f.text, col);
                 new_cursor = Some(f.text[..byte_at(&f.text, m.line, m.slash)].chars().count());
             }
             f.menu = None;
-            apply_kind(&mut self.rows[idx], kind);
-            self.jobs.remove(&idx);
-            if kind == TargetKind::Divider {
-                act = Some(Action::Blur);
-            }
-        } else if f.menu.is_none() && typed && f.text[..byte_at(&f.text, line, col)].ends_with('/')
+            convert = Some((kind, before));
+        } else if f.menu.is_none()
+            && typed
+            && !f.code
+            && f.text[..byte_at(&f.text, line, col)].ends_with('/')
         {
             let slash = col - 1;
             let before = f.text[..byte_at(&f.text, line, col)].chars().rev().nth(1);
@@ -657,13 +833,13 @@ impl App {
         if f.menu.is_none()
             && picked.is_none()
             && typed
+            && !f.code
             && f.text[..byte_at(&f.text, line, col)].ends_with(' ')
         {
             if let Some((kind, rest)) = slash::shortcut(&f.text, line, col) {
-                f.text = rest;
+                let before = std::mem::replace(&mut f.text, rest);
                 new_cursor = Some(0);
-                apply_kind(&mut self.rows[idx], kind);
-                self.jobs.remove(&idx);
+                convert = Some((kind, before));
             }
         }
         if let Some(at) = new_cursor {
@@ -673,6 +849,15 @@ impl App {
             out.state.store(&ctx, id);
         }
         f.prev_len = f.text.len();
+        if let Some((kind, typed)) = convert {
+            let at = new_cursor.unwrap_or_else(|| f.text.chars().count());
+            act = Some(Action::Convert {
+                kind,
+                text: f.text.clone(),
+                typed,
+                at,
+            });
+        }
 
         if let Some(m) = &f.menu {
             let items = slash::filter(m.query(&f.text, line, col).unwrap_or(""));
@@ -704,90 +889,10 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        self.frame(ui);
-    }
-}
-
-impl App {
-    /// One frame (split from `App::ui` so tests can drive it without a window).
-    fn frame(&mut self, ui: &mut Ui) {
-        let ctx = ui.ctx().clone();
-        if self.keylog {
-            ctx.input(|i| keys::log(&i.raw.events));
-        }
-        let ctrl = ctx.input(|i| i.modifiers.ctrl);
-        if ctx.input_mut(|i| keys::take_sidebar_toggle(&mut i.events, ctrl)) {
-            self.sidebar = !self.sidebar;
-        }
-        let mut act = None;
-        if self.sidebar {
-            let go = egui::Panel::left("tree")
-                .size_range(180.0..=420.0)
-                .default_size(260.0)
-                .show(ui, |ui| self.sidebar_ui(ui))
-                .inner;
-            act = go.map(Action::Open);
-        }
-        let page = egui::CentralPanel::default()
-            .show(ui, |ui| self.page_ui(ui))
-            .inner;
-        // a Blur from the edited row must not be lost to another row's action
-        // (click on row B while A loses focus): Blur first, then the rest
-        let mut acts = page;
-        acts.extend(act);
-        blur_first(&mut acts);
-        for a in acts {
-            self.apply(a);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::outline::tests::{blk, rt};
-    use serde_json::json;
-
-    fn para(id: &str, parent: &str) -> notion_core::model::Block {
-        blk(id, parent, "paragraph", json!({ "rich_text": rt(id) }))
-    }
-
-    #[test]
-    fn largest_page_wins() {
-        let store = Store::open_in_memory().unwrap();
-        let sub = |id: &str| blk(id, "root", "child_page", json!({ "title": id }));
-        store
-            .replace_children("root", "root", &[sub("small"), sub("big")])
-            .unwrap();
-        store
-            .replace_children("small", "small", &[para("a", "small")])
-            .unwrap();
-        let kids = [para("x", "big"), para("y", "big"), para("z", "big")];
-        store.replace_children("big", "big", &kids).unwrap();
-        assert_eq!(largest_page(&store).as_deref(), Some("big"));
-        assert_eq!(largest_page(&Store::open_in_memory().unwrap()), None);
-    }
-
-    #[test]
-    fn tree_is_depth_first_by_title() {
-        let e = |id: &str, parent: Option<&str>| PageEntry {
-            id: id.into(),
-            title: id.into(),
-            parent: parent.map(Into::into),
-            icon: None,
-        };
-        let t = sorted_tree(vec![
-            e("c", Some("a")),
-            e("b", None),
-            e("a", None),
-            e("d", Some("zz")),
-        ]);
-        let got: Vec<(&str, usize)> = t.iter().map(|(p, d)| (p.id.as_str(), *d)).collect();
-        assert_eq!(got, [("a", 0), ("c", 1), ("b", 0), ("d", 0)]);
-    }
-
+    
     #[test]
     fn cursor_math_handles_lines_and_multibyte() {
         assert_eq!(line_col("ab\nßc", 4), (1, 2)); // the column is in bytes: ß is 2
@@ -799,86 +904,17 @@ mod tests {
     /// menu really takes ↑/↓/Enter/Esc away from the TextEdit.
     mod headless {
         use super::*;
-        use egui::{Event, Modifiers, RawInput};
+        use egui::Event;
 
-        fn key(k: Key) -> Event {
-            Event::Key {
-                key: k,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: Modifiers::NONE,
-            }
-        }
+        use crate::testkit::{key, Win};
 
-        struct Win {
-            ctx: egui::Context,
-            app: App,
-        }
-
-        impl Win {
-            fn new(texts: &[&str]) -> Win {
-                let store = Store::open_in_memory().unwrap();
-                let kids: Vec<_> = texts
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| {
-                        blk(
-                            &format!("b{i}"),
-                            "p",
-                            "paragraph",
-                            json!({ "rich_text": rt(t) }),
-                        )
-                    })
-                    .collect();
-                store.replace_children("p", "p", &kids).unwrap();
-                let ctx = egui::Context::default();
-                crate::setup_fonts(&ctx);
-                let mut w = Win {
-                    ctx,
-                    app: App::new(store, Some("p".into()), false),
-                };
-                w.frames(vec![]);
-                w
-            }
-
-            fn frames(&mut self, events: Vec<Event>) {
-                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
-                let raw = RawInput {
-                    screen_rect: Some(screen),
-                    events,
-                    ..Default::default()
-                };
-                let app = &mut self.app;
-                self.ctx
-                    .run_ui(raw, |ui| app.frame(ui))
-                    .drop_without_applying_deltas();
-            }
-
-            /// Starts editing row `i`, with the cursor at the end.
-            fn edit(&mut self, i: usize) {
-                self.app.apply(Action::Edit(i, Grab::End));
-                self.frames(vec![]);
-                self.frames(vec![]);
-            }
-
-            fn send(&mut self, ev: Event) {
-                self.frames(vec![ev]);
-                self.frames(vec![]);
-            }
-
-            fn text(&self) -> &str {
-                &self.app.focus.as_ref().unwrap().text
-            }
-
-            fn menu(&self) -> Option<&Menu> {
-                self.app.focus.as_ref().and_then(|f| f.menu.as_ref())
-            }
+        fn win(texts: &[&str]) -> Win {
+            Win::with_texts(texts)
         }
 
         #[test]
         fn slash_menu_takes_the_keys_and_picks() {
-            let mut w = Win::new(&[""]);
+            let mut w = win(&[""]);
             w.edit(0);
             w.send(Event::Text("/".into()));
             assert!(w.menu().is_some(), "typing / opens the menu");
@@ -896,7 +932,7 @@ mod tests {
 
         #[test]
         fn esc_closes_menu_then_row_and_backspace_past_slash_closes() {
-            let mut w = Win::new(&["abc"]);
+            let mut w = win(&["abc"]);
             w.edit(0);
             w.send(Event::Text(" /".into()));
             assert!(w.menu().is_some());
@@ -915,10 +951,10 @@ mod tests {
 
         #[test]
         fn pick_on_a_later_line_keeps_the_text_after_the_cursor() {
-            let mut w = Win::new(&["x\n äö"]);
+            let mut w = win(&["x\n äö"]);
             w.edit(0);
             let st = TextEditState::default();
-            set_cursor(&w.ctx, Id::unique(("edit", 0)), st, 2); // start of line 1
+            set_cursor(&w.ctx, edit_id("p-0"), st, 2); // start of line 1
             w.frames(vec![]);
             w.send(Event::Text("/".into()));
             assert_eq!(w.menu().map(|m| (m.line, m.slash)), Some((1, 0)));
@@ -931,7 +967,7 @@ mod tests {
 
         #[test]
         fn enter_in_the_same_frame_as_typing_uses_the_new_query() {
-            let mut w = Win::new(&[""]);
+            let mut w = win(&[""]);
             w.edit(0);
             w.send(Event::Text("/".into()));
             w.frames(vec![Event::Text("h1".into()), key(Key::Enter)]);
@@ -941,12 +977,12 @@ mod tests {
 
         #[test]
         fn unfocused_editor_leaves_menu_keys_alone() {
-            let mut w = Win::new(&["", "b"]);
+            let mut w = win(&["", "b"]);
             w.edit(0);
             w.send(Event::Text("/".into()));
             assert!(w.menu().is_some());
             w.ctx
-                .memory_mut(|m| m.surrender_focus(Id::unique(("edit", 0))));
+                .memory_mut(|m| m.surrender_focus(edit_id("p-0")));
             w.send(key(Key::Enter));
             assert_eq!(w.app.rows[0].marker, Marker::None, "no pick without focus");
         }
@@ -964,7 +1000,7 @@ mod tests {
 
         #[test]
         fn shortcut_and_row_hopping() {
-            let mut w = Win::new(&["", "second"]);
+            let mut w = win(&["", "second"]);
             w.edit(0);
             w.send(Event::Text("#".into()));
             w.send(Event::Text(" ".into()));
@@ -979,24 +1015,5 @@ mod tests {
             w.send(key(Key::ArrowUp));
             assert_eq!(w.app.focus.as_ref().unwrap().idx, 0);
         }
-    }
-
-    #[test]
-    fn slash_pick_changes_the_marker() {
-        let mut row = Row {
-            block_id: "x".into(),
-            parent: "p".into(),
-            depth: 0,
-            marker: Marker::None,
-            rich_text: vec![],
-            editable: true,
-            locked: false,
-            toggle: false,
-            level: 0,
-        };
-        apply_kind(&mut row, TargetKind::Heading2);
-        assert_eq!(row.marker, Marker::Heading(2));
-        apply_kind(&mut row, TargetKind::Toggle);
-        assert!(row.toggle);
     }
 }

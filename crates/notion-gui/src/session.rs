@@ -42,13 +42,18 @@ impl Default for Session {
 /// The saved session, or the default with a problem for the status bar (a
 /// missing file is no problem). Out-of-range values are fixed up.
 pub fn load(dir: &Path) -> (Session, Option<String>) {
-    let path = dir.join(FILE);
+    load_from(dir, FILE)
+}
+
+/// [`load`] from the file `file` in `dir` (notion-egui keeps its own).
+pub fn load_from(dir: &Path, file: &str) -> (Session, Option<String>) {
+    let path = dir.join(file);
     let (mut s, problem) = match std::fs::read_to_string(&path) {
         Ok(src) => match serde_json::from_str::<Session>(&src) {
             Ok(s) => (s, None),
             Err(e) => (
                 Session::default(),
-                Some(format!("{FILE}: {e}; starting fresh")),
+                Some(format!("{file}: {e}; starting fresh")),
             ),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Session::default(), None),
@@ -68,10 +73,15 @@ pub fn load(dir: &Path) -> (Session, Option<String>) {
 
 /// Writes atomically: a temp file next to it, then a rename.
 pub fn save(dir: &Path, s: &Session) -> std::io::Result<()> {
+    save_to(dir, FILE, s)
+}
+
+/// [`save`] to the file `file` in `dir`.
+pub fn save_to(dir: &Path, file: &str, s: &Session) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!("{FILE}.tmp"));
+    let tmp = dir.join(format!("{file}.tmp"));
     std::fs::write(&tmp, serde_json::to_vec_pretty(s)?)?;
-    std::fs::rename(tmp, dir.join(FILE))
+    std::fs::rename(tmp, dir.join(file))
 }
 
 /// A window size that fits on a screen and leaves room for the UI.
