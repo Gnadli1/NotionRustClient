@@ -106,6 +106,15 @@ pub fn ancestors<'a>(entries: &'a [PageEntry], id: &str) -> Vec<&'a str> {
     out
 }
 
+/// The breadcrumb above page `id`: its listed ancestors, root first.
+pub fn trail<'a>(entries: &'a [PageEntry], id: &str) -> Vec<&'a PageEntry> {
+    ancestors(entries, id)
+        .into_iter()
+        .rev()
+        .filter_map(|a| entries.iter().find(|e| e.id == a))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

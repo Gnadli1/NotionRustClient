@@ -3,17 +3,17 @@
 pub mod theme;
 
 use iced::font::{Family, Style, Weight};
-use iced::widget::text::{LineHeight, Span};
+use iced::widget::text::{LineHeight, Span, Wrapping};
 use iced::widget::{
     button, column, container, mouse_area, opaque, rich_text, row, rule, scrollable, space, span,
     stack, text, text_editor, text_input, Button, Column,
 };
 use std::ops::Range;
 
-use iced::{Element, Fill, Font, Padding, Shrink};
+use iced::{Center, Element, Fill, Font, Padding, Shrink};
 use notion_core::model::{RichText, RichTextKind};
 
-use crate::app::{click, Message, State, SEARCH_ID};
+use crate::app::{click, Message, State, PAGE_SCROLL_ID, SEARCH_ID};
 use crate::edit::{Editing, EDITOR_ID};
 use crate::keys::Keymap;
 use crate::outline::{self, Marker, Row, Table};
@@ -420,6 +420,77 @@ fn sidebar(s: &State) -> Element<'_, Message> {
         .into()
 }
 
+/// The tabs across the top: icon, title and × each, sharing the width.
+fn tab_bar(s: &State) -> Element<'_, Message> {
+    let tabs = s.tabs.iter().enumerate().map(|(i, t)| {
+        let active = i == s.active;
+        // the active tab's slot is stale; its live state is in `s`
+        let page = if active {
+            s.current.as_deref()
+        } else {
+            t.page.as_deref()
+        };
+        let entry = page.and_then(|id| s.tree.iter().find(|e| e.id == id));
+        let (icon, title) = match page {
+            None => ("", "New tab"),
+            Some(_) => (
+                entry.and_then(|e| e.icon.as_deref()).unwrap_or("📄"),
+                if active {
+                    untitled(&s.title)
+                } else {
+                    untitled(entry.map_or(t.title.as_str(), |e| e.title.as_str()))
+                },
+            ),
+        };
+        // long titles are cut off at the tab's edge (iced has no ellipsis)
+        let label = container(text(title).size(13).wrapping(Wrapping::None))
+            .width(Fill)
+            .clip(true);
+        // its own click target: the mouse_area takes the press
+        let close = mouse_area(text("×").size(14)).on_press(Message::CloseTab(i));
+        let body = row![text(icon).size(13), label, close]
+            .spacing(6)
+            .align_y(Center);
+        let tab = button(body)
+            .on_press(Message::SwitchTab(i))
+            .style(theme::tab(active))
+            .padding([0, 10])
+            .width(Fill)
+            .height(Fill);
+        container(mouse_area(tab).on_middle_press(Message::CloseTab(i)))
+            .width(Fill)
+            .max_width(240)
+            .into()
+    });
+    container(row(tabs).spacing(4).height(Fill))
+        .padding([4, 8])
+        .width(Fill)
+        .height(36)
+        .style(theme::sidebar)
+        .into()
+}
+
+/// "Parent › Child › Page" above the title; the ancestors are links.
+fn breadcrumb<'a>(s: &'a State, id: &str, c: &Colors) -> Element<'a, Message> {
+    let mut items: Vec<Element<'a, Message>> = Vec::new();
+    for e in crate::sidebar::trail(&s.tree, id) {
+        items.push(
+            button(text(untitled(&e.title)).size(14).color(c.secondary))
+                .on_press(Message::SidebarOpen(e.id.clone()))
+                .style(theme::item(false))
+                .padding([2, 4])
+                .into(),
+        );
+        items.push(text("›").size(14).color(c.secondary).into());
+    }
+    items.push(
+        container(text(untitled(&s.title)).size(14).color(c.secondary))
+            .padding([2, 4])
+            .into(),
+    );
+    row(items).spacing(2).align_y(Center).into()
+}
+
 /// The Ctrl+K switcher: a box near the top over a dimmed page; a click on
 /// the backdrop closes it.
 fn search_overlay(s: &State) -> Element<'_, Message> {
@@ -453,22 +524,25 @@ fn search_overlay(s: &State) -> Element<'_, Message> {
 pub fn view(s: &State) -> Element<'_, Message> {
     let c = theme::colors(s.mode);
     let main: Element<_> = match &s.current {
-        None => container(text("Pick a page on the left, or search.").color(c.secondary))
+        None => container(text("New tab: pick a page on the left, or search.").color(c.secondary))
             .center(Fill)
             .into(),
-        Some(_) => {
+        Some(id) => {
             let title = text(&s.title)
                 .size(40)
                 .font(BOLD)
                 .line_height(LineHeight::Relative(1.2));
             let page = column![
-                container(title).padding(Padding::ZERO.top(64).bottom(12)),
+                container(breadcrumb(s, id, c)).padding(Padding::ZERO.top(16)),
+                container(title).padding(Padding::ZERO.top(40).bottom(12)),
                 blocks(s, &outline::shown(&s.rows, &s.open), 0..s.rows.len(), 0, c),
             ]
             .width(Fill)
             .max_width(PAGE_WIDTH)
             .padding(Padding::ZERO.bottom(120));
             scrollable(container(page).padding([0.0, MIN_SIDE]).center_x(Fill))
+                .id(PAGE_SCROLL_ID)
+                .on_scroll(|v| Message::Scrolled(v.absolute_offset().y))
                 .height(Fill)
                 .into()
         }
@@ -498,6 +572,8 @@ pub fn view(s: &State) -> Element<'_, Message> {
         body = body.push(search_overlay(s));
     }
     column![
+        tab_bar(s),
+        rule::horizontal(1).style(theme::divider),
         body,
         rule::horizontal(1).style(theme::divider),
         container(text(status).size(12).color(c.secondary)).padding([4, 12]),

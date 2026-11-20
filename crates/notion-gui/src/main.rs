@@ -8,6 +8,7 @@ mod keys;
 mod outline;
 mod sidebar;
 mod slash;
+mod tabs;
 mod tex;
 mod view;
 mod worker;

@@ -149,6 +149,10 @@ pub enum Command {
     Outdent,
     ToggleCheck,
     NewBlock,
+    NewTab,
+    CloseTab,
+    NextTab,
+    PrevTab,
 }
 
 impl Command {
@@ -161,6 +165,10 @@ impl Command {
                 | Command::ForcePull
                 | Command::Search
                 | Command::ToggleSidebar
+                | Command::NewTab
+                | Command::CloseTab
+                | Command::NextTab
+                | Command::PrevTab
         )
     }
 }
@@ -194,6 +202,10 @@ const NAMES: &[(&str, Command)] = &[
     ("outdent", Command::Outdent),
     ("toggle_check", Command::ToggleCheck),
     ("new_block", Command::NewBlock),
+    ("new_tab", Command::NewTab),
+    ("close_tab", Command::CloseTab),
+    ("next_tab", Command::NextTab),
+    ("prev_tab", Command::PrevTab),
 ];
 
 /// Notion's defaults, except link: Ctrl+K is search here, so Ctrl+Shift+K.
@@ -225,6 +237,10 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("tab", "indent"),
     ("shift+tab", "outdent"),
     ("ctrl+enter", "toggle_check"),
+    ("ctrl+t", "new_tab"),
+    ("ctrl+w", "close_tab"),
+    ("ctrl+tab", "next_tab"),
+    ("ctrl+shift+tab", "prev_tab"),
 ];
 
 fn command(name: &str) -> Option<Command> {
@@ -453,6 +469,9 @@ mod tests {
         assert_eq!(k.get(&ch("ctrl+ß")), Some(Command::ToggleSidebar));
         assert_eq!(k.get(&ch("ctrl+shift+k")), Some(Command::Mark(Mark::Link)));
         assert_eq!(k.get(&ch("ctrl+enter")), Some(Command::ToggleCheck));
+        assert_eq!(k.get(&ch("ctrl+tab")), Some(Command::NextTab));
+        assert_eq!(k.get(&ch("ctrl+shift+tab")), Some(Command::PrevTab));
+        assert_eq!(k.get(&ch("tab")), Some(Command::Indent));
         assert_eq!(k.get(&ch("ctrl+x")), None);
     }
 

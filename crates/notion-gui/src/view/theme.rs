@@ -124,6 +124,26 @@ pub fn page_item(current: bool) -> impl Fn(&Theme, button::Status) -> button::St
     }
 }
 
+/// A tab: the active one has the page's background, the others the
+/// sidebar's, with a hover tint.
+pub fn tab(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |t, status| {
+        let c = of(t);
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let bg = if active {
+            Some(c.bg)
+        } else {
+            hovered.then_some(c.hover)
+        };
+        button::Style {
+            background: bg.map(Background::Color),
+            text_color: if active { c.text } else { c.secondary },
+            border: Border::default().rounded(6),
+            ..button::Style::default()
+        }
+    }
+}
+
 /// The dimmed page behind the search overlay.
 pub fn backdrop(_: &Theme) -> container::Style {
     container::Style {

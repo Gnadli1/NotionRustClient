@@ -20,6 +20,7 @@ use crate::edit::{key_action, EditKey, Editing, KeyAction, EDITOR_ID};
 use crate::keys::{self, Chord, Command, Keymap};
 use crate::outline::{self, Marker, Row};
 use crate::slash::{self, Menu, MenuKey};
+use crate::tabs::{self, Tab};
 use crate::view::untitled;
 use crate::worker::{Cmd, Event};
 
@@ -72,9 +73,19 @@ pub enum Message {
     ToggleSidebar,
     /// System light/dark mode, at startup and on change.
     ThemeChanged(iced::theme::Mode),
+    /// Ctrl+T: an empty tab, with the search overlay over it.
+    NewTab,
+    /// Ctrl+W, middle-click or ×: close tab `i`.
+    CloseTab(usize),
+    /// A tab clicked, or Ctrl+Tab / Ctrl+Shift+Tab: make tab `i` active.
+    SwitchTab(usize),
+    /// The page scrolled to this vertical offset.
+    Scrolled(f32),
 }
 
 pub(crate) const SEARCH_ID: &str = "search";
+/// The page's scrollable, scrolled back on a tab switch.
+pub(crate) const PAGE_SCROLL_ID: &str = "page";
 
 pub struct State {
     store: Store,
@@ -108,6 +119,12 @@ pub struct State {
     pub(crate) mode: iced::theme::Mode,
     /// Expanded toggles; every other toggle is collapsed (Notion's default).
     pub(crate) open: HashSet<String>,
+    /// The page's scroll offset.
+    pub(crate) scroll: f32,
+    /// Open tabs; `tabs[active]` is stale, `current`/`open`/`scroll` are its
+    /// live state.
+    pub(crate) tabs: Vec<Tab>,
+    pub(crate) active: usize,
 }
 
 impl State {
@@ -133,6 +150,9 @@ impl State {
             keys: Keymap::default(),
             mode: iced::theme::Mode::None,
             open: HashSet::new(),
+            scroll: 0.0,
+            tabs: vec![Tab::default()],
+            active: 0,
         };
         s.refresh();
         s
@@ -315,6 +335,10 @@ impl State {
                 .get_page(id)?
                 .map_or_else(|| "(not cached)".into(), |p| untitled(&p.title()).into());
             self.rows = outline::flatten(&self.store, id)?;
+        } else {
+            // an empty tab
+            self.title.clear();
+            self.rows.clear();
         }
         self.counts = [
             self.store.queued_ops()?.len(),
@@ -358,6 +382,45 @@ impl State {
         }
     }
 
+    /// Commits the edit, parks the active tab and loads tab `to`. A failed
+    /// commit keeps the editor and the tab.
+    fn switch_tab(&mut self, to: usize) -> Task<Message> {
+        if to == self.active || to >= self.tabs.len() || !self.leave() {
+            return Task::none();
+        }
+        let live = Tab {
+            page: self.current.clone(),
+            scroll: self.scroll,
+            open: std::mem::take(&mut self.open),
+            title: self.title.clone(),
+        };
+        let next = tabs::switch(&mut self.tabs, self.active, to, live);
+        self.active = to;
+        self.load_tab(next)
+    }
+
+    /// Makes `t` the live state (editing has ended) and scrolls back to it.
+    fn load_tab(&mut self, t: Tab) -> Task<Message> {
+        // a late pull must not open its page in this tab
+        self.pending_open = None;
+        self.pending_db = None;
+        // Ctrl+W / Ctrl+Tab with the overlay open: close it with the tab it
+        // was over (NewTab reopens it)
+        self.searching = false;
+        self.current = t.page;
+        self.open = t.open;
+        self.scroll = t.scroll;
+        self.refresh();
+        self.reveal_current();
+        operation::scroll_to(
+            PAGE_SCROLL_ID,
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(t.scroll),
+            },
+        )
+    }
+
     /// Installs the user's keymap; `problems` go to the status bar.
     pub fn set_keys(&mut self, keys: Keymap, problems: Vec<String>) {
         self.keys = keys;
@@ -380,6 +443,10 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             s.sidebar = !s.sidebar;
             return Task::none();
         }
+        Message::Scrolled(y) => {
+            s.scroll = y;
+            return Task::none();
+        }
         // the overlay must not stick open during a push
         Message::SearchEscape if s.searching => return s.close_search(),
         // a push is modal: the worker may already have sent the ops an edit
@@ -398,7 +465,33 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         | Message::Open(_)
         | Message::PickResult(_)
         | Message::SidebarOpen(_)
+        | Message::NewTab
+        | Message::CloseTab(_)
+        | Message::SwitchTab(_)
             if s.pushing() => {}
+        Message::NewTab => {
+            if !s.leave() {
+                return Task::none();
+            }
+            s.tabs.push(Tab::default());
+            let to = s.tabs.len() - 1;
+            let scroll = s.switch_tab(to);
+            return Task::batch([scroll, update(s, Message::FocusSearch)]);
+        }
+        Message::CloseTab(i) if i < s.tabs.len() => {
+            if i != s.active {
+                s.active = tabs::close(&mut s.tabs, s.active, i);
+                return Task::none();
+            }
+            if !s.leave() {
+                return Task::none();
+            }
+            s.active = tabs::close(&mut s.tabs, s.active, i);
+            let t = s.tabs[s.active].clone();
+            return s.load_tab(t);
+        }
+        Message::CloseTab(_) => {}
+        Message::SwitchTab(i) => return s.switch_tab(i),
         Message::SidebarOpen(id) => {
             let cached = matches!(s.store.get_page(&id), Ok(Some(_)));
             return update(
@@ -509,6 +602,14 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
                 Some(Command::ForcePull) => Message::Pull { force: true },
                 Some(Command::Search) => Message::FocusSearch,
                 Some(Command::ToggleSidebar) => Message::ToggleSidebar,
+                Some(Command::NewTab) => Message::NewTab,
+                Some(Command::CloseTab) => Message::CloseTab(s.active),
+                Some(Command::NextTab) => {
+                    Message::SwitchTab(tabs::cycle(s.tabs.len(), s.active, 1))
+                }
+                Some(Command::PrevTab) => {
+                    Message::SwitchTab(tabs::cycle(s.tabs.len(), s.active, -1))
+                }
                 _ => return Task::none(),
             };
             return update(s, msg);
@@ -1613,9 +1714,13 @@ mod tests {
         let mut m = keyboard::Modifiers::empty();
         m.set(keyboard::Modifiers::CTRL, ctrl);
         m.set(keyboard::Modifiers::SHIFT, shift);
+        let k = match c {
+            "tab" => Key::Named(keyboard::key::Named::Tab),
+            c => Key::Character(c.into()),
+        };
         iced::Event::Keyboard(keyboard::Event::KeyPressed {
-            key: Key::Character(c.into()),
-            modified_key: Key::Character(c.into()),
+            key: k.clone(),
+            modified_key: k,
             physical_key: keyboard::key::Physical::Unidentified(
                 keyboard::key::NativeCode::Unidentified,
             ),
@@ -2456,5 +2561,171 @@ mod tests {
         s.sent.push_back(true);
         up(&mut s, Message::SearchEscape);
         assert!(!s.searching);
+    }
+
+    fn chord(s: &mut State, c: &str, ctrl: bool, shift: bool) {
+        let id = iced::window::Id::unique();
+        let m = shortcut(key(c, ctrl, shift), event::Status::Captured, id).unwrap();
+        up(s, m);
+    }
+
+    fn tab_pages(s: &State) -> Vec<Option<&str>> {
+        (0..s.tabs.len())
+            .map(|i| {
+                if i == s.active {
+                    s.current.as_deref()
+                } else {
+                    s.tabs[i].page.as_deref()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ctrl_t_opens_a_tab_with_the_overlay_and_a_pick_fills_it() {
+        let (mut s, _rx) = tree_state();
+        up(&mut s, Message::Open("par".into()));
+        chord(&mut s, "t", true, false);
+        assert_eq!((s.tabs.len(), s.active), (2, 1));
+        assert!(s.searching);
+        assert_eq!(s.current, None);
+        assert!(s.rows.is_empty() && s.title.is_empty(), "old rows cleared");
+        let _ = crate::view::view(&s);
+        up(&mut s, Message::PickResult("kid".into()));
+        assert!(!s.searching);
+        assert_eq!(tab_pages(&s), [Some("par"), Some("kid")]);
+        assert_eq!(s.tabs[0].title, "par", "parked with its title");
+        // the sidebar opens in the active tab
+        up(&mut s, Message::SidebarOpen("par".into()));
+        assert_eq!(tab_pages(&s), [Some("par"), Some("par")]);
+        up(&mut s, Message::Open("kid".into()));
+
+        // Ctrl+W with the overlay open closes it too
+        chord(&mut s, "t", true, false);
+        chord(&mut s, "w", true, false);
+        assert!(!s.searching);
+        assert_eq!(tab_pages(&s), [Some("par"), Some("kid")]);
+
+        // closing the overlay without a pick keeps the empty tab
+        chord(&mut s, "t", true, false);
+        up(&mut s, Message::SearchEscape);
+        assert!(!s.searching);
+        assert_eq!(tab_pages(&s), [Some("par"), Some("kid"), None]);
+        assert_eq!(s.window_title(), env!("CARGO_PKG_NAME"));
+        let _ = crate::view::view(&s);
+    }
+
+    #[test]
+    fn ctrl_w_and_middle_click_close_tabs() {
+        let (mut s, _rx) = tree_state();
+        up(&mut s, Message::Open("par".into()));
+        up(&mut s, Message::NewTab);
+        up(&mut s, Message::PickResult("kid".into()));
+        up(&mut s, Message::NewTab);
+        up(&mut s, Message::SearchEscape);
+        // middle-click on a background tab left of the active one
+        up(&mut s, Message::CloseTab(0));
+        assert_eq!(tab_pages(&s), [Some("kid"), None]);
+        assert_eq!(s.active, 1);
+        // Ctrl+W on the rightmost: the left one becomes active
+        chord(&mut s, "w", true, false);
+        assert_eq!(tab_pages(&s), [Some("kid")]);
+        assert_eq!(s.current.as_deref(), Some("kid"));
+        assert_eq!(s.title, "kid");
+        // the last tab: one empty tab, no quit
+        chord(&mut s, "w", true, false);
+        assert_eq!(tab_pages(&s), [None]);
+        assert!(s.rows.is_empty());
+        up(&mut s, Message::CloseTab(5));
+        assert_eq!(s.tabs.len(), 1, "out of range: ignored");
+        let _ = crate::view::view(&s);
+    }
+
+    #[test]
+    fn ctrl_tab_cycles_while_editing_and_tab_still_indents() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::NewTab);
+        up(&mut s, Message::SearchEscape);
+        up(&mut s, Message::SwitchTab(0));
+        up(&mut s, Message::Focus("b".into()));
+        // the editor leaves Ctrl+Tab to the window listener: no indent, no op
+        assert!(press(&mut s, "ctrl+tab", None));
+        assert!(press(&mut s, "ctrl+shift+tab", None));
+        assert_eq!(depth(&s, "b"), 0);
+        assert_eq!(editing(&s), Some("b"));
+        chord(&mut s, "tab", true, false);
+        assert_eq!(s.active, 1);
+        assert_eq!(editing(&s), None);
+        assert!(
+            s.store.queued_ops().unwrap().is_empty(),
+            "nothing to commit"
+        );
+        // wraps both ways
+        chord(&mut s, "tab", true, false);
+        assert_eq!(s.active, 0);
+        chord(&mut s, "tab", true, true);
+        assert_eq!(s.active, 1);
+        chord(&mut s, "tab", true, true);
+        assert_eq!(s.active, 0);
+        assert_eq!(s.current.as_deref(), Some("pg"));
+
+        // plain Tab still indents (under "m")
+        up(&mut s, Message::Focus("b".into()));
+        assert!(press(&mut s, "tab", None));
+        assert_eq!(depth(&s, "b"), 1);
+        assert_eq!(kinds(&s), ["move_block"]);
+    }
+
+    #[test]
+    fn a_tab_switch_commits_and_restores_per_tab_state() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::ToggleOpen("a".into()));
+        up(&mut s, Message::Scrolled(120.0));
+        up(&mut s, Message::NewTab);
+        up(&mut s, Message::PickResult("pg".into()));
+        assert!(s.open.is_empty(), "a new tab starts collapsed");
+        assert_eq!(s.scroll, 0.0);
+        up(&mut s, Message::Focus("b".into()));
+        type_text(&mut s, "x");
+        up(&mut s, Message::SwitchTab(0));
+        assert_eq!(editing(&s), None, "left unfocused");
+        assert_eq!(kinds(&s), ["update_block"], "the edit was committed");
+        let b = s.rows.iter().find(|r| r.block_id == "b").unwrap();
+        assert_eq!(plain_text(&b.rich_text), "bx");
+        assert!(s.open.contains("a"));
+        assert_eq!(s.scroll, 120.0);
+        up(&mut s, Message::SwitchTab(1));
+        assert!(s.open.is_empty());
+        assert_eq!(s.scroll, 0.0);
+    }
+
+    #[test]
+    fn tabs_are_modal_during_a_push() {
+        let (mut s, _rx) = editing_state();
+        up(&mut s, Message::NewTab);
+        up(&mut s, Message::SearchEscape);
+        s.sent.push_back(true);
+        for m in [Message::NewTab, Message::CloseTab(1), Message::SwitchTab(0)] {
+            up(&mut s, m);
+        }
+        chord(&mut s, "tab", true, false);
+        chord(&mut s, "w", true, false);
+        assert_eq!((s.tabs.len(), s.active), (2, 1));
+    }
+
+    #[test]
+    fn breadcrumb_lists_the_ancestors() {
+        let (mut s, _rx) = tree_state();
+        let ids = |s: &State, id: &str| -> Vec<String> {
+            crate::sidebar::trail(&s.tree, id)
+                .iter()
+                .map(|e| e.id.clone())
+                .collect()
+        };
+        assert_eq!(ids(&s, "unc"), ["par", "kid"]);
+        assert_eq!(ids(&s, "kid"), ["par"]);
+        assert!(ids(&s, "par").is_empty());
+        up(&mut s, Message::Open("kid".into()));
+        let _ = crate::view::view(&s);
     }
 }
