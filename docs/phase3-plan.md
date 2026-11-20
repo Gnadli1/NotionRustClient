@@ -76,3 +76,8 @@ These are parts of your screenshot or the Notion app that the API doesn't give u
 
 ## Before you approve: the page import
 I pulled all 164 pages shared with the integration into the cache. One failed with a Notion 502 error and succeeded on retry. The 13 data sources (Timetable, Grades and so on) aren't imported as tables until F4/F8. Their rows are cached as plain pages but don't appear in the sidebar yet.
+
+## Known gaps after E1 (reviewed, deferred)
+1. **No request timeout in core.** A stalled connection leaves "syncing…" on screen until restart. On exit the app waits at most 10 s for it. Add a reqwest timeout in a later task.
+2. **The slash menu is off in equation and code rows**, so you can't turn them back into text from the editor yet (E2).
+3. **Editor parity is E2:** Enter and Backspace don't create or delete blocks yet. Tab indent, undo, keybinds, table cells and title editing are also still missing.
