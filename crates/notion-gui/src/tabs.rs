@@ -4,8 +4,11 @@
 
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 /// A page in a tab, plus what the view needs to come back to it.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Tab {
     /// None: an empty "New tab".
     pub page: Option<String>,

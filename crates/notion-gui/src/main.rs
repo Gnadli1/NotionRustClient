@@ -6,6 +6,7 @@ mod app;
 mod edit;
 mod keys;
 mod outline;
+mod session;
 mod sidebar;
 mod slash;
 mod tabs;
@@ -59,18 +60,24 @@ fn main() -> iced::Result {
             std::process::exit(1);
         }
     };
+    let dir = config_dir();
+    let (sess, problem) = dir.as_deref().map(session::load).unwrap_or_default();
+    let size = iced::Size::new(sess.window.0, sess.window.1);
     let (cmds, events, worker) = worker::spawn(db);
-    let init = Cell::new(Some((store, cmds, events)));
+    let init = Cell::new(Some((store, cmds, events, sess, problem, dir)));
     let boot = move || {
-        let (store, cmds, events) = init.take().expect("boot runs once");
+        let (store, cmds, events, sess, problem, dir) = init.take().expect("boot runs once");
         let mut state = app::State::new(store, cmds);
-        if let Some(dir) = config_dir() {
+        let mut restore = Task::none();
+        if let Some(dir) = dir {
             let (keys, problems) = keys::load(&dir);
             state.set_keys(keys, problems);
+            restore = state.restore_session(dir, sess, problem);
         }
         (
             state,
             Task::batch([
+                restore,
                 iced::system::theme().map(app::Message::ThemeChanged),
                 Task::run(events, |e| app::Message::Worker(Arc::new(e)))
                     .chain(Task::done(app::Message::WorkerGone)),
@@ -84,8 +91,10 @@ fn main() -> iced::Result {
         .title(app::State::window_title)
         .subscription(app::subscription)
         .theme(app::theme)
+        .window_size(size)
         .run();
-    // State (and the command sender) is gone now, so this only waits for the
+    // State is gone now (its Drop wrote session.json), and with it the command
+    // sender, so this only waits for the
     // command in flight: a push killed mid-way would re-send applied ops.
     let _ = worker.join();
     r

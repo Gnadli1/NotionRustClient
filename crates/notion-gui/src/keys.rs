@@ -153,6 +153,8 @@ pub enum Command {
     CloseTab,
     NextTab,
     PrevTab,
+    Undo,
+    Redo,
 }
 
 impl Command {
@@ -169,6 +171,8 @@ impl Command {
                 | Command::CloseTab
                 | Command::NextTab
                 | Command::PrevTab
+                | Command::Undo
+                | Command::Redo
         )
     }
 }
@@ -206,6 +210,8 @@ const NAMES: &[(&str, Command)] = &[
     ("close_tab", Command::CloseTab),
     ("next_tab", Command::NextTab),
     ("prev_tab", Command::PrevTab),
+    ("undo", Command::Undo),
+    ("redo", Command::Redo),
 ];
 
 /// Notion's defaults, except link: Ctrl+K is search here, so Ctrl+Shift+K.
@@ -241,6 +247,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("ctrl+w", "close_tab"),
     ("ctrl+tab", "next_tab"),
     ("ctrl+shift+tab", "prev_tab"),
+    ("ctrl+z", "undo"),
+    ("ctrl+shift+z", "redo"),
 ];
 
 fn command(name: &str) -> Option<Command> {

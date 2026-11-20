@@ -62,3 +62,13 @@ An internal integration only sees pages that have been shared with it: open the 
 3. **Tab in a table cell leaves the cell.** It commits the edit and doesn't move to the next cell. You can't add or remove table rows or columns.
 4. **Columns aren't side by side yet.** Column content shows as nested rows; L2 puts it side by side.
 5. **Databases don't open.** Clicking a `child_database` shows "databases not supported yet".
+
+## Known gaps after L1–Q1 (reviewed, deferred)
+1. **Conflicts:** the only way to resolve one is to discard your change and keep Notion's version. There is no "keep mine".
+2. **Undo:** undo is cleared by any push, and by any pull that brings in changes. While a pull or push is running, undo does nothing.
+3. **Session:** the session is saved only when the app closes normally. If it is killed or crashes, the last session is lost.
+4. **Auto-pull without a token:** the background auto-pull keeps retrying quietly, at most every 30 s, until a manual pull shows the "offline" message.
+5. **Sidebar order:** pages are sorted alphabetically at every level. Notion uses each page's position on its parent page.
+6. **Nested blocks:** blocks inside a quote or callout show under its box, not inside it. Columns don't stack in narrow windows.
+7. **Scrolling:** every scroll redraws the whole view, because tabs remember their scroll position. Fix this if long pages stutter.
+8. **Shortcut:** Ctrl+\ is also bound as Ctrl+ß, because on German/Austrian layouts it arrives as ß.

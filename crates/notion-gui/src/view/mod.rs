@@ -582,12 +582,32 @@ fn search_overlay(s: &State) -> Element<'_, Message> {
         .size(16)
         .padding([8, 10])
         .style(theme::search);
-    let results = column(
-        s.results
-            .iter()
-            .map(|(id, title)| entry(title, Message::PickResult(id.clone()), false).into()),
-    )
-    .spacing(1);
+    let mut results = Column::new().spacing(1);
+    // an empty query: the recent pages first (arrows + Enter, or a click)
+    let recent = if s.search.trim().is_empty() {
+        s.recent_pages()
+    } else {
+        Vec::new()
+    };
+    if !recent.is_empty() {
+        results = results.push(container(text("Recent").size(12)).padding([2, 8]));
+    }
+    for (i, (id, icon, title)) in recent.into_iter().enumerate() {
+        let label = row![
+            text(icon).size(14).width(22),
+            text(untitled(&title).to_string()).size(14)
+        ];
+        results = results.push(
+            button(label)
+                .on_press(Message::PickResult(id))
+                .style(theme::item(i == s.recent_sel))
+                .padding([4, 8])
+                .width(Fill),
+        );
+    }
+    for (id, title) in &s.results {
+        results = results.push(entry(title, Message::PickResult(id.clone()), false));
+    }
     let panel =
         container(column![input, container(scrollable(results)).max_height(400)].spacing(6))
             .width(560)

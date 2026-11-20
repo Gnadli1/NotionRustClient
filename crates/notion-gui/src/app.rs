@@ -3,6 +3,7 @@
 //! testable without a window.
 
 use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::edit::{key_action, EditKey, Editing, KeyAction, EDITOR_ID};
 use crate::keys::{self, Chord, Command, Keymap};
 use crate::outline::{self, Marker, Row};
+use crate::session::{self, Session};
 use crate::slash::{self, Menu, MenuKey};
 use crate::tabs::{self, Tab};
 use crate::view::untitled;
@@ -98,6 +100,11 @@ pub enum Message {
     OpenProblem(i64),
     /// Drop a conflict/failed op (op id) and force-pull its page.
     Discard(i64),
+    /// Ctrl+Z: the editor's uncommitted typing, else the last local edit.
+    Undo,
+    Redo,
+    /// The window's new size.
+    Resized(f32, f32),
 }
 
 /// A conflict or failed op, for the status bar's list.
@@ -124,6 +131,8 @@ pub(crate) const SEARCH_ID: &str = "search";
 /// The page's scrollable, scrolled back on a tab switch.
 pub(crate) const PAGE_SCROLL_ID: &str = "page";
 pub(crate) const TITLE_ID: &str = "title";
+/// Undo steps kept.
+const UNDO_MAX: usize = 100;
 
 pub struct State {
     store: Store,
@@ -175,6 +184,18 @@ pub struct State {
     pub(crate) problem_ids: HashSet<String>,
     pub(crate) problems: Vec<Problem>,
     pub(crate) problems_open: bool,
+    /// Local edits to undo / redo, newest last: (page, change).
+    pub(crate) undo: Vec<(String, sync::Change)>,
+    pub(crate) redo: Vec<(String, sync::Change)>,
+    /// Inside [`State::step`]: nested steps join the outer one.
+    stepping: bool,
+    /// Recently opened pages, most recent first.
+    pub(crate) recent: Vec<String>,
+    /// The highlighted entry of the overlay's recent list.
+    pub(crate) recent_sel: usize,
+    /// Where session.json is written on exit; None (tests) writes nothing.
+    session_dir: Option<PathBuf>,
+    pub(crate) window: (f32, f32),
 }
 
 impl State {
@@ -211,6 +232,13 @@ impl State {
             problem_ids: HashSet::new(),
             problems: Vec::new(),
             problems_open: false,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            stepping: false,
+            recent: Vec::new(),
+            recent_sel: 0,
+            session_dir: None,
+            window: Session::default().window,
         };
         s.refresh();
         s
@@ -224,6 +252,19 @@ impl State {
     /// Writes the editor's text to the store if it changed, then refreshes.
     /// False if the write failed (the editor is kept).
     fn commit(&mut self) -> bool {
+        let dirty = self.title_edit.is_some()
+            || self
+                .editing
+                .as_ref()
+                .is_some_and(|e| e.content.text() != e.original);
+        if dirty {
+            self.step(Self::commit_now)
+        } else {
+            self.commit_now()
+        }
+    }
+
+    fn commit_now(&mut self) -> bool {
         let titled = self.write_title();
         let wrote = self.write_edit();
         // Some(true) = nothing to write; the rows are current
@@ -251,6 +292,31 @@ impl State {
             self.last_error = Some(format!("title not saved: {e}"));
         }
         true
+    }
+
+    /// Runs `f`, which may edit the current page locally, as one undo step.
+    // ponytail: snapshots the whole page + op table per step and keeps only the
+    // changed rows; diff per block if huge pages make edits lag
+    fn step<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let Some(page) = self.current.clone().filter(|_| !self.stepping) else {
+            return f(self);
+        };
+        let cp = sync::checkpoint(&self.store, &[&page]);
+        self.stepping = true;
+        let r = f(self);
+        self.stepping = false;
+        match cp.and_then(|cp| cp.changes(&self.store)) {
+            Ok(Some(c)) => {
+                self.undo.push((page, c));
+                if self.undo.len() > UNDO_MAX {
+                    self.undo.remove(0);
+                }
+                self.redo.clear();
+            }
+            Ok(None) => {}
+            Err(e) => self.last_error = Some(format!("undo: {e}")),
+        }
+        r
     }
 
     /// Nothing is being edited, searched or sent, and a page is open.
@@ -391,6 +457,9 @@ impl State {
 
     /// Reloads sidebar, outline and op counts from the store.
     fn refresh(&mut self) {
+        if let Some(id) = &self.current {
+            session::touch(&mut self.recent, id);
+        }
         if let Err(e) = self.try_refresh() {
             self.last_error = Some(e.to_string());
         }
@@ -521,6 +590,11 @@ fn problem(store: &Store, op: &Op) -> notion_core::Result<Problem> {
 /// Closing the window with a row open must not lose its text.
 impl Drop for State {
     fn drop(&mut self) {
+        if let Some(dir) = &self.session_dir {
+            if let Err(e) = session::save(dir, &self.session()) {
+                eprintln!("cannot write the session: {e}");
+            }
+        }
         // mid-push the text was committed at Ctrl+S and edits are paused
         if std::thread::panicking() || self.pushing() {
             return;
@@ -582,6 +656,11 @@ impl State {
         self.scroll = t.scroll;
         self.refresh();
         self.reveal_current();
+        // e.g. a restored tab: pulled like any uncached page
+        if let Some(id) = self.current.clone().filter(|id| !self.cached(id)) {
+            self.pending_open = Some(id.clone());
+            self.send(Cmd::Pull { id, force: false });
+        }
         operation::scroll_to(
             PAGE_SCROLL_ID,
             operation::AbsoluteOffset {
@@ -589,6 +668,69 @@ impl State {
                 y: Some(t.scroll),
             },
         )
+    }
+
+    fn cached(&self, id: &str) -> bool {
+        matches!(self.store.get_page(id), Ok(Some(_)))
+    }
+
+    /// The state to write to session.json.
+    fn session(&self) -> Session {
+        let mut tabs = self.tabs.clone();
+        tabs[self.active] = Tab {
+            page: self.current.clone(),
+            scroll: self.scroll,
+            open: self.open.clone(),
+            title: self.title.clone(),
+        };
+        Session {
+            tabs,
+            active: self.active,
+            sidebar: self.sidebar,
+            expanded: self.tree_open.clone(),
+            recent: self.recent.clone(),
+            window: self.window,
+        }
+    }
+
+    /// Restores a saved session (from [`session::load`]) and saves it to
+    /// `dir` on exit; `problem` goes to the status bar.
+    pub fn restore_session(
+        &mut self,
+        dir: PathBuf,
+        s: Session,
+        problem: Option<String>,
+    ) -> Task<Message> {
+        self.session_dir = Some(dir);
+        if let Some(p) = problem {
+            self.last_error = Some(match self.last_error.take() {
+                Some(e) => format!("{e}; {p}"),
+                None => p,
+            });
+        }
+        self.tabs = s.tabs;
+        self.active = s.active;
+        self.sidebar = s.sidebar;
+        self.tree_open = s.expanded;
+        self.recent = s.recent;
+        self.window = s.window;
+        let t = self.tabs[self.active].clone();
+        self.load_tab(t)
+    }
+
+    /// Cached recent pages for the overlay: (id, icon, title).
+    pub(crate) fn recent_pages(&self) -> Vec<(String, String, String)> {
+        self.recent
+            .iter()
+            .filter_map(|id| {
+                let p = self.store.get_page(id).ok()??;
+                let icon = match p.raw["icon"]["emoji"].as_str() {
+                    Some(e) => e.to_string(),
+                    None => "📄".into(),
+                };
+                Some((p.id.clone(), icon, p.title()))
+            })
+            .collect()
     }
 
     /// Installs the user's keymap; `problems` go to the status bar.
@@ -615,6 +757,10 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         }
         Message::Scrolled(y) => {
             s.scroll = y;
+            return Task::none();
+        }
+        Message::Resized(w, h) => {
+            s.window = (w, h);
             return Task::none();
         }
         Message::ToggleProblems => {
@@ -666,6 +812,10 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         | Message::OpenProblem(_)
         | Message::Discard(_)
             if s.pushing() => {}
+        // a pull in flight writes rows it read before our undo
+        Message::Undo | Message::Redo if !s.sent.is_empty() => {}
+        Message::Undo => return undo(s, true),
+        Message::Redo => return undo(s, false),
         Message::LinkClick(url) => return update(s, link_target(&url)),
         Message::EditTitle => {
             if !s.title_editable || s.title_edit.is_some() || !s.leave() {
@@ -721,6 +871,9 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             if !s.commit() {
                 return Task::none();
             }
+            // undo steps may hold the discarded ops
+            s.undo.clear();
+            s.redo.clear();
             let res = s.store.complete_op(op).and_then(|()| {
                 let Some(l) = p.local.as_deref().filter(|l| l.starts_with("local-")) else {
                     return Ok(());
@@ -818,6 +971,8 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             let q = s.search.trim().to_string();
             if !q.is_empty() {
                 s.send(Cmd::Search(q));
+            } else if let Some((id, ..)) = s.recent_pages().into_iter().nth(s.recent_sel) {
+                return update(s, Message::PickResult(id));
             }
         }
         Message::OpenDatabase(id) => {
@@ -862,6 +1017,7 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         Message::FocusSearch => {
             s.commit();
             s.searching = true;
+            s.recent_sel = 0;
             return Task::batch([
                 operation::focus(SEARCH_ID),
                 operation::select_all(SEARCH_ID),
@@ -884,6 +1040,22 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         Message::FocusCell(row, col) => return s.focus_cell(&row, col),
         Message::EditorAction(a) => return on_editor_action(s, a),
         Message::SlashPick(i) => return slash_pick(s, i),
+        // the overlay's recent list (empty query)
+        Message::Chord(c)
+            if s.searching
+                && s.search.trim().is_empty()
+                && [Chord::parse("up"), Chord::parse("down")].contains(&Some(c.clone())) =>
+        {
+            let n = s.recent_pages().len();
+            if n > 0 {
+                let step = if Some(c) == Chord::parse("down") {
+                    1
+                } else {
+                    n - 1
+                };
+                s.recent_sel = (s.recent_sel + step) % n;
+            }
+        }
         // the message it maps to applies its own push rule
         Message::Chord(c) => {
             let msg = match s.keys.get(&c) {
@@ -900,6 +1072,8 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
                 Some(Command::PrevTab) => {
                     Message::SwitchTab(tabs::cycle(s.tabs.len(), s.active, -1))
                 }
+                Some(Command::Undo) => Message::Undo,
+                Some(Command::Redo) => Message::Redo,
                 _ => return Task::none(),
             };
             return update(s, msg);
@@ -912,7 +1086,12 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             s.last_error = Some("sync worker stopped".into());
         }
         Message::Worker(ev) => {
-            s.sent.pop_front();
+            // pushed ops can't be undone, nor edits a pull rewrote under them
+            let pulled = matches!(&*ev, Event::Pulled { report, .. } if !report.skipped);
+            if s.sent.pop_front() == Some(true) || pulled {
+                s.undo.clear();
+                s.redo.clear();
+            }
             // auto-pulls only start with nothing in flight: this answers it
             if std::mem::take(&mut s.auto_pulling) {
                 // quiet: no error shown or cleared, pending opens kept
@@ -1058,6 +1237,10 @@ fn on_command(s: &mut State, c: Command) -> Task<Message> {
 /// Converts the edited block to `kind` and continues editing it with `buf`
 /// (cursor at `pos`). On refusal the buffer is left as typed.
 fn convert(s: &mut State, kind: TargetKind, buf: &str, pos: (usize, usize)) -> Task<Message> {
+    s.step(|s| convert_now(s, kind, buf, pos))
+}
+
+fn convert_now(s: &mut State, kind: TargetKind, buf: &str, pos: (usize, usize)) -> Task<Message> {
     // a table cell is not a block
     let Some(id) = s
         .editing
@@ -1126,6 +1309,10 @@ fn convert(s: &mut State, kind: TargetKind, buf: &str, pos: (usize, usize)) -> T
 
 /// Divider picked on a block with text: keep the block, put a divider after it.
 fn divider_after(s: &mut State, buf: &str, pos: (usize, usize)) -> Task<Message> {
+    s.step(|s| divider_after_now(s, buf, pos))
+}
+
+fn divider_after_now(s: &mut State, buf: &str, pos: (usize, usize)) -> Task<Message> {
     if let Some(e) = &mut s.editing {
         e.set_buffer(buf, pos.0, pos.1);
     }
@@ -1148,6 +1335,20 @@ fn divider_after(s: &mut State, buf: &str, pos: (usize, usize)) -> Task<Message>
 }
 
 fn on_edit_key(s: &mut State, k: EditKey) -> Task<Message> {
+    // the keys that may create, delete or move a block (one undo step each)
+    let edits = match k {
+        EditKey::Enter | EditKey::Indent | EditKey::Outdent | EditKey::ToggleCheck => true,
+        EditKey::Backspace => s.editing.as_ref().is_some_and(|e| e.caret().empty),
+        _ => false,
+    };
+    if edits {
+        s.step(|s| edit_key(s, k))
+    } else {
+        edit_key(s, k)
+    }
+}
+
+fn edit_key(s: &mut State, k: EditKey) -> Task<Message> {
     let Some(e) = &mut s.editing else {
         return Task::none();
     };
@@ -1297,8 +1498,65 @@ fn move_editing(s: &mut State, target: Target) -> Task<Message> {
     operation::focus(EDITOR_ID)
 }
 
+/// Undo (`back`) or redo of the last local edit (uncommitted typing is
+/// committed first), refused once its op was completed or marked.
+fn undo(s: &mut State, back: bool) -> Task<Message> {
+    if s.searching {
+        return Task::none();
+    }
+    // uncommitted typing (row or title) becomes its own step first, so this
+    // undoes exactly it and redo brings it back
+    if !s.commit() {
+        return Task::none();
+    }
+    let stack = if back { &mut s.undo } else { &mut s.redo };
+    let Some((page, c)) = stack.pop() else {
+        return Task::none();
+    };
+    // just committed: the buffer is clean
+    let edited = s
+        .editing
+        .take()
+        .filter(|e| e.cell.is_none())
+        .map(|e| e.block_id);
+    s.title_edit = None;
+    match sync::restore(&s.store, &c) {
+        Ok(true) => {
+            let inv = (page.clone(), c.inverse());
+            if back {
+                s.redo.push(inv);
+            } else {
+                s.undo.push(inv);
+            }
+            if s.current.as_deref() != Some(page.as_str()) {
+                s.pending_open = None;
+                s.pending_db = None;
+                s.current = Some(page);
+            }
+        }
+        res => {
+            s.undo.clear();
+            s.redo.clear();
+            s.last_error = Some(match res {
+                Err(e) => format!("undo: {e}"),
+                _ => "can't undo: pushed or changed since".into(),
+            });
+        }
+    }
+    s.refresh();
+    s.reveal_current();
+    match edited {
+        Some(id) if s.rows.iter().any(|r| r.block_id == id && r.editable) => s.focus(&id),
+        _ => Task::none(),
+    }
+}
+
 /// Ctrl+Enter or a click on ☐/☑: commit, then flip the to-do. No-op otherwise.
 fn toggle_check(s: &mut State, id: &str) -> Task<Message> {
+    s.step(|s| toggle_check_now(s, id))
+}
+
+fn toggle_check_now(s: &mut State, id: &str) -> Task<Message> {
     if !s.commit() {
         return Task::none();
     }
@@ -1332,8 +1590,12 @@ fn toggle_check(s: &mut State, id: &str) -> Task<Message> {
 /// a widget captured them (an Esc the editor also handles is harmless: it
 /// refocuses or unfocuses).
 fn shortcut(ev: iced::Event, _: event::Status, _: iced::window::Id) -> Option<Message> {
-    if let iced::Event::Window(iced::window::Event::Focused) = ev {
-        return Some(Message::AutoPull);
+    match ev {
+        iced::Event::Window(iced::window::Event::Focused) => return Some(Message::AutoPull),
+        iced::Event::Window(iced::window::Event::Resized(size)) => {
+            return Some(Message::Resized(size.width, size.height))
+        }
+        _ => {}
     }
     let iced::Event::Keyboard(keyboard::Event::KeyPressed {
         key,
@@ -2074,6 +2336,8 @@ mod tests {
         m.set(keyboard::Modifiers::SHIFT, shift);
         let k = match c {
             "tab" => Key::Named(keyboard::key::Named::Tab),
+            "up" => Key::Named(keyboard::key::Named::ArrowUp),
+            "down" => Key::Named(keyboard::key::Named::ArrowDown),
             c => Key::Character(c.into()),
         };
         iced::Event::Keyboard(keyboard::Event::KeyPressed {
@@ -3358,5 +3622,305 @@ mod tests {
         up(&mut s, Message::Discard(op));
         assert!(s.store.get_block(&local).unwrap().is_none());
         assert!(s.store.queued_ops().unwrap().iter().all(|o| o.id != del));
+    }
+
+    // ------------------------------------------------------------ Q1b
+
+    fn row_text(s: &State, id: &str) -> String {
+        let r = s.rows.iter().find(|r| r.block_id == id).unwrap();
+        plain_text(&r.rich_text)
+    }
+
+    fn queued(s: &State) -> usize {
+        s.store.queued_ops().unwrap().len()
+    }
+
+    /// Focus `id`, type `t` at the end, Esc (commit).
+    fn edit_row(s: &mut State, id: &str, t: &str) {
+        up(s, Message::Focus(id.into()));
+        type_text(s, t);
+        up(s, Message::EditKey(EditKey::Escape));
+    }
+
+    #[test]
+    fn ctrl_z_and_ctrl_shift_z_walk_the_edits() {
+        let (mut s, _rx) = editing_state();
+        edit_row(&mut s, "b", "1");
+        edit_row(&mut s, "a", "2");
+        assert_eq!((s.undo.len(), queued(&s)), (2, 2));
+        // the editor leaves Ctrl+Z to the window listener (no double undo)
+        up(&mut s, Message::Focus("b".into()));
+        assert!(press(&mut s, "ctrl+z", Some("z")));
+        assert_eq!(s.undo.len(), 2);
+
+        chord(&mut s, "z", true, false);
+        assert_eq!(
+            (row_text(&s, "a"), row_text(&s, "b")),
+            ("a".into(), "b1".into())
+        );
+        assert_eq!(queued(&s), 1);
+        chord(&mut s, "z", true, false);
+        assert_eq!(row_text(&s, "b"), "b");
+        assert_eq!(queued(&s), 0);
+        chord(&mut s, "z", true, false);
+        assert_eq!((s.undo.len(), s.redo.len()), (0, 2), "nothing left");
+
+        chord(&mut s, "z", true, true);
+        assert_eq!(row_text(&s, "b"), "b1");
+        chord(&mut s, "z", true, true);
+        assert_eq!(
+            (row_text(&s, "a"), row_text(&s, "b")),
+            ("a2".into(), "b1".into())
+        );
+        assert_eq!((queued(&s), s.undo.len(), s.redo.len()), (2, 2, 0));
+    }
+
+    #[test]
+    fn a_new_edit_clears_redo() {
+        let (mut s, _rx) = editing_state();
+        edit_row(&mut s, "b", "1");
+        chord(&mut s, "z", true, false);
+        assert_eq!(s.redo.len(), 1);
+        edit_row(&mut s, "a", "2");
+        assert!(s.redo.is_empty());
+        chord(&mut s, "z", true, true);
+        assert_eq!(row_text(&s, "b"), "b", "nothing redone");
+    }
+
+    #[test]
+    fn undo_is_blocked_during_and_after_a_push() {
+        let (mut s, _rx) = editing_state();
+        edit_row(&mut s, "b", "1");
+        up(&mut s, Message::Push);
+        assert!(s.pushing());
+        chord(&mut s, "z", true, false);
+        assert_eq!(
+            (row_text(&s, "b"), queued(&s)),
+            ("b1".into(), 1),
+            "mid-push"
+        );
+        // the worker pushed it
+        let op = s.store.queued_ops().unwrap()[0].id;
+        s.store.complete_op(op).unwrap();
+        up(
+            &mut s,
+            Message::Worker(Arc::new(Event::Pushed(Default::default()))),
+        );
+        assert!(s.undo.is_empty() && s.redo.is_empty());
+        chord(&mut s, "z", true, false);
+        assert_eq!(row_text(&s, "b"), "b1");
+
+        // the re-pull after the push answers (nothing new)
+        up(
+            &mut s,
+            Message::Worker(Arc::new(Event::Pulled {
+                id: "pg".into(),
+                report: notion_core::sync::PullReport {
+                    skipped: true,
+                    ..Default::default()
+                },
+            })),
+        );
+        // refused once the op was completed or marked
+        edit_row(&mut s, "a", "2");
+        let op = s.store.queued_ops().unwrap()[0].id;
+        s.store.complete_op(op).unwrap();
+        chord(&mut s, "z", true, false);
+        assert_eq!(row_text(&s, "a"), "a2");
+        assert!(s.last_error.as_deref().unwrap().contains("can't undo"));
+        assert!(s.undo.is_empty());
+    }
+
+    #[test]
+    fn ctrl_z_in_the_editor_undoes_the_typing_first() {
+        let (mut s, _rx) = editing_state();
+        edit_row(&mut s, "b", "1");
+        up(&mut s, Message::Focus("b".into()));
+        type_text(&mut s, "2");
+        chord(&mut s, "z", true, false);
+        assert_eq!(editing(&s), Some("b"));
+        assert_eq!(buffer(&s), "b1", "typing undone");
+        assert_eq!((s.undo.len(), s.redo.len()), (1, 1));
+        chord(&mut s, "z", true, true);
+        assert_eq!(buffer(&s), "b12", "and redone");
+        assert_eq!(row_text(&s, "b"), "b12");
+        chord(&mut s, "z", true, false);
+        chord(&mut s, "z", true, false);
+        assert_eq!(row_text(&s, "b"), "b");
+        assert_eq!(editing(&s), Some("b"), "still editing it");
+        assert_eq!(buffer(&s), "b");
+        assert_eq!(queued(&s), 0);
+
+        // the title too
+        up(&mut s, Message::EditTitle);
+        up(&mut s, Message::TitleInput("New".into()));
+        chord(&mut s, "z", true, false);
+        assert_eq!((s.title.as_str(), s.title_edit.as_deref()), ("pg", None));
+        chord(&mut s, "z", true, true);
+        assert_eq!(s.title, "New");
+    }
+
+    #[test]
+    fn pulls_pause_and_clear_undo() {
+        let (mut s, _rx) = editing_state();
+        edit_row(&mut s, "b", "1");
+        up(&mut s, Message::Pull { force: false });
+        chord(&mut s, "z", true, false);
+        assert_eq!(row_text(&s, "b"), "b1", "ignored while the pull runs");
+        let pulled = |skipped| {
+            Message::Worker(Arc::new(Event::Pulled {
+                id: "pg".into(),
+                report: notion_core::sync::PullReport {
+                    skipped,
+                    ..Default::default()
+                },
+            }))
+        };
+        up(&mut s, pulled(true));
+        assert_eq!(s.undo.len(), 1, "a skipped pull wrote nothing");
+        chord(&mut s, "z", true, false);
+        assert_eq!(row_text(&s, "b"), "b");
+        assert_eq!(s.redo.len(), 1);
+        up(&mut s, Message::Pull { force: false });
+        up(&mut s, pulled(false));
+        assert!(s.undo.is_empty() && s.redo.is_empty());
+    }
+
+    #[test]
+    fn enter_is_one_undo_step() {
+        let (mut s, _rx) = editing_state();
+        let before = ids(&s).iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        up(&mut s, Message::Focus("b".into()));
+        type_text(&mut s, "x");
+        up(&mut s, Message::EditKey(EditKey::Enter));
+        assert_eq!(ids(&s).len(), before.len() + 1);
+        assert_eq!(s.undo.len(), 1, "commit and create together");
+        chord(&mut s, "z", true, false);
+        assert_eq!(ids(&s), before);
+        assert_eq!((row_text(&s, "b"), queued(&s)), ("b".into(), 0));
+        // and the other edits: delete, indent, to-do
+        up(&mut s, Message::Focus("b".into()));
+        up(&mut s, Message::EditKey(EditKey::Indent));
+        assert_eq!(depth(&s, "b"), 1);
+        chord(&mut s, "z", true, false);
+        assert_eq!(depth(&s, "b"), 0);
+        assert_eq!(queued(&s), 0);
+    }
+
+    #[test]
+    fn undo_opens_the_edits_page() {
+        let (mut s, _rx) = editing_state();
+        s.store
+            .upsert_page(&page(
+                "p2",
+                json!({ "type": "workspace", "workspace": true }),
+            ))
+            .unwrap();
+        edit_row(&mut s, "b", "1");
+        up(&mut s, Message::Open("p2".into()));
+        chord(&mut s, "z", true, false);
+        assert_eq!(s.current.as_deref(), Some("pg"));
+        assert_eq!(row_text(&s, "b"), "b");
+    }
+
+    #[test]
+    fn recent_pages_in_the_overlay() {
+        let (mut s, _rx) = tree_state();
+        for p in ["par", "kid", "unc", "par"] {
+            up(&mut s, Message::Open(p.into()));
+        }
+        assert_eq!(s.recent, ["par", "unc", "kid"]);
+        let ids: Vec<String> = s.recent_pages().into_iter().map(|r| r.0).collect();
+        assert_eq!(ids, ["par", "kid"], "only cached pages");
+
+        chord(&mut s, "k", true, false);
+        assert!(s.searching);
+        let _ = crate::view::view(&s);
+        chord(&mut s, "down", false, false);
+        assert_eq!(s.recent_sel, 1);
+        chord(&mut s, "down", false, false);
+        assert_eq!(s.recent_sel, 0, "wraps");
+        chord(&mut s, "up", false, false);
+        up(&mut s, Message::SearchSubmit);
+        assert!(!s.searching);
+        assert_eq!(s.current.as_deref(), Some("kid"));
+        assert_eq!(s.recent[0], "kid");
+    }
+
+    #[test]
+    fn session_round_trips_through_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _rx) = tree_state();
+        let _ = s.restore_session(dir.path().into(), Session::default(), None);
+        up(&mut s, Message::Open("par".into()));
+        up(&mut s, Message::NewTab);
+        up(&mut s, Message::PickResult("kid".into()));
+        up(&mut s, Message::Scrolled(30.0));
+        up(&mut s, Message::ToggleSidebar);
+        up(&mut s, Message::Resized(900.0, 700.0));
+        let saved = s.session();
+        drop(s);
+        let (loaded, problem) = session::load(dir.path());
+        assert_eq!(problem, None);
+        assert_eq!(loaded, saved, "written on drop");
+        assert_eq!(loaded.tabs[1].page.as_deref(), Some("kid"));
+        assert_eq!(loaded.tabs[1].scroll, 30.0);
+
+        let (mut t, mut rx) = tree_state();
+        let _ = t.restore_session(dir.path().into(), loaded.clone(), Some("bad".into()));
+        assert_eq!(t.session(), loaded);
+        assert_eq!(t.current.as_deref(), Some("kid"));
+        assert!(t.last_error.as_deref().unwrap().contains("bad"));
+        assert!(rx.try_recv().is_err(), "cached: no pull");
+
+        // an unknown page is pulled when its tab is activated
+        let mut unknown = loaded;
+        unknown.tabs[0].page = Some("gone".into());
+        unknown.active = 0;
+        let _ = t.restore_session(dir.path().into(), unknown, None);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Cmd::Pull {
+                id: "gone".into(),
+                force: false
+            }
+        );
+    }
+
+    #[test]
+    fn title_delete_convert_and_check_undo() {
+        let (mut s, _rx) = editing_state();
+        let rows = ids(&s).iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // title
+        up(&mut s, Message::EditTitle);
+        up(&mut s, Message::TitleInput("New".into()));
+        up(&mut s, Message::TitleCommit);
+        assert_eq!((s.title.as_str(), queued(&s)), ("New", 1));
+        chord(&mut s, "z", true, false);
+        assert_eq!((s.title.as_str(), queued(&s)), ("pg", 0));
+
+        // Backspace on the emptied row deletes it
+        up(&mut s, Message::Focus("b".into()));
+        up(&mut s, Message::EditKey(EditKey::Backspace));
+        up(&mut s, Message::EditKey(EditKey::Backspace));
+        assert!(!ids(&s).contains(&"b"));
+        chord(&mut s, "z", true, false);
+        assert_eq!(ids(&s), rows);
+        assert_eq!((row_text(&s, "b"), queued(&s)), ("b".into(), 0));
+
+        // convert a real block (create + delete), then check it
+        up(&mut s, Message::Focus("b".into()));
+        up(&mut s, Message::Command(Command::Block(TargetKind::ToDo)));
+        let todo = editing(&s).unwrap().to_string();
+        assert_ne!(todo, "b");
+        up(&mut s, Message::ToggleCheck(todo.clone()));
+        assert_eq!(marker(&s), Marker::Todo(true));
+        chord(&mut s, "z", true, false);
+        assert_eq!(marker(&s), Marker::Todo(false));
+        chord(&mut s, "z", true, false);
+        assert_eq!(ids(&s), rows, "the original block is back");
+        assert_eq!(queued(&s), 0, "create and delete gone");
+        assert_eq!(s.undo.len(), 0);
+        assert_eq!(s.redo.len(), 2, "the convert cleared the older redos");
     }
 }

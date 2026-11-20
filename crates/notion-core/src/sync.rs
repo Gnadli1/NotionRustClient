@@ -15,6 +15,7 @@ use crate::model::{
 use crate::ops::{Op, OpKind, OpStatus};
 use crate::store::{ts, Store};
 use crate::{Error, Result};
+use rusqlite::OptionalExtension;
 
 #[derive(Debug, Default, PartialEq)]
 pub struct PullReport {
@@ -1044,6 +1045,166 @@ pub fn local_change_type(
         let new = local_create_block(store, &parent, Some(block_id), kind)?;
         local_delete_block(store, block_id)?;
         Ok(ChangeOutcome::Replaced(new))
+    })
+}
+
+// ---------------------------------------------------------------- undo
+
+/// All columns of a `pages`, `blocks` or `ops` row, in table order.
+type SqlRow = Vec<rusqlite::types::Value>;
+/// (table, id as text) → row.
+type Rows = HashMap<(&'static str, String), SqlRow>;
+
+/// The cached rows of some pages (the page row and its blocks) plus the whole
+/// op table, taken before a local edit. [`Checkpoint::changes`] keeps only the
+/// rows the edit touched.
+pub struct Checkpoint {
+    pages: Vec<String>,
+    rows: Rows,
+}
+
+/// One local edit as the rows it changed, before and after. Undo with
+/// [`restore`]; [`Change::inverse`] gives the redo.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Change(Vec<RowChange>);
+
+#[derive(Debug, Clone, PartialEq)]
+struct RowChange {
+    table: &'static str,
+    id: rusqlite::types::Value,
+    before: Option<SqlRow>,
+    after: Option<SqlRow>,
+}
+
+fn key_text(v: &rusqlite::types::Value) -> String {
+    match v {
+        rusqlite::types::Value::Text(s) => s.clone(),
+        v => format!("{v:?}"),
+    }
+}
+
+fn snapshot(store: &Store, pages: &[String]) -> Result<Rows> {
+    let pages = serde_json::to_string(pages)?;
+    let mut rows = Rows::new();
+    // ponytail: the whole op table each time; fine while the queue is small
+    for (table, sql, arg) in [
+        (
+            "pages",
+            "SELECT * FROM pages WHERE id IN (SELECT value FROM json_each(?1))",
+            true,
+        ),
+        (
+            "blocks",
+            "SELECT * FROM blocks WHERE page_id IN (SELECT value FROM json_each(?1))",
+            true,
+        ),
+        ("ops", "SELECT * FROM ops", false),
+    ] {
+        let mut st = store.conn.prepare(sql)?;
+        let n = st.column_count();
+        let mut q = if arg {
+            st.query([&pages])?
+        } else {
+            st.query([])?
+        };
+        while let Some(r) = q.next()? {
+            let row = (0..n)
+                .map(|i| r.get(i))
+                .collect::<rusqlite::Result<SqlRow>>()?;
+            rows.insert((table, key_text(&row[0])), row);
+        }
+    }
+    Ok(rows)
+}
+
+/// Snapshots `pages` (their page rows and cached blocks) and the op queue.
+pub fn checkpoint(store: &Store, pages: &[&str]) -> Result<Checkpoint> {
+    let pages: Vec<String> = pages.iter().map(|p| p.to_string()).collect();
+    Ok(Checkpoint {
+        rows: snapshot(store, &pages)?,
+        pages,
+    })
+}
+
+impl Checkpoint {
+    /// What changed since the checkpoint; None if nothing did.
+    pub fn changes(&self, store: &Store) -> Result<Option<Change>> {
+        let mut now = snapshot(store, &self.pages)?;
+        let mut out = Vec::new();
+        for (k, before) in &self.rows {
+            let after = now.remove(k);
+            if after.as_ref() != Some(before) {
+                out.push(RowChange {
+                    table: k.0,
+                    id: before[0].clone(),
+                    before: Some(before.clone()),
+                    after,
+                });
+            }
+        }
+        for ((table, _), after) in now {
+            out.push(RowChange {
+                table,
+                id: after[0].clone(),
+                before: None,
+                after: Some(after),
+            });
+        }
+        Ok((!out.is_empty()).then_some(Change(out)))
+    }
+}
+
+impl Change {
+    /// The same change the other way round.
+    pub fn inverse(&self) -> Change {
+        Change(
+            self.0
+                .iter()
+                .map(|c| RowChange {
+                    before: c.after.clone(),
+                    after: c.before.clone(),
+                    ..c.clone()
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Puts the changed rows back to before `c`, verbatim (ops keep their ids).
+/// Returns false, changing nothing, unless every one of them is still exactly
+/// as `c` left it: refuses once an op was completed or marked (conflict,
+/// failed), or a row was rewritten since. Row checks can't see another
+/// process that is mid-push: callers pause undo while commands are in flight.
+pub fn restore(store: &Store, c: &Change) -> Result<bool> {
+    store.atomic(|| {
+        for r in &c.0 {
+            let now: Option<SqlRow> = {
+                let mut st = store
+                    .conn
+                    .prepare(&format!("SELECT * FROM {} WHERE id = ?1", r.table))?;
+                let n = st.column_count();
+                st.query_row([&r.id], |row| (0..n).map(|i| row.get(i)).collect())
+                    .optional()?
+            };
+            if now != r.after {
+                return Ok(false);
+            }
+        }
+        for r in &c.0 {
+            store
+                .conn
+                .execute(&format!("DELETE FROM {} WHERE id = ?1", r.table), [&r.id])?;
+        }
+        for r in &c.0 {
+            if let Some(row) = &r.before {
+                let marks = vec!["?"; row.len()].join(",");
+                store.conn.execute(
+                    &format!("INSERT INTO {} VALUES ({marks})", r.table),
+                    rusqlite::params_from_iter(row),
+                )?;
+            }
+        }
+        Ok(true)
     })
 }
 
@@ -3094,5 +3255,158 @@ mod tests {
         .await;
         let r = push(&client(&s), &store).await.unwrap();
         assert_eq!(r.conflicts, 1, "{r:?}");
+    }
+
+    // ------------------------------------------------------------ undo
+
+    /// Page "p" with paragraphs a, b, c; a has a child a1.
+    fn undo_store() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_page(&serde_json::from_value(page("p", pp("root"), T)).unwrap())
+            .unwrap();
+        let b = |id: &str, parent: Value, kids: bool| -> Block {
+            serde_json::from_value(blk(id, parent, id, T, kids)).unwrap()
+        };
+        store
+            .replace_children(
+                "p",
+                "p",
+                &[
+                    b("a", pp("p"), true),
+                    b("b", pp("p"), false),
+                    b("c", pp("p"), false),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_children("p", "a", &[b("a1", bp("a"), false)])
+            .unwrap();
+        store
+    }
+
+    fn snap(store: &Store) -> Rows {
+        snapshot(store, &["p".to_string()]).unwrap()
+    }
+
+    /// Runs `edit` under a checkpoint; returns its change.
+    fn record(store: &Store, edit: impl FnOnce(&Store)) -> Change {
+        let cp = checkpoint(store, &["p"]).unwrap();
+        edit(store);
+        cp.changes(store).unwrap().expect("something changed")
+    }
+
+    #[test]
+    fn restore_reverts_an_edit_and_redo_reapplies_it() {
+        let store = undo_store();
+        let before = snap(&store);
+        let c = record(&store, |s| {
+            local_edit_text(s, "a", "x").unwrap();
+        });
+        let after = snap(&store);
+        assert!(restore(&store, &c).unwrap());
+        assert_eq!(text(&store, "a"), "a");
+        assert!(queue(&store).is_empty(), "the op is gone");
+        assert_eq!(snap(&store), before);
+        // redo
+        assert!(restore(&store, &c.inverse()).unwrap());
+        assert_eq!(snap(&store), after);
+        assert_eq!(text(&store, "a"), "x");
+    }
+
+    #[test]
+    fn restore_reverts_a_merged_op_body() {
+        let store = undo_store();
+        let para = BlockKind::Paragraph(TextBlock {
+            rich_text: Vec::new(),
+            color: "default".into(),
+        });
+        let l = local_create_block(&store, "p", None, para).unwrap();
+        local_edit_text(&store, &l, "x").unwrap();
+        let before = snap(&store);
+        let c = record(&store, |s| {
+            local_edit_text(s, &l, "y").unwrap();
+        });
+        assert_eq!(queue(&store).len(), 1, "merged into the create");
+        assert!(restore(&store, &c).unwrap());
+        assert_eq!(snap(&store), before);
+        assert_eq!(text(&store, &l), "x");
+        let OpKind::CreateBlock { block, .. } = &queue(&store)[0] else {
+            panic!()
+        };
+        assert!(block.to_string().contains("\"x\""), "{block}");
+    }
+
+    #[test]
+    fn restore_brings_back_a_deleted_subtree() {
+        let store = undo_store();
+        let before = snap(&store);
+        let c = record(&store, |s| {
+            local_delete_block(s, "a").unwrap();
+        });
+        assert!(store.get_block("a1").unwrap().is_none());
+        assert!(restore(&store, &c).unwrap());
+        assert_eq!(snap(&store), before);
+        assert_eq!(ids(&store.children("a").unwrap()), ["a1"]);
+        assert!(queue(&store).is_empty(), "no DeleteBlock");
+    }
+
+    #[test]
+    fn restore_drops_a_local_create() {
+        let store = undo_store();
+        let before = snap(&store);
+        let mut new = String::new();
+        let c = record(&store, |s| {
+            let para = BlockKind::Paragraph(TextBlock {
+                rich_text: Vec::new(),
+                color: "default".into(),
+            });
+            new = local_create_block(s, "p", Some("a"), para).unwrap();
+        });
+        assert!(restore(&store, &c).unwrap());
+        assert!(store.get_block(&new).unwrap().is_none());
+        assert!(queue(&store).is_empty());
+        assert_eq!(snap(&store), before);
+        assert_eq!(ids(&store.children("p").unwrap()), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn restore_reverts_a_move() {
+        let store = undo_store();
+        let before = snap(&store);
+        // indent c under b
+        let c = record(&store, |s| {
+            local_move_block(s, "c", "b", None).unwrap();
+        });
+        assert_eq!(ids(&store.children("b").unwrap()), ["c"]);
+        assert!(restore(&store, &c).unwrap());
+        assert_eq!(snap(&store), before);
+        assert_eq!(ids(&store.children("p").unwrap()), ["a", "b", "c"]);
+        assert!(!store.get_block("b").unwrap().unwrap().has_children);
+        assert!(queue(&store).is_empty());
+    }
+
+    #[test]
+    fn restore_refuses_once_the_op_left_the_queue() {
+        for leave in ["pushed", "conflict", "pulled"] {
+            let store = undo_store();
+            let c = record(&store, |s| {
+                local_edit_text(s, "a", "x").unwrap();
+            });
+            let op = store.queued_ops().unwrap()[0].id;
+            match leave {
+                "pushed" => store.complete_op(op).unwrap(),
+                "conflict" => store.mark_op(op, OpStatus::Conflict, Some("x")).unwrap(),
+                // the row itself changed under us
+                _ => {
+                    let mut b = store.get_block("a").unwrap().unwrap();
+                    b.has_children = false;
+                    store.put_block(&b).unwrap();
+                }
+            }
+            let now = snap(&store);
+            assert!(!restore(&store, &c).unwrap(), "{leave}");
+            assert_eq!(snap(&store), now, "{leave}: nothing written");
+        }
     }
 }
