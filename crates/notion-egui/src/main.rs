@@ -8,13 +8,16 @@
 mod app;
 #[allow(dead_code)]
 mod edit;
+mod editing;
 mod keys;
+mod links;
 mod md;
 mod menu;
 mod problems;
 mod shell;
 mod switcher;
 mod theme;
+mod undo;
 mod view;
 mod worker;
 // shared with notion-gui for now; a crate of their own later
@@ -150,6 +153,9 @@ fn main() -> eframe::Result {
             let mut app = app::App::new(store, cmds, events, keylog);
             app.set_worker(worker);
             if let Some(dir) = dir {
+                let (keys, notes) = keys::load(&dir);
+                app.keys = keys;
+                app.last_error = (!notes.is_empty()).then(|| notes.join("; "));
                 app.restore(dir, sess, problem);
             }
             Ok(Box::new(app))

@@ -1,6 +1,8 @@
 //! Test helpers: a headless egui window around an `App`, with its command
 //! channel in reach and a fake worker end for events.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::mpsc::{channel, Sender};
 
 use eframe::egui::{self, Event, Key, Modifiers, RawInput, ViewportCommand, ViewportId};
@@ -61,7 +63,7 @@ pub fn key(k: Key) -> Event {
 pub fn key_mod(k: Key, modifiers: Modifiers) -> Event {
     Event::Key {
         key: k,
-        physical_key: None,
+        physical_key: Some(k),
         pressed: true,
         repeat: false,
         modifiers,
@@ -75,6 +77,10 @@ pub struct Win {
     pub rx: UnboundedReceiver<Cmd>,
     /// The worker's end: send events as if it had answered.
     pub ev: Sender<WEvent>,
+    /// The URLs the app handed to its opener (nothing is ever spawned).
+    pub opened: Rc<RefCell<Vec<String>>>,
+    /// Keys pressed in the last frame, released at the start of the next.
+    down: Vec<(Key, Modifiers)>,
 }
 
 impl Win {
@@ -87,7 +93,20 @@ impl Win {
         let mut app = App::new(store, tx, events, false);
         // the first frame has the focus already: no focus-gain auto-pull
         app.was_focused = true;
-        let mut w = Win { ctx, app, rx, ev };
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let sink = opened.clone();
+        app.opener = Box::new(move |url| {
+            sink.borrow_mut().push(url.to_string());
+            Ok(())
+        });
+        let mut w = Win {
+            ctx,
+            app,
+            rx,
+            ev,
+            opened,
+            down: Vec::new(),
+        };
         w.frames(vec![]);
         w
     }
@@ -105,7 +124,31 @@ impl Win {
     /// Runs one frame; returns the viewport commands it sent.
     pub fn frame_with(&mut self, events: Vec<Event>, modifiers: Modifiers) -> Vec<ViewportCommand> {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
-        let mut all = vec![Event::ModifiersChanged(modifiers)];
+        // egui flags a press of a key still down as a repeat: let go of what
+        // the last frame pressed
+        let mut all: Vec<Event> = self
+            .down
+            .drain(..)
+            .map(|(key, modifiers)| Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: false,
+                repeat: false,
+                modifiers,
+            })
+            .collect();
+        all.push(Event::ModifiersChanged(modifiers));
+        for e in &events {
+            if let Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = e
+            {
+                self.down.push((*key, *modifiers));
+            }
+        }
         all.extend(events);
         let raw = RawInput {
             screen_rect: Some(screen),
@@ -125,6 +168,18 @@ impl Win {
 
     pub fn frames(&mut self, events: Vec<Event>) -> Vec<ViewportCommand> {
         self.frame_with(events, Modifiers::NONE)
+    }
+
+    /// An OS key-repeat of `k`, which the last frame pressed: it is still down.
+    pub fn repeat(&mut self, k: Key) {
+        self.down.clear();
+        self.frames(vec![Event::Key {
+            key: k,
+            physical_key: Some(k),
+            pressed: true,
+            repeat: true,
+            modifiers: Modifiers::NONE,
+        }]);
     }
 
     pub fn send(&mut self, ev: Event) {
@@ -166,6 +221,24 @@ impl Win {
 
     pub fn menu(&self) -> Option<&Menu> {
         self.app.focus.as_ref().and_then(|f| f.menu.as_ref())
+    }
+
+    /// Selects chars `a..b` of the focused editor (cursor at `b`).
+    pub fn select(&mut self, a: usize, b: usize) {
+        let id = crate::app::edit_id(&self.app.focus.as_ref().unwrap().block_id);
+        let mut st = egui::text_edit::TextEditState::load(&self.ctx, id).unwrap_or_default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(a),
+            egui::text::CCursor::new(b),
+        )));
+        st.store(&self.ctx, id);
+        self.frames(vec![]);
+    }
+
+    /// The text of row `id` as stored (plain).
+    pub fn row_text(&self, id: &str) -> String {
+        let r = self.app.rows.iter().find(|r| r.block_id == id).unwrap();
+        notion_core::model::plain_text(&r.rich_text)
     }
 
     pub fn queued(&self) -> usize {

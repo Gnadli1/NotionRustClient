@@ -7,19 +7,20 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Frame, Key, Margin, Modifiers, Ui, ViewportCommand};
 use notion_core::markdown::from_markdown;
-use notion_core::model::{BlockKind, RichText};
+use notion_core::model::{BlockKind, PropertyValue, RichText, RichTextKind};
 use notion_core::ops::OpStatus;
 use notion_core::sync;
 
 use crate::app::{blur_first, Action, App, Grab};
-use crate::outline;
+use crate::outline::{self, Marker};
 use crate::problems::{self, problem};
 use crate::session::{self, Session};
 use crate::switcher::{Out, Switcher};
 use crate::tabs::{self, Tab};
 use crate::view::{self, untitled};
 use crate::worker::{Cmd, Event};
-use crate::{keys, sidebar, theme};
+use crate::keys::{self, Command};
+use crate::{sidebar, theme};
 
 /// Auto-pulls at most this often, however the focus flaps.
 const AUTO_PULL_GAP: Duration = Duration::from_secs(30);
@@ -29,13 +30,6 @@ pub const AUTO_PULL_EVERY: Duration = Duration::from_secs(300);
 /// How long closing waits for the worker (a stalled request has no timeout).
 const WORKER_JOIN: Duration = Duration::from_secs(10);
 pub const SESSION_FILE: &str = "session-egui.json";
-
-const CTRL: Modifiers = Modifiers::CTRL;
-const CTRL_SHIFT: Modifiers = Modifiers {
-    ctrl: true,
-    shift: true,
-    ..Modifiers::NONE
-};
 
 /// Whether an auto-pull may run: idle (see [`App::idle`]) and none in the
 /// last [`AUTO_PULL_GAP`] (`since_last`: time since the last one, if any).
@@ -63,7 +57,16 @@ impl App {
         }
         // the rows moved: find the edited one again, or drop the edit
         if let Some(f) = &mut self.focus {
-            match self.rows.iter().position(|r| r.block_id == f.block_id) {
+            let found = self.rows.iter().position(|r| r.block_id == f.block_id);
+            // a cell needs its row and column too
+            let found = found.filter(|&i| match (&f.cell, &self.rows[i].marker) {
+                (Some((row, col)), Marker::Table(t)) => {
+                    t.rows.iter().any(|tr| tr.id == *row && tr.cells.len() > *col)
+                }
+                (Some(_), _) => false,
+                (None, _) => true,
+            });
+            match found {
                 Some(i) => f.idx = i,
                 None => {
                     self.focus = None;
@@ -95,13 +98,25 @@ impl App {
         let Some(id) = &self.current else {
             // an empty tab
             self.title.clear();
+            self.title_editable = false;
             self.rows.clear();
             return Ok(());
         };
-        self.title = self
-            .store
-            .get_page(id)?
+        let page = self.store.get_page(id)?;
+        self.title = page
+            .as_ref()
             .map_or_else(|| "(not cached)".into(), |p| p.title());
+        // mentions, equations, links and formatting don't survive a plain-text edit
+        self.title_editable = page.is_some_and(|p| {
+            p.properties.values().any(|v| match v {
+                PropertyValue::Title(rt) => rt.iter().all(|r| {
+                    matches!(r.kind, RichTextKind::Text { .. })
+                        && r.href.is_none()
+                        && r.annotations == Default::default()
+                }),
+                _ => false,
+            })
+        });
         match outline::flatten(&self.store, id) {
             Ok(rows) => self.rows = rows,
             Err(e) => {
@@ -143,7 +158,7 @@ impl App {
     }
 
     /// Expands the sidebar pages above the current one.
-    fn reveal_current(&mut self) {
+    pub(crate) fn reveal_current(&mut self) {
         let Some(id) = &self.current else { return };
         let up: Vec<String> = sidebar::ancestors(&self.tree, id)
             .into_iter()
@@ -154,18 +169,48 @@ impl App {
 
     // ------------------------------------------------------------ edits
 
-    /// Writes the focused row's text to the store if it changed (one op,
-    /// through core), keeping the editor open. False if the write failed.
-    /// Locked and non-editable rows are never written.
+    /// Writes the edited text (row, cell or title) to the store if it changed
+    /// (one op, through core, one undo step), keeping the editor open. False
+    /// if the write failed. Locked and non-editable rows are never written.
     pub(crate) fn flush(&mut self) -> bool {
+        let dirty = self.title_edit.as_ref().is_some_and(|t| t.text != t.original)
+            || self.focus.as_ref().is_some_and(|f| f.text != f.original);
+        if !dirty {
+            return true;
+        }
+        self.step(Self::flush_now)
+    }
+
+    fn flush_now(&mut self) -> bool {
+        let titled = self.write_title();
+        let ok = self.write_row();
+        if titled {
+            self.refresh();
+        }
+        ok
+    }
+
+    fn write_row(&mut self) -> bool {
         let Some(f) = &self.focus else { return true };
         let Some(row) = self.rows.get(f.idx) else {
             return true;
         };
-        if f.text == f.original || !row.editable || row.locked {
+        // a table row is no text block: its cells are edited, not it
+        if f.text == f.original || row.locked || (f.cell.is_none() && !row.editable) {
             return true;
         }
         let (idx, code, text) = (f.idx, f.code, f.text.clone());
+        if let Some((row, col)) = f.cell.clone() {
+            if !self.write_cell(&row, col, &text) {
+                return false;
+            }
+            if let Some(f) = &mut self.focus {
+                f.original = text;
+                f.failed = false;
+            }
+            self.refresh(); // the table's cells
+            return true;
+        }
         let rich = if !code {
             from_markdown(&text)
         } else if text.is_empty() {
@@ -203,6 +248,7 @@ impl App {
         let ok = self.flush();
         if ok {
             self.focus = None;
+            self.title_edit = None;
         }
         ok
     }
@@ -227,6 +273,7 @@ impl App {
         self.current.is_some()
             && self.sent.is_empty()
             && self.focus.is_none()
+            && self.title_edit.is_none()
             && self.switcher.is_none()
     }
 
@@ -267,7 +314,12 @@ impl App {
 
     /// The worker answers each command with one event, in order.
     pub(crate) fn on_event(&mut self, ev: Event) {
-        self.sent.pop_front();
+        // pushed ops can't be undone, nor edits a pull rewrote under them
+        let pulled = matches!(&ev, Event::Pulled { report, .. } if !report.skipped);
+        if self.sent.pop_front() == Some(true) || pulled {
+            self.undo.clear();
+            self.redo.clear();
+        }
         // auto-pulls only start with nothing in flight: this answers it
         if std::mem::take(&mut self.auto_pulling) {
             // quiet: no error shown or cleared, pending opens kept
@@ -326,7 +378,7 @@ impl App {
     // ------------------------------------------------------- navigation
 
     /// Makes `id` the page of the active tab; a different page starts at the top.
-    fn set_current(&mut self, id: &str) {
+    pub(crate) fn set_current(&mut self, id: &str) {
         if self.current.as_deref() != Some(id) {
             self.scroll = 0.0;
             self.pending_scroll = Some(0.0);
@@ -478,6 +530,9 @@ impl App {
         if self.pushing() || !self.commit() {
             return;
         }
+        // undo steps may hold the discarded ops
+        self.undo.clear();
+        self.redo.clear();
         if let Err(e) = problems::discard(&self.store, &p) {
             self.last_error = Some(e.to_string());
         }
@@ -595,57 +650,42 @@ impl App {
             .collect()
     }
 
-    /// Takes the shortcut keys from this frame's input, before any widget
-    /// runs. The ones that commit the edit are only noted: the editor has not
-    /// taken this frame's typing yet, [`run_shortcut`](Self::run_shortcut)
-    /// runs them after the page.
-    fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Shortcut> {
-        let mut out = Vec::new();
+    /// Takes the global keymap commands from this frame's input, before any
+    /// widget runs. The sidebar toggle is done at once; the ones that commit
+    /// the edit are only noted: the editor has not taken this frame's typing
+    /// yet, [`run_shortcut`](Self::run_shortcut) runs them after the page.
+    fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Command> {
         let ctrl = ctx.input(|i| i.modifiers.ctrl);
-        if ctx.input_mut(|i| keys::take_sidebar_toggle(&mut i.events, ctrl)) {
+        let map = &self.keys;
+        let mut out =
+            ctx.input_mut(|i| keys::take_commands(&mut i.events, ctrl, map, Command::is_global));
+        if out.contains(&Command::ToggleSidebar) {
             self.sidebar = !self.sidebar;
+            out.retain(|c| *c != Command::ToggleSidebar);
         }
-        // logical matching ignores an extra Shift: the Shift variant first
-        let hit = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
-        if hit(CTRL_SHIFT, Key::Tab) {
-            out.push(Shortcut::Tab(-1));
-        } else if hit(CTRL, Key::Tab) {
-            out.push(Shortcut::Tab(1));
-        }
-        if hit(CTRL_SHIFT, Key::R) {
-            out.push(Shortcut::Pull(true));
-        } else if hit(CTRL, Key::R) {
-            out.push(Shortcut::Pull(false));
-        }
-        // Ctrl+Shift+S/K/T/W stay free for the editor
-        if ctx.input(|i| i.modifiers.shift) {
-            return out;
-        }
-        for (k, s) in [
-            (Key::S, Shortcut::Push),
-            (Key::K, Shortcut::Switcher),
-            (Key::T, Shortcut::NewTab),
-            (Key::W, Shortcut::CloseTab),
-        ] {
-            if hit(CTRL, k) {
-                out.push(s);
-            }
-        }
-        if self.problems_open && self.switcher.is_none() && hit(Modifiers::NONE, Key::Escape) {
+        if self.problems_open
+            && self.switcher.is_none()
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
             self.problems_open = false;
         }
         out
     }
 
-    fn run_shortcut(&mut self, s: Shortcut) {
-        match s {
-            Shortcut::Tab(d) => self.cycle_tab(d),
-            Shortcut::Pull(force) => self.pull(force),
-            Shortcut::Push => self.push(),
-            Shortcut::Switcher if self.switcher.is_some() => self.switcher = None,
-            Shortcut::Switcher => self.open_switcher(),
-            Shortcut::NewTab => self.new_tab_with_switcher(),
-            Shortcut::CloseTab => self.close_tab(self.active),
+    fn run_shortcut(&mut self, c: Command) {
+        match c {
+            Command::NextTab => self.cycle_tab(1),
+            Command::PrevTab => self.cycle_tab(-1),
+            Command::ForcePull => self.pull(true),
+            Command::Pull => self.pull(false),
+            Command::Push => self.push(),
+            Command::Search if self.switcher.is_some() => self.switcher = None,
+            Command::Search => self.open_switcher(),
+            Command::NewTab => self.new_tab_with_switcher(),
+            Command::CloseTab => self.close_tab(self.active),
+            Command::Undo => self.undo_redo(true),
+            Command::Redo => self.undo_redo(false),
+            _ => {}
         }
     }
 
@@ -810,17 +850,6 @@ fn join_within(h: std::thread::JoinHandle<()>, wait: Duration) {
     if h.is_finished() {
         let _ = h.join();
     }
-}
-
-/// A shortcut that commits the edit, noted by `shortcuts`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Shortcut {
-    Tab(isize),
-    Pull(bool),
-    Push,
-    Switcher,
-    NewTab,
-    CloseTab,
 }
 
 fn icon_of(e: &notion_core::store::PageEntry) -> String {

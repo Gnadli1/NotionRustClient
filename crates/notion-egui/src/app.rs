@@ -20,6 +20,8 @@ use notion_core::store::{PageEntry, Store};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::edit::EditKey;
+use crate::keys::Keymap;
+use crate::links::{self, Link};
 use crate::menu::{menu_step, Outcome};
 use crate::outline::{self, Marker, Row};
 use crate::problems::Problem;
@@ -27,6 +29,7 @@ use crate::session;
 use crate::slash::{self, Menu};
 use crate::switcher::Switcher;
 use crate::tabs::Tab;
+use crate::undo::Step;
 use crate::worker::{Cmd, Event};
 use crate::{md, theme};
 
@@ -37,6 +40,18 @@ pub(crate) enum Grab {
     End,
     /// A char index.
     At(usize),
+}
+
+impl Grab {
+    /// The char index in `text`.
+    pub(crate) fn index(self, text: &str) -> usize {
+        let end = text.chars().count();
+        match self {
+            Grab::Start => 0,
+            Grab::End => end,
+            Grab::At(n) => n.min(end),
+        }
+    }
 }
 
 /// The row being edited: its text lives here until Esc, a move or a sync
@@ -52,18 +67,69 @@ pub(crate) struct Focus {
     /// Code and equation rows are edited as raw text, not Markdown.
     pub(crate) code: bool,
     pub(crate) menu: Option<Menu>,
+    /// A table cell (table row id, column): `block_id` is then the table's
+    /// and `idx` its row.
+    pub(crate) cell: Option<(String, usize)>,
     galley: Option<Arc<Galley>>,
     /// Set until the editor has taken keyboard focus and its cursor.
     grab: Option<Grab>,
-    prev_len: usize,
+    pub(crate) prev_len: usize,
     scroll: bool,
     /// The last write of this text failed: a second Esc leaves without it.
     pub(crate) failed: bool,
 }
 
+impl Focus {
+    /// An editor on row `idx` (a table for a cell); the cursor goes to `grab`.
+    pub(crate) fn new(
+        idx: usize,
+        block_id: String,
+        original: String,
+        text: String,
+        code: bool,
+        grab: Grab,
+    ) -> Focus {
+        Focus {
+            idx,
+            block_id,
+            original,
+            prev_len: text.len(),
+            text,
+            code,
+            menu: None,
+            cell: None,
+            galley: None,
+            grab: Some(grab),
+            scroll: true,
+            failed: false,
+        }
+    }
+
+    pub(crate) fn take_grab(&mut self) -> Option<Grab> {
+        self.grab.take()
+    }
+}
+
+/// The text edit's title, while it is being edited in place.
+pub(crate) struct TitleEdit {
+    pub(crate) text: String,
+    /// The text as the edit started (or was last written).
+    pub(crate) original: String,
+    /// Set until the edit has taken keyboard focus and its cursor.
+    pub(crate) grab: bool,
+}
+
 pub(crate) enum Action {
     Edit(usize, Grab),
     Blur,
+    /// Enter, Backspace, Tab ... on the edited row (see `App::on_edit_key`).
+    Key(EditKey),
+    /// A click on a link; `new_tab` for Ctrl+click and middle-click.
+    Link { link: Link, new_tab: bool },
+    EditTitle,
+    TitleCommit,
+    /// A table cell: (table row id, column).
+    EditCell(String, usize),
     /// A page link, sidebar row or breadcrumb: shown, or pulled if uncached.
     Open(String),
     Toggle(usize),
@@ -89,6 +155,9 @@ pub(crate) enum Action {
     },
 }
 
+/// Opens a web link outside the app (injectable for tests).
+pub(crate) type Opener = Box<dyn Fn(&str) -> Result<(), String>>;
+
 pub struct App {
     pub(crate) store: Store,
     /// None once the worker is shut down.
@@ -111,6 +180,17 @@ pub struct App {
     /// Table cells by (row, table row, column).
     pub(crate) table_jobs: HashMap<(usize, usize, usize), LayoutJob>,
     pub(crate) focus: Option<Focus>,
+    pub(crate) keys: Keymap,
+    pub(crate) title_edit: Option<TitleEdit>,
+    /// The title has no mentions or equations (plain text round-trips).
+    pub(crate) title_editable: bool,
+    /// Local edits to undo / redo, newest last.
+    pub(crate) undo: Vec<Step>,
+    pub(crate) redo: Vec<Step>,
+    /// Inside [`App::step`]: nested steps join the outer one.
+    pub(crate) stepping: bool,
+    /// Opens a web link (`xdg-open`; tests swap it out).
+    pub(crate) opener: Opener,
     /// The page's scroll offset, read back every frame.
     pub(crate) scroll: f32,
     /// An offset to apply on the next frame (tab switch, new page), once.
@@ -168,8 +248,24 @@ fn look(m: &Marker) -> (f32, bool) {
 
 /// Blur first, then the rest in order: a Blur from the edited row must not be
 /// lost to (or undo) another row's action in the same frame.
-pub(crate) fn blur_first(acts: &mut [Action]) {
-    acts.sort_by_key(|a| !matches!(a, Action::Blur));
+/// A row index taken from the old outline is stale once a key action
+/// (create, delete, move) ran, so those after it are dropped.
+pub(crate) fn blur_first(acts: &mut Vec<Action>) {
+    acts.sort_by_key(|a| !matches!(a, Action::Blur | Action::TitleCommit));
+    if let Some(k) = acts.iter().position(|a| matches!(a, Action::Key(_))) {
+        let mut i = 0;
+        acts.retain(|a| {
+            i += 1;
+            i <= k + 1 || !matches!(a, Action::Edit(..) | Action::Check(_) | Action::Toggle(_))
+        });
+    }
+}
+
+/// Some(open in a new tab?) when `r` was clicked: Ctrl+click and a middle
+/// click open a new tab.
+fn clicked_new_tab(ui: &Ui, r: &egui::Response) -> Option<bool> {
+    let mid = r.middle_clicked();
+    (r.clicked() || mid).then(|| mid || ui.input(|i| i.modifiers.command))
 }
 
 /// (line, byte column in that line) of the cursor at char index `at`.
@@ -191,14 +287,14 @@ fn byte_at(text: &str, line: usize, col: usize) -> usize {
         + col
 }
 
-fn set_cursor(ctx: &egui::Context, id: Id, mut st: TextEditState, at: usize) {
+pub(crate) fn set_cursor(ctx: &egui::Context, id: Id, mut st: TextEditState, at: usize) {
     st.cursor
         .set_char_range(Some(CCursorRange::one(CCursor::new(at))));
     st.store(ctx, id);
 }
 
 /// The nearest shown, editable row above (-1) or below (+1) `idx`.
-fn neighbour(rows: &[Row], shown: &[bool], idx: usize, dir: isize) -> Option<usize> {
+pub(crate) fn neighbour(rows: &[Row], shown: &[bool], idx: usize, dir: isize) -> Option<usize> {
     let mut i = idx as isize + dir;
     while (0..rows.len() as isize).contains(&i) {
         if shown[i as usize] && rows[i as usize].editable {
@@ -233,6 +329,13 @@ impl App {
             jobs: HashMap::new(),
             table_jobs: HashMap::new(),
             focus: None,
+            keys: Keymap::default(),
+            title_edit: None,
+            title_editable: false,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            stepping: false,
+            opener: Box::new(links::xdg_open),
             scroll: 0.0,
             pending_scroll: None,
             tabs: vec![Tab::default()],
@@ -273,7 +376,7 @@ impl App {
 
     /// The editor on row `i`, with `typed` in it if the text differs from the
     /// row's (a conversion keeps what was typed).
-    fn open_editor(&mut self, i: usize, grab: Grab, typed: Option<String>) {
+    pub(crate) fn open_editor(&mut self, i: usize, grab: Grab, typed: Option<String>) {
         let r = &self.rows[i];
         let code = r.marker == Marker::Equation || matches!(r.marker, Marker::Code(_));
         let original = if code {
@@ -282,23 +385,11 @@ impl App {
             to_markdown(&r.rich_text)
         };
         let text = typed.unwrap_or_else(|| original.clone());
-        self.focus = Some(Focus {
-            idx: i,
-            block_id: r.block_id.clone(),
-            original,
-            prev_len: text.len(),
-            text,
-            code,
-            menu: None,
-            galley: None,
-            grab: Some(grab),
-            scroll: true,
-            failed: false,
-        });
+        self.focus = Some(Focus::new(i, r.block_id.clone(), original, text, code, grab));
     }
 
     /// A to-do's box: queues the change. Locked rows and pushes refuse.
-    fn check(&mut self, i: usize) {
+    pub(crate) fn check(&mut self, i: usize) {
         let r = &self.rows[i];
         let Marker::Todo(checked) = r.marker else { return };
         if r.locked || self.pushing() || !self.flush() {
@@ -395,6 +486,13 @@ impl App {
     pub(crate) fn apply(&mut self, act: Action) {
         match act {
             Action::Edit(i, _) | Action::Toggle(i) | Action::Check(i) if i >= self.rows.len() => {}
+            Action::Key(k) => self.on_edit_key(k),
+            Action::Link { link, new_tab } => self.open_link(link, new_tab),
+            Action::EditTitle => self.start_title(),
+            Action::TitleCommit => {
+                self.commit();
+            }
+            Action::EditCell(row, col) => self.start_cell(&row, col),
             Action::Edit(i, grab) => self.start_edit(i, grab),
             Action::Blur => {
                 // a write that keeps failing must not trap the editor: the
@@ -418,13 +516,13 @@ impl App {
                 }
                 self.shown = outline::shown(&self.rows, &self.open);
             }
-            Action::Check(i) => self.check(i),
+            Action::Check(i) => self.step(|s| s.check(i)),
             Action::Convert {
                 kind,
                 text,
                 typed,
                 at,
-            } => self.convert(kind, text, typed, at),
+            } => self.step(|s| s.convert(kind, text, typed, at)),
             Action::ToggleTree(id) => {
                 if !self.tree_open.remove(&id) {
                     self.tree_open.insert(id);
@@ -464,7 +562,7 @@ impl App {
                     ui.add_space(16.0);
                     acts.extend(crate::view::breadcrumb(ui, c, &crumbs, &title));
                     ui.add_space(8.0);
-                    ui.add(Label::new(RichText::new(&title).size(38.0).strong()).wrap());
+                    acts.extend(self.title_ui(ui, &title));
                     ui.add_space(12.0);
                     for idx in 0..self.rows.len() {
                         if self.shown[idx] {
@@ -479,27 +577,9 @@ impl App {
         acts
     }
 
-    fn row_ui(&mut self, ui: &mut Ui, idx: usize) -> Option<Action> {
-        if let Marker::Table(t) = &self.rows[idx].marker {
-            let indent = 26.0 * self.rows[idx].depth as f32;
-            let table_jobs = &mut self.table_jobs;
-            ui.horizontal_top(|ui| {
-                ui.add_space(indent);
-                egui::Grid::new(("table", idx))
-                    .striped(true)
-                    .show(ui, |ui| {
-                        for (ri, r) in t.rows.iter().enumerate() {
-                            for (ci, c) in r.cells.iter().enumerate() {
-                                let job = table_jobs
-                                    .entry((idx, ri, ci))
-                                    .or_insert_with(|| md::rich_job(&c.rich_text, 15.0, false));
-                                ui.add(Label::new(job.clone()));
-                            }
-                            ui.end_row();
-                        }
-                    });
-            });
-            return None;
+    fn row_ui(&mut self, ui: &mut Ui, idx: usize) -> Vec<Action> {
+        if matches!(self.rows[idx].marker, Marker::Table(_)) {
+            return self.table_ui(ui, idx);
         }
         let (depth, editable, toggle, level) = {
             let r = &self.rows[idx];
@@ -601,8 +681,10 @@ impl App {
                 Marker::ChildPage(t) | Marker::ChildDatabase(t) => {
                     let page = matches!(marker, Marker::ChildPage(_));
                     let text = format!("{} {t}", if page { "📄" } else { "🗄" });
-                    if ui.add(Label::new(text).sense(Sense::click())).clicked() && page {
-                        act = Some(Action::Open(self.rows[idx].block_id.clone()));
+                    let r = ui.add(Label::new(text).sense(Sense::click()));
+                    if let Some(new_tab) = page.then(|| clicked_new_tab(ui, &r)).flatten() {
+                        let link = Link::Page(self.rows[idx].block_id.clone());
+                        act = Some(Action::Link { link, new_tab });
                     }
                 }
                 Marker::LinkToPage {
@@ -615,15 +697,20 @@ impl App {
                     } else {
                         format!("→ {title}")
                     };
-                    if ui.add(Label::new(text).sense(Sense::click())).clicked() && !database {
-                        act = Some(Action::Open(id.clone()));
+                    let r = ui.add(Label::new(text).sense(Sense::click()));
+                    if let Some(new_tab) = (!database).then(|| clicked_new_tab(ui, &r)).flatten() {
+                        act = Some(Action::Link {
+                            link: Link::Page(id.clone()),
+                            new_tab,
+                        });
                     }
                 }
                 Marker::LinkCard { kind, url, label } => {
-                    ui.label(format!(
-                        "🔗 [{kind}] {}",
-                        if label.is_empty() { url } else { label }
-                    ));
+                    let text = format!("🔗 [{kind}] {}", if label.is_empty() { url } else { label });
+                    let r = ui.add(Label::new(text).sense(Sense::click()));
+                    if clicked_new_tab(ui, &r).is_some() {
+                        act = Some(Action::Link { link: crate::links::route(url), new_tab: false });
+                    }
                 }
                 Marker::Synced | Marker::ColumnList | Marker::Column | Marker::Breadcrumb => {
                     ui.label(RichText::new(marker.label()).color(grey));
@@ -643,10 +730,53 @@ impl App {
                 _ => body(self, ui),
             }
         });
-        act
+        act.into_iter().collect()
     }
 
-    /// The row's text: a cached label, or the editor if it has focus.
+    /// A table: a cell is edited in place on a click, unless the table is
+    /// locked (synced) or the cell is read-only (a mention).
+    fn table_ui(&mut self, ui: &mut Ui, idx: usize) -> Vec<Action> {
+        let Marker::Table(t) = self.rows[idx].marker.clone() else {
+            return Vec::new();
+        };
+        let (indent, locked) = (26.0 * self.rows[idx].depth as f32, self.rows[idx].locked);
+        let mut acts = Vec::new();
+        ui.horizontal_top(|ui| {
+            ui.add_space(indent);
+            egui::Grid::new(("table", idx)).striped(true).show(ui, |ui| {
+                for (ri, r) in t.rows.iter().enumerate() {
+                    for (ci, c) in r.cells.iter().enumerate() {
+                        let editing = self
+                            .focus
+                            .as_ref()
+                            .is_some_and(|f| f.idx == idx && f.cell == Some((r.id.clone(), ci)));
+                        if editing {
+                            acts.extend(self.cell_edit(ui));
+                            continue;
+                        }
+                        let job = self
+                            .table_jobs
+                            .entry((idx, ri, ci))
+                            .or_insert_with(|| md::rich_job(&c.rich_text, 15.0, false));
+                        let mut l = Label::new(job.clone());
+                        let click = !locked && c.editable;
+                        if click {
+                            l = l.sense(Sense::click()).selectable(false);
+                        }
+                        let resp = ui.add(l);
+                        if click && resp.on_hover_cursor(egui::CursorIcon::Text).clicked() {
+                            acts.push(Action::EditCell(r.id.clone(), ci));
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        acts
+    }
+
+    /// The row's text: a cached label, or the editor if it has focus. A click
+    /// on a link follows it, any other click edits the row.
     fn body(&mut self, ui: &mut Ui, idx: usize, editable: bool) -> Option<Action> {
         if self.focus.as_ref().is_some_and(|f| f.idx == idx) {
             return self.edit_body(ui, idx);
@@ -665,17 +795,44 @@ impl App {
                 _ => md::rich_job(&r.rich_text, size, bold),
             }
         });
+        let linked = rows[idx].rich_text.iter().any(|r| links::run_link(r).is_some());
         let mut l = Label::new(job.clone()).wrap();
-        if editable {
+        if editable || linked {
             l = l.sense(Sense::click()).selectable(false);
         }
-        let r = ui.add(l);
-        if editable {
-            r.on_hover_cursor(egui::CursorIcon::Text)
-                .clicked()
-                .then_some(Action::Edit(idx, Grab::End))
-        } else {
-            None
+        if !linked {
+            let r = ui.add(l);
+            return if editable {
+                r.on_hover_cursor(egui::CursorIcon::Text)
+                    .clicked()
+                    .then_some(Action::Edit(idx, Grab::End))
+            } else {
+                None
+            };
+        }
+        // the link under the pointer, found in the label's own layout
+        let (pos, galley, r) = l.layout_in_ui(ui);
+        if ui.is_rect_visible(r.rect) {
+            let color = ui.visuals().text_color();
+            ui.painter().add(egui::epaint::TextShape::new(pos, galley.clone(), color));
+        }
+        let rich = &rows[idx].rich_text;
+        let at = |p: egui::Pos2| {
+            let rel = p - pos;
+            let c = galley.cursor_from_pos(rel).index.0;
+            let x = galley.pos_from_cursor(CCursor::new(c)).min.x;
+            links::link_at(rich, job, if rel.x >= x { c } else { c.saturating_sub(1) })
+        };
+        let hover = r.hover_pos().and_then(at);
+        if hover.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        } else if editable {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        }
+        let new_tab = clicked_new_tab(ui, &r)?;
+        match r.interact_pointer_pos().and_then(at) {
+            Some(link) => Some(Action::Link { link, new_tab }),
+            None => editable.then_some(Action::Edit(idx, Grab::End)),
         }
     }
 
@@ -689,13 +846,7 @@ impl App {
 
         if let Some(g) = f.grab.take() {
             ctx.memory_mut(|m| m.request_focus(id));
-            let end = f.text.chars().count();
-            let at = match g {
-                Grab::Start => 0,
-                Grab::End => end,
-                Grab::At(n) => n.min(end),
-            };
-            set_cursor(&ctx, id, TextEditState::default(), at);
+            set_cursor(&ctx, id, TextEditState::default(), g.index(&f.text));
         }
         let cur = TextEditState::load(&ctx, id)
             .and_then(|s| s.cursor.char_range())
@@ -732,17 +883,17 @@ impl App {
             // the query, so the pick is resolved after the edit has run
             enter = take(Key::Enter) > 0;
         } else {
-            take(Key::Tab);
-            if take(Key::Escape) > 0 {
-                act = Some(Action::Blur);
-            }
-            // ↑ on the first visual line / ↓ on the last leaves the row
+            // ↑ on the first visual line / ↓ on the last leaves the row; ↑ from
+            // the first row goes to the title
             if let (Some(g), true) = (&f.galley, ctx.input(|i| i.modifiers.is_none())) {
                 let row = g.layout_from_cursor(CCursor::new(cur)).row;
                 if row == 0 && ctx.input(|i| i.key_pressed(Key::ArrowUp)) {
                     if let Some(j) = neighbour(&self.rows, &self.shown, idx, -1) {
                         take(Key::ArrowUp);
                         act = Some(Action::Edit(j, Grab::End));
+                    } else if self.title_editable {
+                        take(Key::ArrowUp);
+                        act = Some(Action::EditTitle);
                     }
                 } else if row + 1 >= g.rows.len() && ctx.input(|i| i.key_pressed(Key::ArrowDown)) {
                     if let Some(j) = neighbour(&self.rows, &self.shown, idx, 1) {
@@ -753,6 +904,12 @@ impl App {
             }
         }
 
+        // Enter, Tab, Esc, Backspace, keymap commands; text edited by a mark
+        // is read back below
+        if focused {
+            act = self.editor_keys(&ctx, id).or(act);
+        }
+        let f = self.focus.as_mut()?;
         let mut layouter = |ui: &Ui, text: &dyn TextBuffer, wrap: f32| {
             let mut job = md::md_job(text.as_str(), size, bold, dim);
             job.wrap.max_width = wrap;
@@ -985,6 +1142,22 @@ mod tests {
                 .memory_mut(|m| m.surrender_focus(edit_id("p-0")));
             w.send(key(Key::Enter));
             assert_eq!(w.app.rows[0].marker, Marker::None, "no pick without focus");
+        }
+
+        #[test]
+        fn index_actions_after_a_key_are_dropped() {
+            let mut acts = vec![
+                Action::Edit(1, Grab::End),
+                Action::Key(EditKey::Enter),
+                Action::Check(2),
+                Action::Edit(3, Grab::End),
+                Action::Toggle(1),
+                Action::Blur,
+            ];
+            blur_first(&mut acts);
+            assert!(matches!(acts[0], Action::Blur));
+            assert_eq!(acts.len(), 3, "Edit(1) stays before the key, the rest go");
+            assert!(matches!(acts[2], Action::Key(_)));
         }
 
         #[test]
