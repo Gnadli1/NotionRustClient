@@ -5,8 +5,8 @@ pub mod theme;
 use iced::font::{Family, Style, Weight};
 use iced::widget::text::{LineHeight, Span};
 use iced::widget::{
-    button, column, container, mouse_area, rich_text, row, rule, scrollable, span, text,
-    text_editor, text_input, Button, Column,
+    button, column, container, mouse_area, opaque, rich_text, row, rule, scrollable, space, span,
+    stack, text, text_editor, text_input, Button, Column,
 };
 use std::ops::Range;
 
@@ -378,32 +378,80 @@ fn entry<'a>(title: &'a str, msg: Message, selected: bool) -> Button<'a, Message
         .width(Fill)
 }
 
-pub fn view(s: &State) -> Element<'_, Message> {
-    let c = theme::colors(s.mode);
-    let mut side = column![text_input("Search… (Ctrl+K)", &s.search)
+/// Notion's sidebar: the Search row, then the page tree.
+fn sidebar(s: &State) -> Element<'_, Message> {
+    let search = button(text("🔍  Search").size(14))
+        .on_press(Message::FocusSearch)
+        .style(theme::item(false))
+        .padding([4, 8])
+        .width(Fill);
+    let mut side = column![search].spacing(1).padding(8);
+    for r in crate::sidebar::rows(&s.tree, &s.tree_open) {
+        let e = r.entry;
+        // the arrow is its own click target: the mouse_area takes the press
+        let arrow = text(match (r.has_children, r.expanded) {
+            (false, _) => "",
+            (true, false) => "▸",
+            (true, true) => "▾",
+        })
+        .size(12)
+        .width(16);
+        let arrow: Element<_> = if r.has_children {
+            mouse_area(arrow)
+                .on_press(Message::SidebarExpand(e.id.clone()))
+                .into()
+        } else {
+            arrow.into()
+        };
+        let icon = text(e.icon.as_deref().unwrap_or("📄")).size(14).width(22);
+        let current = s.current.as_ref() == Some(&e.id);
+        side = side.push(
+            button(row![arrow, icon, text(untitled(&e.title)).size(14)].spacing(2))
+                .on_press(Message::SidebarOpen(e.id.clone()))
+                .style(theme::page_item(current))
+                .padding(Padding::from([3, 8]).left(4.0 + r.depth as f32 * 14.0))
+                .width(Fill),
+        );
+    }
+    container(scrollable(side))
+        .width(240)
+        .height(Fill)
+        .style(theme::sidebar)
+        .into()
+}
+
+/// The Ctrl+K switcher: a box near the top over a dimmed page; a click on
+/// the backdrop closes it.
+fn search_overlay(s: &State) -> Element<'_, Message> {
+    let input = text_input("Search pages…", &s.search)
         .id(SEARCH_ID)
         .on_input(Message::SearchInput)
         .on_submit(Message::SearchSubmit)
-        .size(14)
-        .padding([6, 8])
-        .style(theme::search)]
-    .spacing(2)
-    .padding(8);
-    for (id, title) in &s.results {
-        side = side.push(entry(title, Message::PickResult(id.clone()), false));
-    }
-    if !s.results.is_empty() {
-        side = side.push(container(text("Cached").size(12).color(c.secondary)).padding([6, 8]));
-    }
-    for (id, title) in &s.pages {
-        let current = s.current.as_ref() == Some(id);
-        side = side.push(entry(title, Message::Open(id.clone()), current));
-    }
-    let side = container(scrollable(side))
-        .width(240)
+        .size(16)
+        .padding([8, 10])
+        .style(theme::search);
+    let results = column(
+        s.results
+            .iter()
+            .map(|(id, title)| entry(title, Message::PickResult(id.clone()), false).into()),
+    )
+    .spacing(1);
+    let panel =
+        container(column![input, container(scrollable(results)).max_height(400)].spacing(6))
+            .width(560)
+            .padding(8)
+            .style(theme::bordered);
+    // the inner opaque keeps clicks in the box from reaching the backdrop
+    let backdrop = container(opaque(panel))
+        .center_x(Fill)
         .height(Fill)
-        .style(theme::sidebar);
+        .padding(Padding::ZERO.top(80))
+        .style(theme::backdrop);
+    opaque(mouse_area(backdrop).on_press(Message::SearchEscape))
+}
 
+pub fn view(s: &State) -> Element<'_, Message> {
+    let c = theme::colors(s.mode);
     let main: Element<_> = match &s.current {
         None => container(text("Pick a page on the left, or search.").color(c.secondary))
             .center(Fill)
@@ -437,13 +485,20 @@ pub fn view(s: &State) -> Element<'_, Message> {
         status.push_str(&format!(" · error: {e}"));
     }
 
+    // the same widget tree shape whether the sidebar or overlay is shown,
+    // so toggling them doesn't reset the scrollables' state
+    let (side, line): (Element<_>, Element<_>) = if s.sidebar {
+        (sidebar(s), rule::vertical(1).style(theme::divider).into())
+    } else {
+        (space().into(), space().into())
+    };
+    let main = container(main).width(Fill).height(Fill);
+    let mut body = stack![row![side, line, main].height(Fill)];
+    if s.searching {
+        body = body.push(search_overlay(s));
+    }
     column![
-        row![
-            side,
-            rule::vertical(1).style(theme::divider),
-            container(main).width(Fill).height(Fill)
-        ]
-        .height(Fill),
+        body,
         rule::horizontal(1).style(theme::divider),
         container(text(status).size(12).color(c.secondary)).padding([4, 12]),
     ]

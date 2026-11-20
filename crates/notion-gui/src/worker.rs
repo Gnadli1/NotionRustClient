@@ -198,7 +198,13 @@ mod tests {
                 Event::SearchResults(vec![(PID.into(), "Home".into())]),
             ]
         );
-        assert_eq!(store.pages().unwrap(), vec![(PID.into(), "Home".into())]);
+        let tree = store.page_tree().unwrap();
+        assert_eq!(
+            tree.iter()
+                .map(|e| (e.id.as_str(), e.title.as_str()))
+                .collect::<Vec<_>>(),
+            [(PID, "Home")]
+        );
         assert_eq!(store.children(PID).unwrap()[0].id, "b1");
     }
 

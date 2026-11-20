@@ -65,7 +65,8 @@ impl Chord {
             " " => "space",
             k => k,
         };
-        let one_char = key.chars().count() == 1 && key.chars().all(|c| c.is_ascii_graphic());
+        let one_char =
+            key.chars().count() == 1 && key.chars().all(|c| !c.is_whitespace() && !c.is_control());
         if !one_char && !NAMED.iter().any(|(_, n)| *n == key) {
             return None;
         }
@@ -143,6 +144,7 @@ pub enum Command {
     Pull,
     ForcePull,
     Search,
+    ToggleSidebar,
     Indent,
     Outdent,
     ToggleCheck,
@@ -154,7 +156,11 @@ impl Command {
     pub fn is_global(self) -> bool {
         matches!(
             self,
-            Command::Push | Command::Pull | Command::ForcePull | Command::Search
+            Command::Push
+                | Command::Pull
+                | Command::ForcePull
+                | Command::Search
+                | Command::ToggleSidebar
         )
     }
 }
@@ -183,6 +189,7 @@ const NAMES: &[(&str, Command)] = &[
     ("pull", Command::Pull),
     ("force_pull", Command::ForcePull),
     ("search", Command::Search),
+    ("toggle_sidebar", Command::ToggleSidebar),
     ("indent", Command::Indent),
     ("outdent", Command::Outdent),
     ("toggle_check", Command::ToggleCheck),
@@ -212,6 +219,9 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("ctrl+r", "pull"),
     ("ctrl+shift+r", "force_pull"),
     ("ctrl+k", "search"),
+    ("ctrl+\\", "toggle_sidebar"),
+    // Ctrl+\ on German/Austrian layouts (the unshifted key is ß)
+    ("ctrl+ß", "toggle_sidebar"),
     ("tab", "indent"),
     ("shift+tab", "outdent"),
     ("ctrl+enter", "toggle_check"),
@@ -407,9 +417,7 @@ mod tests {
         assert_eq!(ch("ctrl++").key, "+");
         assert_eq!(ch("esc"), ch("escape"));
         assert_eq!(ch("tab").to_string(), "tab");
-        for bad in [
-            "", "ctrl+", "hyper+a", "ctrl+f13", "ctrl+ab", "ctrl+é", "ctrl+alt",
-        ] {
+        for bad in ["", "ctrl+", "hyper+a", "ctrl+f13", "ctrl+ab", "ctrl+alt"] {
             assert_eq!(Chord::parse(bad), None, "{bad:?}");
         }
     }
@@ -441,6 +449,8 @@ mod tests {
             Some(Command::Block(TargetKind::Heading1))
         );
         assert_eq!(k.get(&ch("ctrl+k")), Some(Command::Search));
+        assert_eq!(k.get(&ch("ctrl+\\")), Some(Command::ToggleSidebar));
+        assert_eq!(k.get(&ch("ctrl+ß")), Some(Command::ToggleSidebar));
         assert_eq!(k.get(&ch("ctrl+shift+k")), Some(Command::Mark(Mark::Link)));
         assert_eq!(k.get(&ch("ctrl+enter")), Some(Command::ToggleCheck));
         assert_eq!(k.get(&ch("ctrl+x")), None);

@@ -6,6 +6,7 @@ mod app;
 mod edit;
 mod keys;
 mod outline;
+mod sidebar;
 mod slash;
 mod tex;
 mod view;

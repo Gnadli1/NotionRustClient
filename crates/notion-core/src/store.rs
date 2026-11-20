@@ -27,6 +27,18 @@ CREATE TABLE id_map (local_id TEXT PRIMARY KEY, remote_id TEXT NOT NULL);
 PRAGMA user_version = 1;
 ";
 
+/// One sidebar entry: a page, cached or known only from a `child_page` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageEntry {
+    pub id: String,
+    pub title: String,
+    /// The nearest page above this one; None at top level (workspace,
+    /// database or data source parent, or a parent block that isn't cached).
+    pub parent: Option<String>,
+    /// The emoji icon, if the page has one.
+    pub icon: Option<String>,
+}
+
 /// Rows of `id` and every block below it (recursive on parent_id).
 const SUBTREE: &str = "WITH RECURSIVE sub(id) AS (SELECT ?1 UNION \
      SELECT b.id FROM blocks b JOIN sub ON b.parent_id = sub.id) ";
@@ -81,12 +93,28 @@ impl Store {
         self.get("SELECT raw FROM pages WHERE id = ?1", id)
     }
 
-    /// (id, title) of every cached page not in trash, ordered by title.
-    pub fn pages(&self) -> Result<Vec<(String, String)>> {
+    /// Every non-trashed cached page except database rows, plus the pages only known from a cached
+    /// `child_page` block, with their parent page resolved (unordered).
+    pub fn page_tree(&self) -> Result<Vec<PageEntry>> {
         let mut st = self.conn.prepare(
-            "SELECT id, title FROM pages WHERE in_trash = 0 ORDER BY title COLLATE NOCASE, id",
+            "SELECT p.id, p.title,
+               CASE p.parent_type WHEN 'page_id' THEN p.parent_id WHEN 'block_id' THEN b.page_id END,
+               CASE WHEN json_extract(p.raw, '$.icon.type') = 'emoji'
+                 THEN json_extract(p.raw, '$.icon.emoji') END
+             FROM pages p LEFT JOIN blocks b ON p.parent_type = 'block_id' AND b.id = p.parent_id
+             WHERE p.in_trash = 0 AND p.parent_type <> 'data_source_id'
+             UNION ALL
+             SELECT id, COALESCE(json_extract(raw, '$.child_page.title'), ''), page_id, NULL
+             FROM blocks WHERE type = 'child_page' AND id NOT IN (SELECT id FROM pages)",
         )?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = st.query_map([], |r| {
+            Ok(PageEntry {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                parent: r.get(2)?,
+                icon: r.get(3)?,
+            })
+        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -595,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn pages_sorted_by_title_without_trash() {
+    fn page_tree_without_trash() {
         let s = Store::open_in_memory().unwrap();
         s.upsert_page(&page("p1", pp("r"), "Zeta")).unwrap();
         s.upsert_page(&page("p2", pp("r"), "Alpha")).unwrap();
@@ -603,12 +631,71 @@ mod tests {
         gone.in_trash = true;
         s.upsert_page(&gone).unwrap();
         s.upsert_page(&page("p4", pp("r"), "beta")).unwrap();
+        let mut ids: Vec<String> = s.page_tree().unwrap().into_iter().map(|e| e.id).collect();
+        ids.sort();
+        assert_eq!(ids, ["p1", "p2", "p4"]);
+    }
+
+    #[test]
+    fn page_tree_resolves_parents_icons_and_child_pages() {
+        let s = Store::open_in_memory().unwrap();
+        let ws = json!({ "type": "workspace", "workspace": true });
+        let mut top = page("top", ws.clone(), "Top");
+        top.raw["icon"] = json!({ "type": "emoji", "emoji": "🚀" });
+        s.upsert_page(&top).unwrap();
+        s.upsert_page(&page("sub", pp("top"), "Sub")).unwrap();
+        // under a column block of "top"
+        s.replace_children("top", "top", &[block("col", pp("top"), "")])
+            .unwrap();
+        s.upsert_page(&page("incol", bp("col"), "In column"))
+            .unwrap();
+        s.upsert_page(&page("lost", bp("nowhere"), "Lost")).unwrap();
+        let mut ext = page("ext", ws.clone(), "Ext");
+        ext.raw["icon"] = json!({ "type": "external", "external": { "url": "https://x/y.png" } });
+        s.upsert_page(&ext).unwrap();
+        let mut gone = page("gone", pp("top"), "Gone");
+        gone.in_trash = true;
+        s.upsert_page(&gone).unwrap();
+        let ds = json!({ "type": "data_source_id", "data_source_id": "ds", "database_id": "db" });
+        s.upsert_page(&page("row", ds, "Row")).unwrap();
+        // child_page blocks: one uncached, one for the cached "sub", one for trashed "gone"
+        let cp = |id: &str, title: &str| -> Block {
+            serde_json::from_value(json!({
+                "object": "block", "id": id, "parent": pp("top"), "type": "child_page",
+                "child_page": { "title": title }, "has_children": false, "in_trash": false,
+                "created_time": T, "last_edited_time": T,
+            }))
+            .unwrap()
+        };
+        s.replace_children(
+            "top",
+            "top",
+            &[
+                block("col", pp("top"), ""),
+                cp("unc", "Uncached"),
+                cp("sub", "Sub"),
+                cp("gone", "Gone"),
+            ],
+        )
+        .unwrap();
+
+        let mut got = s.page_tree().unwrap();
+        got.sort_by(|a, b| a.id.cmp(&b.id));
+        let e = |id: &str, title: &str, parent: Option<&str>, icon: Option<&str>| PageEntry {
+            id: id.into(),
+            title: title.into(),
+            parent: parent.map(Into::into),
+            icon: icon.map(Into::into),
+        };
         assert_eq!(
-            s.pages().unwrap(),
+            got,
             [
-                ("p2".into(), "Alpha".into()),
-                ("p4".into(), "beta".into()),
-                ("p1".into(), "Zeta".into())
+                e("ext", "Ext", None, None),
+                e("incol", "In column", Some("top"), None),
+                e("lost", "Lost", None, None),
+                e("sub", "Sub", Some("top"), None),
+                e("top", "Top", None, Some("🚀")),
+                e("unc", "Uncached", Some("top"), None),
             ]
         );
     }

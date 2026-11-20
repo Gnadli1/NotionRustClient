@@ -10,9 +10,9 @@ use iced::widget::{operation, text_editor};
 use iced::{event, Subscription, Task};
 use notion_core::markdown::from_markdown;
 use notion_core::model::{plain_text, TargetKind};
-use notion_core::model::{BlockKind, Parent, RichText, TextBlock};
+use notion_core::model::{BlockKind, RichText, TextBlock};
 use notion_core::ops::OpStatus;
-use notion_core::store::Store;
+use notion_core::store::{PageEntry, Store};
 use notion_core::sync::{self, ChangeOutcome};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -59,10 +59,17 @@ pub enum Message {
     Chord(Chord),
     /// A keymap command from the row editor (block type, mark, new block).
     Command(Command),
-    /// Ctrl+K
+    /// Ctrl+K or the sidebar's Search row: opens the search overlay.
     FocusSearch,
-    /// Esc anywhere: back from the search box to the outline.
+    /// Esc anywhere, or a click on the overlay's backdrop: closes the search
+    /// overlay, back to the outline.
     SearchEscape,
+    /// Sidebar page clicked: opened if cached, else pulled first.
+    SidebarOpen(String),
+    /// Sidebar ▸/▾ clicked: expand or collapse that page's children.
+    SidebarExpand(String),
+    /// Ctrl+\: show or hide the sidebar.
+    ToggleSidebar,
     /// System light/dark mode, at startup and on change.
     ThemeChanged(iced::theme::Mode),
 }
@@ -72,7 +79,13 @@ pub(crate) const SEARCH_ID: &str = "search";
 pub struct State {
     store: Store,
     cmds: UnboundedSender<Cmd>,
-    pub(crate) pages: Vec<(String, String)>,
+    /// Sidebar pages; [`crate::sidebar`] nests them.
+    pub(crate) tree: Vec<PageEntry>,
+    /// Expanded sidebar pages.
+    pub(crate) tree_open: HashSet<String>,
+    pub(crate) sidebar: bool,
+    /// The search overlay is open.
+    pub(crate) searching: bool,
     pub(crate) current: Option<String>,
     pub(crate) title: String,
     pub(crate) rows: Vec<Row>,
@@ -102,7 +115,10 @@ impl State {
         let mut s = State {
             store,
             cmds,
-            pages: Vec::new(),
+            tree: Vec::new(),
+            tree_open: HashSet::new(),
+            sidebar: true,
+            searching: false,
             current: None,
             title: String::new(),
             rows: Vec::new(),
@@ -292,18 +308,7 @@ impl State {
     }
 
     fn try_refresh(&mut self) -> notion_core::Result<()> {
-        // ponytail: one get_page per cached page; fine for hundreds, add a
-        // Store query if the cache grows to thousands
-        self.pages.clear();
-        for (id, title) in self.store.pages()? {
-            let row = self
-                .store
-                .get_page(&id)?
-                .is_some_and(|p| matches!(p.parent, Parent::DataSource { .. }));
-            if !row {
-                self.pages.push((id, title));
-            }
-        }
+        self.tree = self.store.page_tree()?;
         if let Some(id) = &self.current {
             self.title = self
                 .store
@@ -332,6 +337,27 @@ impl Drop for State {
 }
 
 impl State {
+    /// Expands the sidebar pages above the current one.
+    fn reveal_current(&mut self) {
+        let Some(id) = &self.current else { return };
+        let up: Vec<String> = crate::sidebar::ancestors(&self.tree, id)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        self.tree_open.extend(up);
+    }
+
+    /// Closes the search overlay; Esc then goes back to the edited row.
+    fn close_search(&mut self) -> Task<Message> {
+        self.searching = false;
+        // mid-push the editor is paused: don't hand it the focus
+        if self.editing.is_some() && !self.pushing() {
+            operation::focus(EDITOR_ID)
+        } else {
+            iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::unfocus())
+        }
+    }
+
     /// Installs the user's keymap; `problems` go to the status bar.
     pub fn set_keys(&mut self, keys: Keymap, problems: Vec<String>) {
         self.keys = keys;
@@ -343,6 +369,19 @@ impl State {
 
 pub fn update(s: &mut State, msg: Message) -> Task<Message> {
     match msg {
+        // view only: allowed mid-push
+        Message::SidebarExpand(id) => {
+            if !s.tree_open.remove(&id) {
+                s.tree_open.insert(id);
+            }
+            return Task::none();
+        }
+        Message::ToggleSidebar => {
+            s.sidebar = !s.sidebar;
+            return Task::none();
+        }
+        // the overlay must not stick open during a push
+        Message::SearchEscape if s.searching => return s.close_search(),
         // a push is modal: the worker may already have sent the ops an edit
         // would rewrite
         Message::Focus(_)
@@ -358,7 +397,19 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         | Message::SearchEscape
         | Message::Open(_)
         | Message::PickResult(_)
+        | Message::SidebarOpen(_)
             if s.pushing() => {}
+        Message::SidebarOpen(id) => {
+            let cached = matches!(s.store.get_page(&id), Ok(Some(_)));
+            return update(
+                s,
+                if cached {
+                    Message::Open(id)
+                } else {
+                    Message::PickResult(id)
+                },
+            );
+        }
         Message::Open(id) => {
             if !s.leave() {
                 return Task::none();
@@ -367,6 +418,7 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             s.pending_db = None;
             s.current = Some(id);
             s.refresh();
+            s.reveal_current();
         }
         Message::Pull { force } => {
             // commit first: a pull keeps blocks with queued edits
@@ -398,12 +450,14 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             }
         }
         Message::PickResult(id) => {
+            s.searching = false;
             if matches!(s.store.get_page(&id), Ok(Some(_))) {
                 if !s.leave() {
                     return Task::none();
                 }
                 s.current = Some(id.clone());
                 s.refresh();
+                s.reveal_current();
             }
             s.pending_open = Some(id.clone());
             s.send(Cmd::Pull { id, force: false });
@@ -427,6 +481,7 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         }
         Message::FocusSearch => {
             s.commit();
+            s.searching = true;
             return Task::batch([
                 operation::focus(SEARCH_ID),
                 operation::select_all(SEARCH_ID),
@@ -453,6 +508,7 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
                 Some(Command::Pull) => Message::Pull { force: false },
                 Some(Command::ForcePull) => Message::Pull { force: true },
                 Some(Command::Search) => Message::FocusSearch,
+                Some(Command::ToggleSidebar) => Message::ToggleSidebar,
                 _ => return Task::none(),
             };
             return update(s, msg);
@@ -467,7 +523,8 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             s.sent.pop_front();
             match &*ev {
                 Event::Pulled { id, .. } => {
-                    if s.pending_open.as_ref() == Some(id) && s.leave() {
+                    let opened = s.pending_open.as_ref() == Some(id) && s.leave();
+                    if opened {
                         s.pending_open = None;
                         s.pending_db = None;
                         s.current = Some(id.clone());
@@ -475,7 +532,10 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
                     s.last_error = None;
                     // the editor keeps its own buffer; only the other rows change
                     s.refresh();
-                    if s.editing.is_some() {
+                    if opened {
+                        s.reveal_current();
+                    }
+                    if s.editing.is_some() && !s.searching {
                         // its place in the tree may have moved
                         return operation::focus(EDITOR_ID);
                     }
@@ -990,7 +1050,8 @@ mod tests {
             ))
             .unwrap();
         s.refresh();
-        assert_eq!(s.pages, vec![("a".into(), "a".into())]);
+        let ids: Vec<&str> = s.tree.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["a"]);
     }
 
     #[test]
@@ -2254,5 +2315,146 @@ mod tests {
             Message::Worker(Arc::new(Event::Error("offline".into()))),
         );
         assert_eq!(s.last_error.as_deref(), Some("offline"));
+    }
+
+    /// "par" (workspace) with a cached child "kid", which has an uncached
+    /// child_page block "unc".
+    fn tree_state() -> (State, UnboundedReceiver<Cmd>) {
+        use crate::outline::tests::blk;
+        let (mut s, rx) = state();
+        s.store
+            .upsert_page(&page(
+                "par",
+                json!({ "type": "workspace", "workspace": true }),
+            ))
+            .unwrap();
+        s.store
+            .upsert_page(&page("kid", json!({ "type": "page_id", "page_id": "par" })))
+            .unwrap();
+        s.store
+            .replace_children(
+                "kid",
+                "kid",
+                &[blk("unc", "kid", "child_page", json!({ "title": "Unc" }))],
+            )
+            .unwrap();
+        s.refresh();
+        (s, rx)
+    }
+
+    fn visible(s: &State) -> Vec<&str> {
+        crate::sidebar::rows(&s.tree, &s.tree_open)
+            .into_iter()
+            .map(|r| r.entry.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn sidebar_arrow_expands_without_opening() {
+        let (mut s, mut rx) = tree_state();
+        assert_eq!(visible(&s), ["par"]);
+        up(&mut s, Message::SidebarExpand("par".into()));
+        assert_eq!(visible(&s), ["par", "kid"]);
+        assert_eq!(s.current, None, "not opened");
+        assert!(rx.try_recv().is_err(), "nothing sent");
+        assert!(s.store.queued_ops().unwrap().is_empty(), "no op queued");
+        up(&mut s, Message::SidebarExpand("par".into()));
+        assert_eq!(visible(&s), ["par"]);
+        let _ = crate::view::view(&s);
+    }
+
+    #[test]
+    fn sidebar_open_reveals_and_pulls_uncached() {
+        let (mut s, mut rx) = tree_state();
+        // opening a nested page expands its ancestors
+        s.current = Some("unc".into());
+        s.reveal_current();
+        assert_eq!(visible(&s), ["par", "kid", "unc"]);
+        s.current = None;
+        s.tree_open.clear();
+
+        up(&mut s, Message::SidebarOpen("kid".into()));
+        assert_eq!(s.current.as_deref(), Some("kid"));
+        assert!(rx.try_recv().is_err(), "cached: no network");
+        assert_eq!(visible(&s), ["par", "kid"], "ancestors only");
+
+        up(&mut s, Message::SidebarOpen("unc".into()));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Cmd::Pull {
+                id: "unc".into(),
+                force: false
+            }
+        );
+        assert_eq!(s.current.as_deref(), Some("kid"), "until it's pulled");
+        let _ = crate::view::view(&s);
+    }
+
+    #[test]
+    fn ctrl_sharp_s_toggles_the_sidebar_on_german_layouts() {
+        let id = iced::window::Id::unique();
+        let (mut s, _rx) = state();
+        let m = shortcut(key("ß", true, false), event::Status::Ignored, id).unwrap();
+        up(&mut s, m);
+        assert!(!s.sidebar);
+    }
+
+    #[test]
+    fn ctrl_backslash_toggles_the_sidebar() {
+        let id = iced::window::Id::unique();
+        let (mut s, _rx) = state();
+        assert!(s.sidebar);
+        let m = shortcut(key("\\", true, false), event::Status::Ignored, id).unwrap();
+        up(&mut s, m.clone());
+        assert!(!s.sidebar);
+        let _ = crate::view::view(&s);
+        up(&mut s, m);
+        assert!(s.sidebar);
+    }
+
+    #[test]
+    fn search_overlay_opens_closes_and_picks() {
+        let id = iced::window::Id::unique();
+        let (mut s, mut rx) = tree_state();
+        let ctrl_k = shortcut(key("k", true, false), event::Status::Ignored, id).unwrap();
+        up(&mut s, ctrl_k.clone());
+        assert!(s.searching);
+        let _ = crate::view::view(&s);
+        let esc = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: Key::Named(keyboard::key::Named::Escape),
+            modified_key: Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        up(&mut s, shortcut(esc, event::Status::Captured, id).unwrap());
+        assert!(!s.searching);
+
+        // search, then pick a result
+        up(&mut s, Message::FocusSearch);
+        up(&mut s, Message::SearchInput("ki".into()));
+        up(&mut s, Message::SearchSubmit);
+        assert_eq!(rx.try_recv().unwrap(), Cmd::Search("ki".into()));
+        up(
+            &mut s,
+            Message::Worker(Arc::new(Event::SearchResults(vec![(
+                "kid".into(),
+                "kid".into(),
+            )]))),
+        );
+        let _ = crate::view::view(&s);
+        up(&mut s, Message::PickResult("kid".into()));
+        assert!(!s.searching);
+        assert_eq!(s.current.as_deref(), Some("kid"));
+
+        // the backdrop closes it even mid-push
+        up(&mut s, Message::FocusSearch);
+        s.sent.push_back(true);
+        up(&mut s, Message::SearchEscape);
+        assert!(!s.searching);
     }
 }

@@ -105,6 +105,33 @@ pub fn item(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style 
     }
 }
 
+/// A sidebar page: hover like [`item`]; the current page a stronger tint.
+pub fn page_item(current: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |t, status| {
+        let c = of(t);
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let bg = if current {
+            Some(c.hover.scale_alpha(2.0))
+        } else {
+            hovered.then_some(c.hover)
+        };
+        button::Style {
+            background: bg.map(Background::Color),
+            text_color: c.text,
+            border: Border::default().rounded(4),
+            ..button::Style::default()
+        }
+    }
+}
+
+/// The dimmed page behind the search overlay.
+pub fn backdrop(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.35).into()),
+        ..container::Style::default()
+    }
+}
+
 pub fn sidebar(t: &Theme) -> container::Style {
     container::Style {
         background: Some(of(t).sidebar.into()),
