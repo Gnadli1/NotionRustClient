@@ -148,6 +148,16 @@ impl Store {
         self.get("SELECT raw FROM blocks WHERE id = ?1", id)
     }
 
+    /// The page a cached block sits on.
+    pub fn block_page(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT page_id FROM blocks WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
     pub fn children(&self, parent_id: &str) -> Result<Vec<Block>> {
         self.list(
             "SELECT raw FROM blocks WHERE parent_id = ?1 ORDER BY position",

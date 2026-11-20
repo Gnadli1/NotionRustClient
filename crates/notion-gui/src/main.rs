@@ -74,6 +74,9 @@ fn main() -> iced::Result {
                 iced::system::theme().map(app::Message::ThemeChanged),
                 Task::run(events, |e| app::Message::Worker(Arc::new(e)))
                     .chain(Task::done(app::Message::WorkerGone)),
+                Task::run(worker::ticks(app::AUTO_PULL_EVERY), |()| {
+                    app::Message::AutoPull
+                }),
             ]),
         )
     };

@@ -205,6 +205,19 @@ pub fn editor(t: &Theme, _: text_editor::Status) -> text_editor::Style {
     }
 }
 
+/// The title edited in place: like the title text, only a caret added.
+pub fn title(t: &Theme, _: text_input::Status) -> text_input::Style {
+    let c = of(t);
+    text_input::Style {
+        background: Color::TRANSPARENT.into(),
+        border: Border::default(),
+        icon: c.secondary,
+        placeholder: c.secondary,
+        value: c.text,
+        selection: c.accent.scale_alpha(0.3),
+    }
+}
+
 pub fn search(t: &Theme, status: text_input::Status) -> text_input::Style {
     let c = of(t);
     text_input::Style {

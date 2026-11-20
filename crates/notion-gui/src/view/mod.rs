@@ -13,7 +13,7 @@ use std::ops::Range;
 use iced::{Center, Element, Fill, Font, Padding, Shrink};
 use notion_core::model::{RichText, RichTextKind};
 
-use crate::app::{click, Message, State, PAGE_SCROLL_ID, SEARCH_ID};
+use crate::app::{click, Message, State, PAGE_SCROLL_ID, SEARCH_ID, TITLE_ID};
 use crate::edit::{Editing, EDITOR_ID};
 use crate::keys::Keymap;
 use crate::outline::{self, Marker, Row, Table};
@@ -46,7 +46,18 @@ pub(crate) fn untitled(t: &str) -> &str {
     }
 }
 
-fn styled<'a>(t: &'a RichText, c: &Colors) -> Span<'a, ()> {
+/// What clicking a span does: a page mention opens the page, a link goes
+/// through [`Message::LinkClick`].
+fn link(t: &RichText) -> Option<Message> {
+    match &t.kind {
+        RichTextKind::Mention(m) if m["type"] == "page" => m["page"]["id"]
+            .as_str()
+            .map(|id| Message::SidebarOpen(id.to_string())),
+        _ => t.href.clone().map(Message::LinkClick),
+    }
+}
+
+fn styled<'a>(t: &'a RichText, c: &Colors) -> Span<'a, Message> {
     if let RichTextKind::Equation { expression } = &t.kind {
         // Unicode pretty-print in italic serif; the TeX source in monospace if it can't
         return match crate::tex::pretty_tex(expression) {
@@ -71,6 +82,7 @@ fn styled<'a>(t: &'a RichText, c: &Colors) -> Span<'a, ()> {
         font.style = Style::Italic;
     }
     span(t.plain_text.as_str())
+        .link_maybe(link(t))
         .font(font)
         .strikethrough(a.strikethrough)
         .underline(a.underline || t.href.is_some())
@@ -114,7 +126,7 @@ fn table_view<'a>(
             let body: Element<_> = match edited {
                 Some(e) => editor(e, keys, 14, false),
                 None => {
-                    let spans: Vec<Span<'_, ()>> = cell
+                    let spans: Vec<Span<'_, Message>> = cell
                         .rich_text
                         .iter()
                         .map(|rt| {
@@ -128,7 +140,13 @@ fn table_view<'a>(
                             sp
                         })
                         .collect();
-                    let body = container(rich_text(spans).size(14).line_height(LINE)).width(Fill);
+                    let body = container(
+                        rich_text(spans)
+                            .on_link_click(std::convert::identity)
+                            .size(14)
+                            .line_height(LINE),
+                    )
+                    .width(Fill);
                     if cell.editable {
                         mouse_area(body)
                             .on_press(Message::FocusCell(tr.id.clone(), j))
@@ -182,10 +200,39 @@ fn blocks<'a>(
             continue;
         }
         let open = s.open.contains(&r.block_id);
-        out.push(row_view(r, level, open, s.editing.as_ref(), &s.keys, c));
+        // the sync gutter: red for a conflict/failed op, accent for a queued one
+        let dot = if s.problem_ids.contains(&r.block_id) {
+            Some(c.error)
+        } else if s.queued_ids.contains(&r.block_id) {
+            Some(c.accent)
+        } else {
+            None
+        };
+        let gutter = container(dot.map(|col| text("●").size(8).color(col)))
+            .width(12)
+            .padding(Padding::ZERO.top(metrics(&r.marker).1 + 10.0));
+        out.push(
+            row![
+                gutter,
+                row_view(r, level, open, s.editing.as_ref(), &s.keys, c)
+            ]
+            .into(),
+        );
         i += 1;
     }
     column(out).spacing(2)
+}
+
+/// A row's text size and the space above it.
+fn metrics(m: &Marker) -> (u32, f32) {
+    match m {
+        Marker::Heading(1) => (30, 24.0),
+        Marker::Heading(2) => (24, 18.0),
+        Marker::Heading(3) => (20, 12.0),
+        Marker::Equation => (20, 0.0),
+        Marker::Code(_) => (14, 0.0),
+        _ => (16, 0.0),
+    }
 }
 
 /// One row; `level` is its indent, `open` whether its toggle is expanded.
@@ -198,14 +245,7 @@ fn row_view<'a>(
     c: &Colors,
 ) -> Element<'a, Message> {
     let heading = matches!(r.marker, Marker::Heading(_));
-    let (size, above) = match r.marker {
-        Marker::Heading(1) => (30, 24.0),
-        Marker::Heading(2) => (24, 18.0),
-        Marker::Heading(3) => (20, 12.0),
-        Marker::Equation => (20, 0.0),
-        Marker::Code(_) => (14, 0.0),
-        _ => (16, 0.0),
-    };
+    let (size, above) = metrics(&r.marker);
     // indent and the space above headings sit outside the hover box
     let outer = Padding::ZERO.left(level as f32 * 24.0).top(above);
     let link = click(r).is_some();
@@ -261,7 +301,7 @@ fn row_view<'a>(
         };
         container(body).padding(BLOCK_PAD).width(Fill).into()
     } else {
-        let mut spans: Vec<Span<'_, ()>> = Vec::new();
+        let mut spans: Vec<Span<'_, Message>> = Vec::new();
         let label = r.marker.label();
         // placeholders, cards and links keep their text label
         if !has_prefix && !label.is_empty() && !matches!(r.marker, Marker::Quote | Marker::Code(_))
@@ -291,7 +331,13 @@ fn row_view<'a>(
             }
             sp
         }));
-        let content = with_prefix(rich_text(spans).size(size).line_height(LINE).into());
+        let content = with_prefix(
+            rich_text(spans)
+                .on_link_click(std::convert::identity)
+                .size(size)
+                .line_height(LINE)
+                .into(),
+        );
         let mut content = container(content).width(Fill);
         if r.marker == Marker::Equation {
             content = content.center_x(Fill);
@@ -491,6 +537,41 @@ fn breadcrumb<'a>(s: &'a State, id: &str, c: &Colors) -> Element<'a, Message> {
     row(items).spacing(2).align_y(Center).into()
 }
 
+/// The conflict/failed ops, over the page's bottom-left corner: click one to
+/// go to it, or discard it (the remote version wins).
+fn problems_panel<'a>(s: &'a State, c: &Colors) -> Element<'a, Message> {
+    let items = s.problems.iter().map(|p| {
+        let info = column![
+            text(format!("{} · {}", p.kind, p.label)).size(13),
+            text(&p.error).size(12).color(c.error),
+        ]
+        .spacing(2);
+        row![
+            button(info)
+                .on_press(Message::OpenProblem(p.op))
+                .style(theme::item(false))
+                .padding([4, 8])
+                .width(Fill),
+            button(text("Discard").size(12))
+                .on_press(Message::Discard(p.op))
+                .style(theme::item(false))
+                .padding([4, 8]),
+        ]
+        .align_y(Center)
+        .into()
+    });
+    let panel = container(scrollable(column(items).spacing(2)))
+        .max_height(300)
+        .width(480)
+        .padding(4)
+        .style(theme::bordered);
+    container(opaque(panel))
+        .align_bottom(Fill)
+        .width(Fill)
+        .padding(Padding::ZERO.left(8).bottom(4))
+        .into()
+}
+
 /// The Ctrl+K switcher: a box near the top over a dimmed page; a click on
 /// the backdrop closes it.
 fn search_overlay(s: &State) -> Element<'_, Message> {
@@ -528,18 +609,41 @@ pub fn view(s: &State) -> Element<'_, Message> {
             .center(Fill)
             .into(),
         Some(id) => {
-            let title = text(&s.title)
-                .size(40)
-                .font(BOLD)
-                .line_height(LineHeight::Relative(1.2));
+            let title_line = LineHeight::Relative(1.2);
+            let title: Element<_> = match &s.title_edit {
+                Some(t) => text_input("Untitled", t)
+                    .id(TITLE_ID)
+                    .on_input(Message::TitleInput)
+                    .on_submit(Message::TitleCommit)
+                    .size(40)
+                    .font(BOLD)
+                    .line_height(title_line)
+                    .padding(0)
+                    .style(theme::title)
+                    .into(),
+                None => {
+                    let t = text(&s.title).size(40).font(BOLD).line_height(title_line);
+                    if s.title_editable {
+                        mouse_area(t)
+                            .on_press(Message::EditTitle)
+                            .interaction(iced::mouse::Interaction::Text)
+                            .into()
+                    } else {
+                        t.into()
+                    }
+                }
+            };
             let page = column![
-                container(breadcrumb(s, id, c)).padding(Padding::ZERO.top(16)),
-                container(title).padding(Padding::ZERO.top(40).bottom(12)),
+                // left: past the rows' sync gutter
+                container(breadcrumb(s, id, c)).padding(Padding::ZERO.top(16).left(12)),
+                container(title).padding(Padding::ZERO.top(40).bottom(12).left(12)),
                 blocks(s, &outline::shown(&s.rows, &s.open), 0..s.rows.len(), 0, c),
             ]
             .width(Fill)
             .max_width(PAGE_WIDTH)
             .padding(Padding::ZERO.bottom(120));
+            // a click beside the title (nothing else took it) commits it
+            let page = mouse_area(page).on_press(Message::TitleCommit);
             scrollable(container(page).padding([0.0, MIN_SIDE]).center_x(Fill))
                 .id(PAGE_SCROLL_ID)
                 .on_scroll(|v| Message::Scrolled(v.absolute_offset().y))
@@ -549,7 +653,18 @@ pub fn view(s: &State) -> Element<'_, Message> {
     };
 
     let [queued, conflicts, failed] = s.counts;
-    let mut status = format!("queued {queued} · conflicts {conflicts} · failed {failed}");
+    let counts = format!("conflicts {conflicts} · failed {failed}");
+    let counts: Element<_> = if s.problems.is_empty() {
+        text(counts).size(12).color(c.secondary).into()
+    } else {
+        // opens the list of them
+        button(text(counts).size(12).color(c.error))
+            .on_press(Message::ToggleProblems)
+            .style(theme::item(s.problems_open))
+            .padding([0, 4])
+            .into()
+    };
+    let mut status = String::new();
     if s.pushing() {
         status.push_str(" · pushing…");
     } else if !s.sent.is_empty() {
@@ -568,6 +683,9 @@ pub fn view(s: &State) -> Element<'_, Message> {
     };
     let main = container(main).width(Fill).height(Fill);
     let mut body = stack![row![side, line, main].height(Fill)];
+    if s.problems_open {
+        body = body.push(problems_panel(s, c));
+    }
     if s.searching {
         body = body.push(search_overlay(s));
     }
@@ -576,7 +694,17 @@ pub fn view(s: &State) -> Element<'_, Message> {
         rule::horizontal(1).style(theme::divider),
         body,
         rule::horizontal(1).style(theme::divider),
-        container(text(status).size(12).color(c.secondary)).padding([4, 12]),
+        container(
+            row![
+                text(format!("queued {queued} · "))
+                    .size(12)
+                    .color(c.secondary),
+                counts,
+                text(status).size(12).color(c.secondary),
+            ]
+            .align_y(Center)
+        )
+        .padding([4, 12]),
     ]
     .into()
 }

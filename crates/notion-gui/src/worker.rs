@@ -91,6 +91,19 @@ pub fn spawn(
     (cmd_tx, ev_rx, handle)
 }
 
+/// A tick every `every`, from a std thread (iced's timers need its tokio or
+/// smol feature). The thread ends at the first tick after the receiver is gone.
+pub fn ticks(every: std::time::Duration) -> fmpsc::UnboundedReceiver<()> {
+    let (tx, rx) = fmpsc::unbounded();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(every);
+        if tx.unbounded_send(()).is_err() {
+            break;
+        }
+    });
+    rx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

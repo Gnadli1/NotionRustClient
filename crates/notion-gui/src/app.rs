@@ -4,14 +4,15 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use iced::keyboard::{self, Key};
 use iced::widget::{operation, text_editor};
 use iced::{event, Subscription, Task};
 use notion_core::markdown::from_markdown;
 use notion_core::model::{plain_text, TargetKind};
-use notion_core::model::{BlockKind, RichText, TextBlock};
-use notion_core::ops::OpStatus;
+use notion_core::model::{Block, BlockKind, PropertyValue, RichText, RichTextKind, TextBlock};
+use notion_core::ops::{Op, OpKind, OpStatus};
 use notion_core::store::{PageEntry, Store};
 use notion_core::sync::{self, ChangeOutcome};
 use tokio::sync::mpsc::UnboundedSender;
@@ -81,11 +82,48 @@ pub enum Message {
     SwitchTab(usize),
     /// The page scrolled to this vertical offset.
     Scrolled(f32),
+    /// A link in a row's text clicked: a Notion page opens here, the rest
+    /// goes to xdg-open.
+    LinkClick(String),
+    /// The page title clicked: edit it in place.
+    EditTitle,
+    TitleInput(String),
+    /// Enter in the title, or a click beside it: commit the title.
+    TitleCommit,
+    /// The 5-minute timer or the window gaining focus.
+    AutoPull,
+    /// The status bar's conflict/failed count: show or hide their list.
+    ToggleProblems,
+    /// A problem op clicked (op id): open its page and block.
+    OpenProblem(i64),
+    /// Drop a conflict/failed op (op id) and force-pull its page.
+    Discard(i64),
 }
+
+/// A conflict or failed op, for the status bar's list.
+#[derive(Debug, Clone)]
+pub(crate) struct Problem {
+    pub op: i64,
+    pub kind: &'static str,
+    /// The block to show and focus: a create's own block while cached.
+    pub block: String,
+    pub page: Option<String>,
+    /// The block's text, or the page's title, or the id.
+    pub label: String,
+    pub error: String,
+    /// A create's unpushed `local-*` block.
+    local: Option<String>,
+}
+
+/// Auto-pulls at most this often, however the focus flaps.
+const AUTO_PULL_GAP: Duration = Duration::from_secs(30);
+/// The auto-pull timer.
+pub const AUTO_PULL_EVERY: Duration = Duration::from_secs(300);
 
 pub(crate) const SEARCH_ID: &str = "search";
 /// The page's scrollable, scrolled back on a tab switch.
 pub(crate) const PAGE_SCROLL_ID: &str = "page";
+pub(crate) const TITLE_ID: &str = "title";
 
 pub struct State {
     store: Store,
@@ -125,6 +163,18 @@ pub struct State {
     /// live state.
     pub(crate) tabs: Vec<Tab>,
     pub(crate) active: usize,
+    /// The title being edited in place.
+    pub(crate) title_edit: Option<String>,
+    /// The title has no mentions or equations (plain text round-trips).
+    pub(crate) title_editable: bool,
+    last_auto: Option<Instant>,
+    /// The command in flight is an auto-pull.
+    auto_pulling: bool,
+    /// Resolved targets of queued ops, and of conflict/failed ones.
+    pub(crate) queued_ids: HashSet<String>,
+    pub(crate) problem_ids: HashSet<String>,
+    pub(crate) problems: Vec<Problem>,
+    pub(crate) problems_open: bool,
 }
 
 impl State {
@@ -153,6 +203,14 @@ impl State {
             scroll: 0.0,
             tabs: vec![Tab::default()],
             active: 0,
+            title_edit: None,
+            title_editable: false,
+            last_auto: None,
+            auto_pulling: false,
+            queued_ids: HashSet::new(),
+            problem_ids: HashSet::new(),
+            problems: Vec::new(),
+            problems_open: false,
         };
         s.refresh();
         s
@@ -166,12 +224,42 @@ impl State {
     /// Writes the editor's text to the store if it changed, then refreshes.
     /// False if the write failed (the editor is kept).
     fn commit(&mut self) -> bool {
+        let titled = self.write_title();
         let wrote = self.write_edit();
         // Some(true) = nothing to write; the rows are current
-        if wrote != Some(true) {
+        if wrote != Some(true) || titled {
             self.refresh();
         }
         wrote.is_some()
+    }
+
+    /// Ends title editing, writing the title if it changed. True if the
+    /// store may have changed. A failed write drops the edit (shown as an
+    /// error) rather than block every commit point.
+    fn write_title(&mut self) -> bool {
+        let Some(new) = self.title_edit.take() else {
+            return false;
+        };
+        let Some(id) = self.current.clone() else {
+            return false;
+        };
+        let old = self.store.get_page(&id).ok().flatten().map(|p| p.title());
+        if old.as_deref() == Some(new.as_str()) {
+            return false;
+        }
+        if let Err(e) = sync::local_set_title(&self.store, &id, &new) {
+            self.last_error = Some(format!("title not saved: {e}"));
+        }
+        true
+    }
+
+    /// Nothing is being edited, searched or sent, and a page is open.
+    fn idle(&self) -> bool {
+        self.current.is_some()
+            && self.sent.is_empty()
+            && self.editing.is_none()
+            && self.title_edit.is_none()
+            && !self.searching
     }
 
     /// Some(changed?) on success, None on a failed write. No refresh.
@@ -329,24 +417,105 @@ impl State {
 
     fn try_refresh(&mut self) -> notion_core::Result<()> {
         self.tree = self.store.page_tree()?;
+        self.title_editable = false;
         if let Some(id) = &self.current {
-            self.title = self
-                .store
-                .get_page(id)?
+            let page = self.store.get_page(id)?;
+            self.title = page
+                .as_ref()
                 .map_or_else(|| "(not cached)".into(), |p| untitled(&p.title()).into());
+            // mentions and equations don't survive a plain-text edit
+            self.title_editable = page.is_some_and(|p| {
+                p.properties.values().any(|v| match v {
+                    PropertyValue::Title(rt) => rt
+                        .iter()
+                        .all(|r| matches!(r.kind, RichTextKind::Text { .. })),
+                    _ => false,
+                })
+            });
             self.rows = outline::flatten(&self.store, id)?;
         } else {
             // an empty tab
             self.title.clear();
             self.rows.clear();
         }
-        self.counts = [
-            self.store.queued_ops()?.len(),
-            self.store.ops_by_status(OpStatus::Conflict)?.len(),
-            self.store.ops_by_status(OpStatus::Failed)?.len(),
-        ];
+        let queued = self.store.queued_ops()?;
+        let conflict = self.store.ops_by_status(OpStatus::Conflict)?;
+        let failed = self.store.ops_by_status(OpStatus::Failed)?;
+        self.counts = [queued.len(), conflict.len(), failed.len()];
+        // a create marks its own block, not its parent
+        self.queued_ids = queued
+            .iter()
+            .map(|o| {
+                self.store
+                    .resolve_id(sync::op_block(&o.kind).unwrap_or(o.kind.target_id()))
+            })
+            .collect::<notion_core::Result<_>>()?;
+        self.problems = conflict
+            .iter()
+            .chain(&failed)
+            .map(|o| problem(&self.store, o))
+            .collect::<notion_core::Result<_>>()?;
+        self.problem_ids = self.problems.iter().map(|p| p.block.clone()).collect();
+        if self.problems.is_empty() {
+            self.problems_open = false;
+        }
         Ok(())
     }
+}
+
+/// A conflict/failed op's list entry: what it is, where, and why.
+fn problem(store: &Store, op: &Op) -> notion_core::Result<Problem> {
+    let target = store.resolve_id(op.kind.target_id())?;
+    let (kind, local) = match &op.kind {
+        OpKind::CreateBlock { block, .. } => {
+            ("create", block["id"].as_str().map(|id| id.to_string()))
+        }
+        OpKind::UpdateBlock { .. } => ("edit", None),
+        OpKind::DeleteBlock { .. } => ("delete", None),
+        OpKind::MoveBlock { .. } => ("move", None),
+        OpKind::UpdatePageProperties { .. } => ("title", None),
+    };
+    let shown = match &local {
+        Some(l) if store.get_block(l)?.is_some() => l.clone(),
+        _ => target.clone(),
+    };
+    // a deleted block is gone from the cache: its base snapshot remains
+    let block = match store.get_block(&shown)? {
+        Some(b) => Some(b),
+        None => op
+            .base_raw
+            .clone()
+            .and_then(|v| serde_json::from_value::<Block>(v).ok()),
+    };
+    let page = store.get_page(&shown)?;
+    let page_id = match (&page, &block) {
+        (Some(p), _) => Some(p.id.clone()),
+        (None, Some(b)) => match store.block_page(&b.id)? {
+            Some(p) => Some(p),
+            // one hop up from the snapshot
+            None => match &b.parent {
+                notion_core::model::Parent::Page(p) => Some(p.clone()),
+                notion_core::model::Parent::Block(p) => store.block_page(p)?,
+                _ => None,
+            },
+        },
+        (None, None) => None,
+    };
+    let text = block
+        .as_ref()
+        .and_then(|b| b.kind.text().map(|t| plain_text(&t.rich_text)))
+        .or_else(|| page.map(|p| p.title()))
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| shown.clone());
+    Ok(Problem {
+        op: op.id,
+        kind,
+        block: shown,
+        page: page_id,
+        label: text.chars().take(60).collect(),
+        error: op.error.clone().unwrap_or_default(),
+        local,
+    })
 }
 
 /// Closing the window with a row open must not lose its text.
@@ -356,6 +525,7 @@ impl Drop for State {
         if std::thread::panicking() || self.pushing() {
             return;
         }
+        self.write_title();
         self.write_edit();
     }
 }
@@ -447,8 +617,30 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             s.scroll = y;
             return Task::none();
         }
+        Message::ToggleProblems => {
+            s.problems_open = !s.problems_open && !s.problems.is_empty();
+            return Task::none();
+        }
+        Message::AutoPull => {
+            let now = Instant::now();
+            let offline = s
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("offline"));
+            let due = !offline && auto_pull_due(s.last_auto.map(|t| now - t), s.idle());
+            if let Some(id) = s.current.clone().filter(|_| due) {
+                s.last_auto = Some(now);
+                s.send(Cmd::Pull { id, force: false });
+                s.auto_pulling = !s.sent.is_empty();
+            }
+            return Task::none();
+        }
         // the overlay must not stick open during a push
         Message::SearchEscape if s.searching => return s.close_search(),
+        Message::SearchEscape if s.problems_open => {
+            s.problems_open = false;
+            return Task::none();
+        }
         // a push is modal: the worker may already have sent the ops an edit
         // would rewrite
         Message::Focus(_)
@@ -468,7 +660,102 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         | Message::NewTab
         | Message::CloseTab(_)
         | Message::SwitchTab(_)
+        | Message::EditTitle
+        | Message::TitleInput(_)
+        | Message::TitleCommit
+        | Message::OpenProblem(_)
+        | Message::Discard(_)
             if s.pushing() => {}
+        Message::LinkClick(url) => return update(s, link_target(&url)),
+        Message::EditTitle => {
+            if !s.title_editable || s.title_edit.is_some() || !s.leave() {
+                return Task::none();
+            }
+            let Some(p) = s
+                .current
+                .as_ref()
+                .and_then(|id| s.store.get_page(id).ok().flatten())
+            else {
+                return Task::none();
+            };
+            s.title_edit = Some(p.title());
+            return Task::batch([
+                operation::focus(TITLE_ID),
+                operation::move_cursor_to_end(TITLE_ID),
+            ]);
+        }
+        Message::TitleInput(t) => {
+            if let Some(e) = &mut s.title_edit {
+                *e = t;
+            }
+        }
+        Message::TitleCommit => {
+            if s.title_edit.is_some() {
+                s.commit();
+                return iced::advanced::widget::operate(
+                    iced::advanced::widget::operation::focusable::unfocus(),
+                );
+            }
+        }
+        Message::OpenProblem(op) => {
+            let Some(p) = s.problems.iter().find(|p| p.op == op).cloned() else {
+                return Task::none();
+            };
+            s.problems_open = false;
+            let Some(page) = p.page else {
+                return Task::none();
+            };
+            let open = update(s, Message::SidebarOpen(page.clone()));
+            // where feasible: an editable block already shown gets the focus
+            if s.current.as_deref() == Some(page.as_str())
+                && s.rows.iter().any(|r| r.block_id == p.block && r.editable)
+            {
+                return Task::batch([open, s.focus(&p.block)]);
+            }
+            return open;
+        }
+        Message::Discard(op) => {
+            let Some(p) = s.problems.iter().find(|p| p.op == op).cloned() else {
+                return Task::none();
+            };
+            if !s.commit() {
+                return Task::none();
+            }
+            let res = s.store.complete_op(op).and_then(|()| {
+                let Some(l) = p.local.as_deref().filter(|l| l.starts_with("local-")) else {
+                    return Ok(());
+                };
+                // ops on the never-created block go too
+                // ponytail: direct dependents only; ops on its children or
+                // placed after it stay (they fail on push and are listed then)
+                for o in s
+                    .store
+                    .queued_ops()?
+                    .into_iter()
+                    .chain(s.store.ops_by_status(OpStatus::Failed)?)
+                {
+                    if sync::op_block(&o.kind) == Some(l) || o.kind.target_id() == l {
+                        s.store.complete_op(o.id)?;
+                    }
+                }
+                // pulls keep local-* blocks: drop it from the cache too
+                if s.store.get_block(l)?.is_some() {
+                    s.store.delete_block(l)?;
+                }
+                Ok(())
+            });
+            if let Err(e) = res {
+                s.last_error = Some(e.to_string());
+            }
+            s.refresh();
+            // the remote version wins
+            if let Some(page) = p.page {
+                s.send(Cmd::Pull {
+                    id: page,
+                    force: true,
+                });
+            }
+        }
         Message::NewTab => {
             if !s.leave() {
                 return Task::none();
@@ -581,6 +868,9 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
             ]);
         }
         Message::SearchEscape => {
+            if s.title_edit.is_some() {
+                return update(s, Message::TitleCommit);
+            }
             return if s.editing.is_some() {
                 operation::focus(EDITOR_ID)
             } else {
@@ -618,10 +908,20 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         Message::EditKey(k) => return on_edit_key(s, k),
         Message::WorkerGone => {
             s.sent.clear();
+            s.auto_pulling = false;
             s.last_error = Some("sync worker stopped".into());
         }
         Message::Worker(ev) => {
             s.sent.pop_front();
+            // auto-pulls only start with nothing in flight: this answers it
+            if std::mem::take(&mut s.auto_pulling) {
+                // quiet: no error shown or cleared, pending opens kept
+                s.refresh();
+                if s.editing.is_some() && !s.searching {
+                    return operation::focus(EDITOR_ID);
+                }
+                return Task::none();
+            }
             match &*ev {
                 Event::Pulled { id, .. } => {
                     let opened = s.pending_open.as_ref() == Some(id) && s.leave();
@@ -1032,6 +1332,9 @@ fn toggle_check(s: &mut State, id: &str) -> Task<Message> {
 /// a widget captured them (an Esc the editor also handles is harmless: it
 /// refocuses or unfocuses).
 fn shortcut(ev: iced::Event, _: event::Status, _: iced::window::Id) -> Option<Message> {
+    if let iced::Event::Window(iced::window::Event::Focused) = ev {
+        return Some(Message::AutoPull);
+    }
     let iced::Event::Keyboard(keyboard::Event::KeyPressed {
         key,
         physical_key,
@@ -1098,6 +1401,61 @@ fn open_url(url: &str) -> Result<(), String> {
     // reap it so it doesn't linger as a zombie
     std::thread::spawn(move || child.wait());
     Ok(())
+}
+
+/// Whether an auto-pull may run: idle (see [`State::idle`]) and none in the
+/// last [`AUTO_PULL_GAP`] (`since_last`: time since the last one, if any).
+fn auto_pull_due(since_last: Option<Duration>, idle: bool) -> bool {
+    idle && since_last.is_none_or(|d| d >= AUTO_PULL_GAP)
+}
+
+/// The page id (8-4-4-4-12) a Notion link points at: a notion.so /
+/// www.notion.so / notion.com / www.notion.com / *.notion.site URL, or a relative `/…` path, whose last
+/// segment ends in a 32-hex id (dashed or not; `?…#…` ignored).
+pub(crate) fn notion_page_id(url: &str) -> Option<String> {
+    let url = url.split(['?', '#']).next().unwrap_or_default();
+    let path = if url.starts_with('/') {
+        url
+    } else {
+        let rest = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))?;
+        let (host, path) = rest.split_at(rest.find('/')?);
+        let host = host.to_ascii_lowercase();
+        let hosts = ["notion.so", "www.notion.so", "notion.com", "www.notion.com"];
+        if !(hosts.contains(&host.as_str()) || host.ends_with(".notion.site")) {
+            return None;
+        }
+        path
+    };
+    let last: String = path
+        .rsplit('/')
+        .next()?
+        .chars()
+        .filter(|&c| c != '-')
+        .collect();
+    let h = last
+        .get(last.len().checked_sub(32)?..)?
+        .to_ascii_lowercase();
+    if !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    ))
+}
+
+/// A clicked link: a Notion page opens in the app, anything else via xdg-open.
+pub(crate) fn link_target(url: &str) -> Message {
+    match notion_page_id(url) {
+        Some(id) => Message::SidebarOpen(id),
+        None => Message::OpenLink(url.to_string()),
+    }
 }
 
 /// What clicking a read-only row does, if anything.
@@ -2727,5 +3085,278 @@ mod tests {
         assert!(ids(&s, "par").is_empty());
         up(&mut s, Message::Open("kid".into()));
         let _ = crate::view::view(&s);
+    }
+
+    const PID: &str = "0123abcd-0123-4567-89ab-0123456789ab";
+
+    #[test]
+    fn notion_urls_parse_to_page_ids() {
+        let hex = "0123abcd0123456789ab0123456789ab";
+        for url in [
+            format!("https://www.notion.so/{hex}"),
+            format!("https://notion.so/{PID}"),
+            format!("https://www.notion.so/team/My-Page-{hex}?pvs=4"),
+            format!("http://WWW.Notion.so/My-Page-{}#abc", hex.to_uppercase()),
+            format!("https://acme.notion.site/Page-{hex}"),
+            format!("https://www.notion.com/Page-{hex}"),
+            format!("https://notion.com/{PID}?pvs=4"),
+            format!("/{hex}"),
+            format!("/My-Page-{PID}?v=1#x"),
+        ] {
+            assert_eq!(notion_page_id(&url).as_deref(), Some(PID), "{url}");
+        }
+        for url in [
+            format!("https://example.com/{hex}"),
+            format!("https://notion.so.evil.com/{hex}"),
+            format!("https://fakenotion.site/{hex}"),
+            format!("https://notion.com.evil.com/{hex}"),
+            "https://www.notion.so/no-id-here".into(),
+            format!("https://www.notion.so/{hex}/sub"),
+            format!("file:///{hex}"),
+            format!("https://www.notion.so/x?p={hex}"),
+            "/short-abc".into(),
+        ] {
+            assert_eq!(notion_page_id(&url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn link_clicks_route_in_app_or_to_xdg_open() {
+        assert!(
+            matches!(link_target(&format!("https://www.notion.so/P-{}", PID.replace('-', ""))),
+                Message::SidebarOpen(id) if id == PID)
+        );
+        assert!(
+            matches!(link_target("https://example.com/a"), Message::OpenLink(u) if u == "https://example.com/a")
+        );
+        // an uncached Notion page is pulled, then opened here
+        let (mut s, mut rx) = editing_state();
+        up(&mut s, Message::LinkClick(format!("/{PID}")));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Cmd::Pull {
+                id: PID.into(),
+                force: false
+            }
+        );
+        // a cached one opens right away
+        s.store
+            .upsert_page(&page(
+                PID,
+                json!({ "type": "workspace", "workspace": true }),
+            ))
+            .unwrap();
+        up(
+            &mut s,
+            Message::LinkClick(format!("https://acme.notion.site/X-{PID}")),
+        );
+        assert_eq!(s.current.as_deref(), Some(PID));
+        // (web links go to xdg-open: not clicked here, a test would start a browser)
+    }
+
+    #[test]
+    fn title_edits_commit_and_queue_the_op() {
+        let (mut s, _rx) = editing_state();
+        assert!(s.title_editable);
+        up(&mut s, Message::Focus("a".into()));
+        up(&mut s, Message::EditTitle);
+        assert_eq!(editing(&s), None, "the row editor left");
+        assert_eq!(s.title_edit.as_deref(), Some("pg"));
+        up(&mut s, Message::TitleInput("New".into()));
+        up(&mut s, Message::TitleCommit);
+        assert_eq!(s.title_edit, None);
+        assert_eq!(s.title, "New");
+        assert_eq!(s.tree[0].title, "New");
+        assert_eq!(kinds(&s), ["update_page_properties"]);
+        // Esc commits too, into the same op
+        up(&mut s, Message::EditTitle);
+        up(&mut s, Message::TitleInput("Newer".into()));
+        up(&mut s, Message::SearchEscape);
+        assert_eq!((s.title_edit.as_deref(), s.title.as_str()), (None, "Newer"));
+        assert_eq!(kinds(&s), ["update_page_properties"]);
+        // unchanged: nothing queued; a click on a row commits
+        up(&mut s, Message::EditTitle);
+        up(&mut s, Message::Focus("b".into()));
+        assert_eq!(s.title_edit, None);
+        assert_eq!(editing(&s), Some("b"));
+        assert_eq!(kinds(&s), ["update_page_properties"]);
+
+        // a title with a mention is read-only
+        let mut p = s.store.get_page("pg").unwrap().unwrap();
+        p.properties.insert(
+            "Name".into(),
+            PropertyValue::Title(vec![serde_json::from_value(json!({ "type": "mention",
+                "mention": { "type": "date", "date": { "start": "2025-01-01" } },
+                "plain_text": "d", "annotations": {} }))
+            .unwrap()]),
+        );
+        s.store.upsert_page(&p).unwrap();
+        s.refresh();
+        assert!(!s.title_editable);
+        up(&mut s, Message::EditTitle);
+        assert_eq!(s.title_edit, None);
+    }
+
+    #[test]
+    fn auto_pull_waits_for_idle_and_rate_limits() {
+        let secs = |n| Some(Duration::from_secs(n));
+        assert!(auto_pull_due(None, true));
+        assert!(auto_pull_due(secs(30), true));
+        assert!(!auto_pull_due(secs(29), true), "focus flapping");
+        assert!(!auto_pull_due(None, false));
+
+        let (mut s, mut rx) = editing_state();
+        let pulls =
+            |rx: &mut UnboundedReceiver<Cmd>| std::iter::from_fn(|| rx.try_recv().ok()).count();
+        assert!(s.idle());
+        up(&mut s, Message::Focus("a".into()));
+        up(&mut s, Message::AutoPull);
+        up(&mut s, Message::EditKey(EditKey::Escape));
+        up(&mut s, Message::EditTitle);
+        up(&mut s, Message::AutoPull);
+        up(&mut s, Message::TitleCommit);
+        up(&mut s, Message::FocusSearch);
+        up(&mut s, Message::AutoPull);
+        up(&mut s, Message::SearchEscape);
+        assert_eq!(pulls(&mut rx), 0, "editing a row or the title, searching");
+        up(&mut s, Message::Push);
+        up(&mut s, Message::AutoPull);
+        assert_eq!(rx.try_recv().unwrap(), Cmd::Push);
+        assert_eq!(pulls(&mut rx), 0, "pushing");
+        up(&mut s, Message::WorkerGone);
+        s.last_error = None;
+        up(&mut s, Message::AutoPull);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Cmd::Pull {
+                id: "pg".into(),
+                force: false
+            }
+        );
+        // its answer is quiet: no error shown, a pending open kept
+        s.pending_open = Some("other".into());
+        up(
+            &mut s,
+            Message::Worker(Arc::new(Event::Error("500 boom".into()))),
+        );
+        assert_eq!(s.last_error, None);
+        assert_eq!(s.pending_open.as_deref(), Some("other"));
+        assert!(s.sent.is_empty() && !s.auto_pulling);
+        up(&mut s, Message::AutoPull);
+        assert_eq!(pulls(&mut rx), 0, "within 30 s of the last");
+        // offline: none at all
+        s.last_auto = None;
+        s.last_error = Some("offline: NOTION_TOKEN not set".into());
+        up(&mut s, Message::AutoPull);
+        assert_eq!(pulls(&mut rx), 0, "offline");
+        // no page open
+        let (mut s, mut rx) = state();
+        up(&mut s, Message::AutoPull);
+        assert_eq!(pulls(&mut rx), 0);
+        // window focus maps to it
+        assert!(matches!(
+            shortcut(
+                iced::Event::Window(iced::window::Event::Focused),
+                event::Status::Ignored,
+                iced::window::Id::unique()
+            ),
+            Some(Message::AutoPull)
+        ));
+    }
+
+    #[test]
+    fn sync_dots_problem_list_and_discard() {
+        let (mut s, mut rx) = editing_state();
+        sync::local_edit_text(&s.store, "a", "x").unwrap();
+        let bad = sync::local_edit_text(&s.store, "b", "y").unwrap();
+        s.store
+            .mark_op(bad, OpStatus::Conflict, Some("remote edited"))
+            .unwrap();
+        s.refresh();
+        assert_eq!(s.counts, [1, 1, 0]);
+        assert_eq!(s.queued_ids, HashSet::from(["a".to_string()]));
+        assert_eq!(s.problem_ids, HashSet::from(["b".to_string()]));
+        let p = &s.problems[0];
+        assert_eq!(
+            (
+                p.kind,
+                p.label.as_str(),
+                p.page.as_deref(),
+                p.error.as_str()
+            ),
+            ("edit", "y", Some("pg"), "remote edited")
+        );
+        let _ = crate::view::view(&s);
+
+        up(&mut s, Message::ToggleProblems);
+        assert!(s.problems_open);
+        let _ = crate::view::view(&s);
+        up(&mut s, Message::SearchEscape);
+        assert!(!s.problems_open, "Esc closes it");
+        up(&mut s, Message::ToggleProblems);
+        up(&mut s, Message::ToggleProblems);
+        assert!(!s.problems_open, "a second click closes it");
+
+        // a click opens the page and focuses the block
+        up(&mut s, Message::Open("a".into()));
+        up(&mut s, Message::ToggleProblems);
+        up(&mut s, Message::OpenProblem(bad));
+        assert!(!s.problems_open);
+        assert_eq!(s.current.as_deref(), Some("pg"));
+        assert_eq!(editing(&s), Some("b"));
+
+        up(&mut s, Message::Discard(bad));
+        assert!(s
+            .store
+            .ops_by_status(OpStatus::Conflict)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Cmd::Pull {
+                id: "pg".into(),
+                force: true
+            }
+        );
+        assert!(s.problems.is_empty() && s.problem_ids.is_empty());
+        assert_eq!(s.counts, [1, 0, 0]);
+        up(&mut s, Message::ToggleProblems);
+        assert!(!s.problems_open, "nothing to list");
+
+        // a failed create: listed, focused and dotted by its own block;
+        // Discard drops the local block and the ops on it too
+        let para = BlockKind::Paragraph(TextBlock {
+            rich_text: vec![RichText::plain("new")],
+            color: "default".into(),
+        });
+        let local = sync::local_create_block(&s.store, "a", None, para).unwrap();
+        s.refresh();
+        assert!(
+            s.queued_ids.contains(&local),
+            "its own row, not the parent's"
+        );
+        let op = s.store.queued_ops().unwrap().last().unwrap().id;
+        s.store.mark_op(op, OpStatus::Failed, Some("400")).unwrap();
+        s.refresh();
+        let p = &s.problems[0];
+        assert_eq!(
+            (p.kind, p.label.as_str(), p.block.as_str()),
+            ("create", "new", local.as_str())
+        );
+        assert_eq!(s.problem_ids, HashSet::from([local.clone()]));
+        // a later delete of it, queued: goes with the discard
+        let del = s
+            .store
+            .enqueue(
+                OpKind::DeleteBlock {
+                    block_id: local.clone(),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        up(&mut s, Message::Discard(op));
+        assert!(s.store.get_block(&local).unwrap().is_none());
+        assert!(s.store.queued_ops().unwrap().iter().all(|o| o.id != del));
     }
 }

@@ -9,7 +9,9 @@ use serde_json::{json, Value};
 
 use crate::api::{BlockNode, Client};
 use crate::markdown::split_runs;
-use crate::model::{Block, BlockKind, Page, Parent, RichText, TargetKind, TextBlock};
+use crate::model::{
+    Block, BlockKind, Page, Parent, PropertyValue, RichText, TargetKind, TextBlock,
+};
 use crate::ops::{Op, OpKind, OpStatus};
 use crate::store::{ts, Store};
 use crate::{Error, Result};
@@ -156,6 +158,8 @@ pub async fn pull_page(
         }
         store.replace_children(&page.id, &parent_id, &list)?;
     }
+    let mut page = page;
+    keep_queued_props(store, &mut page)?;
     store.upsert_page(&page)?;
     Ok(report)
 }
@@ -163,22 +167,15 @@ pub async fn pull_page(
 pub async fn pull_data_source(client: &Client, store: &Store, ds_id: &str) -> Result<PullReport> {
     let ds = client.get_data_source(ds_id).await?;
     store.upsert_data_source(&ds)?;
-    let mut pending = HashSet::new();
-    for op in store.queued_ops()? {
-        if let OpKind::UpdatePageProperties { page_id, .. } = &op.kind {
-            pending.insert(store.resolve_id(page_id)?);
-        }
-    }
     let rows = client.query_data_source(&ds.id, json!({})).await?;
     let mut report = PullReport {
         fetched: rows.len(),
         ..Default::default()
     };
-    for row in rows {
+    for mut row in rows {
         let cached = store.get_page(&row.id)?;
-        if cached.map(|c| c.last_edited_time) != Some(row.last_edited_time)
-            && !pending.contains(&row.id)
-        {
+        if cached.map(|c| c.last_edited_time) != Some(row.last_edited_time) {
+            keep_queued_props(store, &mut row)?;
             store.upsert_page(&row)?;
             report.updated += 1;
         }
@@ -357,10 +354,31 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
         } => {
             let id = store.resolve_id(page_id)?;
             let remote = client.get_page(&id).await?;
-            if let Some(c) = conflict(op, &id, remote.last_edited_time, own, |raw| {
-                Ok(serde_json::from_value::<Page>(raw.clone())?.properties == remote.properties)
-            })? {
-                return Ok(Outcome::Conflict(c));
+            // Any block edit bumps a page's last_edited_time, so the time says
+            // nothing here: only a remote change to a property this op writes
+            // is a conflict (base: our own write in this push, else the op's).
+            let base = match own.get(&id) {
+                Some((_, raw)) => Some(raw),
+                None => op.base_raw.as_ref(),
+            };
+            if let Some(base) = base {
+                let base: Page = serde_json::from_value(base.clone())?;
+                let changed: Vec<&String> = properties
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|o| o.keys())
+                    .filter(|k| base.properties.get(*k) != remote.properties.get(*k))
+                    .collect();
+                if !changed.is_empty() {
+                    return Ok(Outcome::Conflict(format!(
+                        "remote changed {}",
+                        changed
+                            .iter()
+                            .map(|k| k.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
             }
             let p = client.update_page_properties(&id, properties).await?;
             store.upsert_page(&p)?;
@@ -601,6 +619,102 @@ pub fn local_set_checked(store: &Store, block_id: &str, checked: bool) -> Result
     )
 }
 
+/// The queued UpdatePageProperties op for `page_id`, if any.
+fn queued_props(store: &Store, page_id: &str) -> Result<Option<Op>> {
+    for op in store.queued_ops()? {
+        if let OpKind::UpdatePageProperties { page_id: p, .. } = &op.kind {
+            if store.resolve_id(p)? == page_id {
+                return Ok(Some(op));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// A remote `page` keeps the cached values of the properties a queued
+/// UpdatePageProperties op will write; the rest is taken from remote.
+// ponytail: scans the queue per page; index by page id if queues get long
+fn keep_queued_props(store: &Store, page: &mut Page) -> Result<()> {
+    let Some(Op {
+        kind: OpKind::UpdatePageProperties { properties, .. },
+        ..
+    }) = queued_props(store, &page.id)?
+    else {
+        return Ok(());
+    };
+    let Some(cached) = store.get_page(&page.id)? else {
+        return Ok(());
+    };
+    for k in properties.as_object().into_iter().flat_map(|o| o.keys()) {
+        match cached.properties.get(k) {
+            Some(v) => page.properties.insert(k.clone(), v.clone()),
+            None => page.properties.remove(k),
+        };
+    }
+    // Keep the cached time too, so the pull after the op leaves the queue
+    // isn't skipped as "unchanged" while the cache still holds our title.
+    page.last_edited_time = cached.last_edited_time;
+    Ok(())
+}
+
+/// Sets a cached page's title (plain text) and queues
+/// `{"<title key>":{"title":[..]}}`, merged into this page's queued property
+/// update if there is one. Returns the op id.
+pub fn local_set_title(store: &Store, page_id: &str, title: &str) -> Result<i64> {
+    let base = store
+        .get_page(page_id)?
+        .ok_or_else(|| Error::Invalid(format!("page {page_id} not cached")))?;
+    let key = base
+        .properties
+        .iter()
+        .find(|(_, v)| matches!(v, PropertyValue::Title(_)))
+        .map(|(k, _)| k.clone())
+        .ok_or_else(|| Error::Invalid(format!("page {page_id} has no title property")))?;
+    let runs = if title.is_empty() {
+        Vec::new()
+    } else {
+        split_runs(vec![RichText::plain(title)])
+    };
+    let body: Vec<Value> = runs
+        .iter()
+        .map(|r| json!({ "type": "text", "text": { "content": r.plain_text } }))
+        .collect();
+    let mut page = base.clone();
+    page.properties
+        .insert(key.clone(), PropertyValue::Title(runs));
+    store.atomic(|| {
+        store.upsert_page(&page)?;
+        if let Some(Op {
+            id,
+            kind:
+                OpKind::UpdatePageProperties {
+                    page_id,
+                    mut properties,
+                },
+            ..
+        }) = queued_props(store, &page.id)?
+        {
+            properties[&key] = json!({ "title": body });
+            store.update_op_kind(
+                id,
+                &OpKind::UpdatePageProperties {
+                    page_id,
+                    properties,
+                },
+            )?;
+            return Ok(id);
+        }
+        store.enqueue(
+            OpKind::UpdatePageProperties {
+                page_id: page.id.clone(),
+                properties: json!({ key: { "title": body } }),
+            },
+            Some(base.last_edited_time),
+            Some(serde_json::to_value(&base)?),
+        )
+    })
+}
+
 /// (placed block, parent, after) of an op that puts a block somewhere.
 fn placement(k: &OpKind) -> Option<(&str, &str, Option<&str>)> {
     match k {
@@ -623,7 +737,7 @@ fn placement(k: &OpKind) -> Option<(&str, &str, Option<&str>)> {
 }
 
 /// The block an op is about (for a create: the block it creates).
-fn op_block(k: &OpKind) -> Option<&str> {
+pub fn op_block(k: &OpKind) -> Option<&str> {
     match k {
         OpKind::CreateBlock { block, .. } => block["id"].as_str(),
         OpKind::UpdateBlock { block_id, .. }
@@ -982,6 +1096,14 @@ mod tests {
         })
     }
 
+    /// page() under "root" with title `t`.
+    fn titled(id: &str, time: &str, t: &str) -> Value {
+        let mut v = page(id, pp("root"), time);
+        v["properties"]["Name"]["title"] = json!([{ "type": "text", "text": { "content": t },
+            "plain_text": t, "annotations": {} }]);
+        v
+    }
+
     fn ok(v: Value) -> ResponseTemplate {
         ResponseTemplate::new(200).set_body_json(v)
     }
@@ -1284,7 +1406,8 @@ mod tests {
                 .unwrap();
         }
         get(&s, "/v1/pages/r", ok(page("r", pp("root"), T))).await;
-        get(&s, "/v1/pages/q", ok(page("q", pp("root"), T2))).await; // edited remotely
+        // its title edited remotely
+        get(&s, "/v1/pages/q", ok(titled("q", T2, "Other"))).await;
         Mock::given(method("PATCH"))
             .and(path("/v1/pages/r"))
             .and(body_string_contains("New"))
@@ -1312,6 +1435,145 @@ mod tests {
             T2
         );
         assert_eq!(store.ops_by_status(OpStatus::Conflict).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn local_set_title_uses_the_title_key_and_rewrites_its_op() {
+        let store = Store::open_in_memory().unwrap();
+        let p: Page = serde_json::from_value(page("p", pp("root"), T)).unwrap();
+        store.upsert_page(&p).unwrap();
+        let id = local_set_title(&store, "p", "One").unwrap();
+        let cached = store.get_page("p").unwrap().unwrap();
+        assert_eq!(cached.title(), "One");
+        assert_eq!(store.page_tree().unwrap()[0].title, "One");
+        // the base stays the pulled page
+        assert_eq!(ts(&cached.last_edited_time), T);
+        let id2 = local_set_title(&store, "p", "Two").unwrap();
+        assert_eq!(id, id2);
+        let ops = store.queued_ops().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(
+            ops[0].kind,
+            OpKind::UpdatePageProperties {
+                page_id: "p".into(),
+                properties: json!({ "Name": { "title": [
+                    { "type": "text", "text": { "content": "Two" } }] } }),
+            }
+        );
+        assert_eq!(
+            ops[0].base_raw.as_ref(),
+            Some(&serde_json::to_value(&p).unwrap())
+        );
+        assert!(local_set_title(&store, "nope", "x").is_err());
+    }
+
+    #[tokio::test]
+    async fn title_push_after_a_block_edit_is_not_a_conflict() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        local_edit_text(&store, "b", "x").unwrap();
+        local_set_title(&store, "p", "New").unwrap();
+
+        // a pull meanwhile keeps the local title, takes the rest from remote
+        let mut remote = page("p", pp("root"), T);
+        remote["properties"]["Note"] = json!({ "id": "n", "type": "rich_text", "rich_text": [] });
+        get(&s, "/v1/pages/p", ok(remote)).await;
+        get(
+            &s,
+            "/v1/blocks/p/children",
+            list(vec![blk("b", pp("p"), "b", T, false)]),
+        )
+        .await;
+        pull_page(&client(&s), &store, "p", true).await.unwrap();
+        let cached = store.get_page("p").unwrap().unwrap();
+        assert_eq!(cached.title(), "New");
+        assert!(cached.properties.contains_key("Note"));
+        s.reset().await;
+
+        get(&s, "/v1/blocks/b", ok(blk("b", pp("p"), "b", T, false))).await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/b"))
+            .respond_with(ok(blk("b", pp("p"), "x", T2, false)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        // the block PATCH bumped the page's time; its properties are unchanged
+        get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
+        let done = titled("p", T2, "New");
+        Mock::given(method("PATCH"))
+            .and(path("/v1/pages/p"))
+            .and(body_partial_json(
+                json!({ "properties": { "Name": { "title": [
+                { "type": "text", "text": { "content": "New" } }] } } }),
+            ))
+            .respond_with(ok(done))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!(
+            r,
+            PushReport {
+                applied: 2,
+                conflicts: 0,
+                failed: 0
+            }
+        );
+        assert_eq!(store.get_page("p").unwrap().unwrap().title(), "New");
+        assert!(store.queued_ops().unwrap().is_empty());
+    }
+
+    /// Title op on seeded page "p" pushed against a remote page `remote`.
+    async fn push_title(s: &MockServer, store: &Store, remote: Value) -> PushReport {
+        local_set_title(store, "p", "New").unwrap();
+        get(s, "/v1/pages/p", ok(remote)).await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/pages/p"))
+            .respond_with(ok(titled("p", T2, "New")))
+            .mount(s)
+            .await;
+        push(&client(s), store).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn title_conflicts_only_on_a_remote_title_change() {
+        let report = |applied, conflicts| PushReport {
+            applied,
+            conflicts,
+            failed: 0,
+        };
+        // a delete in the same push: the block is gone from the cache
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        local_delete_block(&store, "b").unwrap();
+        get(&s, "/v1/blocks/b", ok(blk("b", pp("p"), "b", T, false))).await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/blocks/b"))
+            .respond_with(ok(blk("b", pp("p"), "b", T2, false)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let r = push_title(&s, &store, page("p", pp("root"), T2)).await;
+        assert_eq!(r, report(2, 0));
+
+        // a block edited elsewhere since the pull bumped the page's time
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        let r = push_title(&s, &store, page("p", pp("root"), T2)).await;
+        assert_eq!(r, report(1, 0));
+        assert_eq!(store.get_page("p").unwrap().unwrap().title(), "New");
+
+        // the title itself changed remotely
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        let r = push_title(&s, &store, titled("p", T2, "Theirs")).await;
+        assert_eq!(r, report(0, 1));
+        let c = store.ops_by_status(OpStatus::Conflict).unwrap();
+        assert_eq!(c[0].error.as_deref(), Some("remote changed Name"));
     }
 
     #[tokio::test]
