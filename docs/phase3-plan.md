@@ -81,3 +81,12 @@ I pulled all 164 pages shared with the integration into the cache. One failed wi
 1. **No request timeout in core.** A stalled connection leaves "syncing…" on screen until restart. On exit the app waits at most 10 s for it. Add a reqwest timeout in a later task.
 2. **The slash menu is off in equation and code rows**, so you can't turn them back into text from the editor yet (E2).
 3. **Editor parity is E2:** Enter and Backspace don't create or delete blocks yet. Tab indent, undo, keybinds, table cells and title editing are also still missing.
+
+## Known gaps after E2 (reviewed, deferred)
+1. **Shared `keys.json`:** the old Ctrl+Alt+0–9 keys from the iced app still work alongside Ctrl+Shift+0–9. Delete them from `~/.config/notion-client/keys.json` if you only want Notion's keys.
+2. **Ctrl+Minus on US layouts** also toggles the sidebar, a side effect of the Ctrl+ß workaround.
+3. **Tab always indents**, even if `keys.json` unbinds it.
+4. **Titles with formatting** (bold, colour, link) or mentions can't be edited in place, so they aren't flattened.
+5. **After undoing a block conversion** the editor loses focus.
+6. **No way back from the title** with ↓ or Enter.
+7. **Not clickable yet:** databases (F4) and links inside table cells.
