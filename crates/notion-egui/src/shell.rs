@@ -2,17 +2,18 @@
 //! and worker events, tabs, the switcher, the problem list, session and the
 //! frame. It mirrors notion-gui's `update()`; no editor features (E2).
 
+use std::collections::HashMap;
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Frame, Key, Margin, Modifiers, Ui, ViewportCommand};
-use notion_core::markdown::from_markdown;
-use notion_core::model::{BlockKind, PropertyValue, RichText, RichTextKind};
+use notion_core::markdown::{from_markdown, to_markdown};
+use notion_core::model::{plain_text, BlockKind, PropertyValue, RichText, RichTextKind};
 use notion_core::ops::OpStatus;
-use notion_core::sync;
+use notion_core::sync::{self, Skip};
 
 use crate::app::{blur_first, Action, App, Grab};
-use crate::outline::{self, Marker};
+use crate::outline::{self, Marker, Row};
 use crate::problems::{self, problem};
 use crate::session::{self, Session};
 use crate::switcher::{Out, Switcher};
@@ -22,10 +23,16 @@ use crate::worker::{Cmd, Event};
 use crate::keys::{self, Command};
 use crate::{sidebar, theme};
 
-/// Auto-pulls at most this often, however the focus flaps.
-const AUTO_PULL_GAP: Duration = Duration::from_secs(30);
-/// The auto-pull timer.
-pub const AUTO_PULL_EVERY: Duration = Duration::from_secs(300);
+/// The open page is polled this often, every other tab's page this often.
+pub const POLL_OPEN: Duration = Duration::from_secs(15);
+pub const POLL_BG: Duration = Duration::from_secs(60);
+/// A window that gains focus polls its page unless it was polled this lately.
+const FOCUS_GAP: Duration = Duration::from_secs(5);
+/// Notion's edit time has minute precision, so a poll of a recently edited
+/// page pulls in full even if the time is unchanged: at most this often per page.
+const FULL_MIN: Duration = Duration::from_secs(60);
+/// How long a block a poll changed stays tinted.
+pub const FLASH: Duration = Duration::from_secs(2);
 /// The workspace's users are pulled again this often (they rarely change).
 pub const USERS_EVERY: Duration = Duration::from_secs(3600);
 /// The least time between on-demand user pulls (`@` menu, switcher).
@@ -34,12 +41,6 @@ const USERS_MIN: Duration = Duration::from_secs(60);
 /// How long closing waits for the worker (a stalled request has no timeout).
 const WORKER_JOIN: Duration = Duration::from_secs(10);
 pub const SESSION_FILE: &str = "session-egui.json";
-
-/// Whether an auto-pull may run: idle (see [`App::idle`]) and none in the
-/// last [`AUTO_PULL_GAP`] (`since_last`: time since the last one, if any).
-pub fn auto_pull_due(since_last: Option<Duration>, idle: bool) -> bool {
-    idle && since_last.is_none_or(|d| d >= AUTO_PULL_GAP)
-}
 
 impl App {
     // ------------------------------------------------------------ store
@@ -324,13 +325,28 @@ impl App {
         }
     }
 
-    /// Nothing is being edited, searched or sent, and a page is open.
-    pub(crate) fn idle(&self) -> bool {
-        self.current.is_some()
-            && self.sent.is_empty()
-            && self.focus.is_none()
-            && self.title_edit.is_none()
-            && self.switcher.is_none()
+    /// A poll must wait: a command is in flight, the switcher, title editor or
+    /// a menu is open, we are offline, or the worker is gone. Editing a block
+    /// does not block it.
+    fn poll_blocked(&self) -> bool {
+        self.worker_gone
+            || !self.sent.is_empty()
+            || self.title_edit.is_some()
+            || self.switcher.is_some()
+            || self.focus.as_ref().is_some_and(|f| f.menu.is_some())
+            || self.offline()
+    }
+
+    /// The pages to poll with their period: the open one, then the other
+    /// tabs' (once each).
+    fn poll_pages(&self) -> Vec<(String, Duration)> {
+        let mut v: Vec<(String, Duration)> = self.current.iter().map(|p| (p.clone(), POLL_OPEN)).collect();
+        for (i, t) in self.tabs.iter().enumerate() {
+            if let Some(p) = t.page.as_ref().filter(|p| i != self.active && v.iter().all(|(q, _)| q != *p)) {
+                v.push((p.clone(), POLL_BG));
+            }
+        }
+        v
     }
 
     /// Ctrl+S. A failed commit keeps the editor; pushing now would lose the
@@ -359,7 +375,6 @@ impl App {
                     if !self.worker_gone {
                         self.worker_gone = true;
                         self.sent.clear();
-                        self.auto_pulling = false;
                         self.last_error.get_or_insert("sync worker stopped".into());
                     }
                     break;
@@ -370,17 +385,22 @@ impl App {
 
     /// The worker answers each command with one event, in order.
     pub(crate) fn on_event(&mut self, ev: Event) {
-        // pushed ops can't be undone, nor edits a pull rewrote under them
+        // pushed ops can't be undone, nor edits a pull rewrote under them; a
+        // poll clears only what it changed (see `on_poll`)
         let pulled = matches!(&ev, Event::Pulled { report, .. } if !report.skipped);
         let answered = self.sent.pop_front();
-        if answered == Some(Cmd::Push) || pulled {
+        let poll = matches!(answered, Some(Cmd::Poll { .. }));
+        if answered == Some(Cmd::Push) || (pulled && !poll) {
             self.undo.clear();
             self.redo.clear();
         }
-        // auto-pulls only start with nothing in flight: this answers it
-        if std::mem::take(&mut self.auto_pulling) {
-            // quiet: no error shown or cleared, pending opens kept
-            self.refresh();
+        if let Event::Pulled { id, report } = &ev {
+            if !report.skipped {
+                self.full_at.insert(id.clone(), Instant::now());
+            }
+        }
+        if poll {
+            self.on_poll(ev);
             return;
         }
         match ev {
@@ -449,6 +469,53 @@ impl App {
                 self.refresh();
                 self.info = None;
                 self.last_error = Some(e);
+            }
+        }
+    }
+
+    /// A poll's answer, quietly: no message, pending open or `current` touched.
+    /// A skipped poll changed nothing. A pulled one drops the undo steps of
+    /// its page only if the page really changed, tints the changed blocks and
+    /// re-seeds a focused block the user has not typed in. A dirty buffer is
+    /// never touched (its edit was written before the poll, see `poll_flush`).
+    fn on_poll(&mut self, ev: Event) {
+        let (id, report) = match ev {
+            Event::Pulled { id, report } if !report.skipped => (id, report),
+            // back off as for any command
+            Event::Error(e) if e.starts_with("offline") => {
+                self.last_error = Some(e);
+                return;
+            }
+            _ => return,
+        };
+        let old = self.rows.clone();
+        self.refresh();
+        let here = self.current.as_ref() == Some(&id);
+        let changed = if here { changed_ids(&old, &self.rows) } else { Vec::new() };
+        let moved = here && old.iter().map(|r| &r.block_id).ne(self.rows.iter().map(|r| &r.block_id));
+        if report.updated > 0 || !changed.is_empty() || moved {
+            self.undo.retain(|(p, _)| *p != id);
+            self.redo.retain(|(p, _)| *p != id);
+        }
+        let until = Instant::now() + FLASH;
+        self.flash.extend(changed.iter().map(|b| (b.clone(), until)));
+        // typed in since the poll was sent: the buffer stays, but the push
+        // would write it over the remote edit
+        if self.focus.as_ref().is_some_and(|f| f.text != f.original && changed.contains(&f.block_id)) {
+            self.info = Some("this block was edited in Notion meanwhile — your push may overwrite it".into());
+        }
+        // a clean editor on a changed block would write its stale text over
+        // the remote edit with the new base: show the new text (egui clamps
+        // the cursor); a table cell is simply closed
+        if self.focus.as_ref().is_some_and(|f| f.text == f.original && changed.contains(&f.block_id)) {
+            let f = self.focus.as_mut().expect("checked");
+            match self.rows.get(f.idx).filter(|_| f.cell.is_none()) {
+                Some(r) => {
+                    f.code = r.marker == Marker::Equation || matches!(r.marker, Marker::Code(_));
+                    let t = if f.code { plain_text(&r.rich_text) } else { to_markdown(&r.rich_text) };
+                    (f.prev_len, f.original, f.text) = (t.len(), t.clone(), t);
+                }
+                None => self.focus = None,
             }
         }
     }
@@ -782,26 +849,97 @@ impl App {
         }
     }
 
-    /// Auto-pull: on the timer and when the window gains focus; never while
-    /// editing, searching or with a command in flight, nor while offline.
-    pub(crate) fn auto_pull_at(&mut self, now: Instant, gained_focus: bool) {
-        let tick = now >= self.next_tick;
-        if tick {
-            self.next_tick = now + AUTO_PULL_EVERY;
-        }
-        if !(tick || gained_focus) {
+    /// Polls one due page, the open one first: every [`POLL_OPEN`], the other
+    /// tabs' every [`POLL_BG`], and the open one when the window gains focus.
+    /// A poll is one request unless the page changed (see [`Skip`]). It runs
+    /// while a block is edited: the edit is written first, so the pull keeps
+    /// it (queued edits survive a pull) and a remote change to that block is
+    /// a conflict at push; the editor's buffer and cursor are never touched.
+    /// Pages seen for the first time wait a period (startup pulls go first).
+    pub(crate) fn poll_at(&mut self, now: Instant, gained_focus: bool) {
+        let open = self.current.clone();
+        let due = self.poll_pages().into_iter().find(|(id, every)| {
+            let focus = gained_focus && open.as_ref() == Some(id);
+            let first = if focus { now.checked_sub(FOCUS_GAP).unwrap_or(now) } else { now };
+            let last = *self.polled.entry(id.clone()).or_insert(first);
+            now.saturating_duration_since(last) >= if focus { FOCUS_GAP } else { *every }
+        });
+        let Some((id, _)) = due.filter(|_| !self.poll_blocked()) else {
+            return;
+        };
+        self.polled.insert(id.clone(), now);
+        if open.as_ref() == Some(&id) && !self.poll_flush() {
             return;
         }
-        let offline = self
-            .last_error
-            .as_deref()
-            .is_some_and(|e| e.starts_with("offline"));
-        let due = !offline && auto_pull_due(self.last_auto.map(|t| now - t), self.idle());
-        if let Some(id) = self.current.clone().filter(|_| due) {
-            self.last_auto = Some(now);
-            self.send(Cmd::Pull { id, force: false });
-            self.auto_pulling = !self.sent.is_empty();
+        let full_due = self.full_at.get(&id).is_none_or(|t| now.saturating_duration_since(*t) >= FULL_MIN);
+        let skip = if full_due { sync::poll_settle() } else { Skip::IfUnchanged };
+        self.send(Cmd::Poll { id, skip });
+    }
+
+    /// [`flush`](Self::flush) for a poll. Typing in one block for a minute
+    /// must stay one undo step, so a flush that follows the previous poll
+    /// flush with no other step in between replaces that step: it is redone
+    /// from the older checkpoint.
+    fn poll_flush(&mut self) -> bool {
+        let focus = self.focus.as_ref().filter(|f| f.text != f.original);
+        let key = self.current.clone().zip(focus).map(|(p, f)| (p, f.block_id.clone(), f.cell.clone()));
+        let Some(key) = key.filter(|_| !self.stepping) else {
+            return self.flush();
+        };
+        let page = key.0.clone();
+        // the same page, block and cell, and nothing else since
+        let kept = self.poll_cp.take().filter(|(k, _, step)| *k == key && self.undo.last() == Some(step));
+        let old = kept.as_ref().and_then(|_| self.undo.pop());
+        let cp = match kept {
+            Some((_, cp, _)) => cp,
+            None => match sync::checkpoint(&self.store, &[&page]) {
+                Ok(cp) => cp,
+                Err(e) => {
+                    self.last_error = Some(format!("undo: {e}"));
+                    return self.flush();
+                }
+            },
+        };
+        let before = self.undo.len();
+        let ok = self.flush();
+        let pushed = self.undo.len() == before + 1;
+        match (cp.changes(&self.store), pushed) {
+            (Ok(Some(c)), true) => {
+                let step = (page, c);
+                *self.undo.last_mut().expect("just pushed") = step.clone();
+                self.poll_cp = Some((key, cp, step));
+            }
+            (_, pushed) => {
+                if let Some(old) = old {
+                    // the old step stands, below the new one if there is one
+                    let new = pushed.then(|| self.undo.pop()).flatten();
+                    self.poll_cp = (new.is_none()).then(|| (key, cp, old.clone()));
+                    self.undo.push(old);
+                    self.undo.extend(new);
+                }
+            }
         }
+        ok
+    }
+
+    /// Drops ended highlights.
+    pub(crate) fn expire_flash(&mut self, now: Instant) {
+        self.flash.retain(|_, until| *until > now);
+    }
+
+    /// How long until the frame loop must run again: the next poll or the end
+    /// of a highlight. A poll that is due but blocked is retried every second.
+    fn next_wake(&self, now: Instant) -> Duration {
+        let polls = if self.worker_gone || self.offline() {
+            POLL_OPEN
+        } else {
+            let due = |(id, every): (String, Duration)| {
+                (self.polled.get(&id).map_or(now, |t| *t + every)).saturating_duration_since(now)
+            };
+            self.poll_pages().into_iter().map(due).min().unwrap_or(POLL_BG).max(Duration::from_secs(1))
+        };
+        let ends = self.flash.values().map(|t| t.saturating_duration_since(now));
+        ends.chain([polls]).min().unwrap_or(polls)
     }
 
     /// One frame (split from `App::ui` so tests can drive it without a window).
@@ -820,9 +958,10 @@ impl App {
         let gained = focused && !self.was_focused;
         self.was_focused = focused;
         let now = Instant::now();
-        self.auto_pull_at(now, gained);
+        self.poll_at(now, gained);
         self.users_tick(now);
-        ctx.request_repaint_after(self.next_tick.saturating_duration_since(now));
+        self.expire_flash(now);
+        ctx.request_repaint_after(self.next_wake(now));
         let title = self.window_title();
         if title != self.shown_title {
             ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
@@ -933,6 +1072,20 @@ impl App {
     }
 }
 
+/// Rows that are new or whose text or type changed (a list number shifting
+/// is not a change).
+fn changed_ids(old: &[Row], new: &[Row]) -> Vec<String> {
+    let old: HashMap<&str, &Row> = old.iter().map(|r| (r.block_id.as_str(), r)).collect();
+    let same = |a: &Marker, b: &Marker| a == b || matches!((a, b), (Marker::Number(_), Marker::Number(_)));
+    new.iter()
+        .filter(|n| {
+            old.get(n.block_id.as_str())
+                .is_none_or(|o| o.rich_text != n.rich_text || !same(&o.marker, &n.marker))
+        })
+        .map(|r| r.block_id.clone())
+        .collect()
+}
+
 /// Joins `h` if it ends within `wait`, else leaves it running: the process
 /// exit takes it down.
 fn join_within(h: std::thread::JoinHandle<()>, wait: Duration) {
@@ -968,73 +1121,359 @@ mod tests {
     use notion_core::model::{plain_text, Block, BlockKind, TargetKind};
     use notion_core::store::Store;
     use notion_core::sync::PullReport;
+    use crate::tabs::Tab;
+    use crate::switcher::Switcher;
 
-    fn secs(n: u64) -> Option<Duration> {
-        Some(Duration::from_secs(n))
+    fn skipped(id: &str) -> Event {
+        Event::Pulled {
+            id: id.into(),
+            report: PullReport { skipped: true, ..Default::default() },
+        }
     }
 
-    /// The iced rule, verbatim: idle, and not twice within the gap.
-    #[test]
-    fn auto_pull_rule() {
-        assert!(auto_pull_due(None, true));
-        assert!(auto_pull_due(secs(30), true));
-        assert!(!auto_pull_due(secs(29), true), "focus flapping");
-        assert!(!auto_pull_due(None, false));
+    fn changed(id: &str) -> Event {
+        Event::Pulled {
+            id: id.into(),
+            report: PullReport { fetched: 1, updated: 1, skipped: false },
+        }
     }
 
+    fn poll(id: &str, skip: Skip) -> Cmd {
+        Cmd::Poll { id: id.into(), skip }
+    }
+
+    /// A window with page "p" open and a background tab on each of `bg`.
+    fn with_tabs(bg: &[&str]) -> Win {
+        let mut w = Win::with_texts(&["a", "b"]);
+        for id in bg {
+            w.app.tabs.push(Tab { page: Some(id.to_string()), ..Default::default() });
+        }
+        w
+    }
+
+    /// Polls once a second for 5 minutes, answering every poll "unchanged":
+    /// the open page every 15 s, each other tab every 60 s. That is
+    /// 4 + 4 requests a minute for five tabs, nowhere near Notion's 180
+    /// (the client's limiter caps the bursts, see core's `limiter_caps_a_minute_for_any_number_of_callers`).
     #[test]
-    fn auto_pull_on_focus_and_timer_only_when_idle() {
+    fn polls_the_open_page_every_15s_and_the_other_tabs_every_60s() {
+        let mut w = with_tabs(&["q1", "q2", "q3", "q4"]);
+        let t0 = w.app.polled["p"];
+        let mut polls: Vec<(u64, String)> = Vec::new();
+        for t in 0..=300 {
+            // five times a second: every page can be due at once
+            for _ in 0..5 {
+                w.app.poll_at(t0 + Duration::from_secs(t), false);
+                for c in w.cmds() {
+                    let Cmd::Poll { id, .. } = c else { panic!("{c:?}") };
+                    polls.push((t, id.clone()));
+                    w.app.on_event(skipped(&id));
+                }
+            }
+        }
+        let of = |id: &str| polls.iter().filter(|p| p.1 == id).map(|p| p.0).collect::<Vec<_>>();
+        assert_eq!(of("p"), (1..=20).map(|n| n * 15).collect::<Vec<_>>());
+        for q in ["q1", "q2", "q3", "q4"] {
+            assert_eq!(of(q), [60, 120, 180, 240, 300], "{q}");
+        }
+        assert_eq!(polls.len(), 40, "8 a minute");
+    }
+
+    /// A page edited in the last two minutes is pulled in full by a poll, but
+    /// not twice within a minute: the second poll may skip on an unchanged time.
+    #[test]
+    fn a_page_is_pulled_in_full_at_most_once_a_minute_by_polls() {
         let mut w = Win::with_texts(&["a"]);
-        let t0 = Instant::now();
-        // nothing: no focus gain, no tick
-        w.app.auto_pull_at(t0, false);
-        assert!(w.cmds().is_empty());
-        // focus gained: pulls the open page, quietly
-        w.app.auto_pull_at(t0, true);
-        assert_eq!(
-            w.cmds(),
-            [Cmd::Pull {
-                id: "p".into(),
-                force: false
-            }]
-        );
-        assert!(w.app.auto_pulling);
-        // its answer is quiet and clears the flag
-        w.answer(Event::Error("boom".into()));
-        assert!(!w.app.auto_pulling);
-        assert_eq!(w.app.last_error, None, "auto-pull errors are not shown");
-        // flapping focus inside the gap: nothing
-        w.app.auto_pull_at(t0 + Duration::from_secs(10), true);
-        assert!(w.cmds().is_empty());
-        // the 5 min timer
-        w.app.auto_pull_at(t0 + AUTO_PULL_EVERY + AUTO_PULL_EVERY, false);
-        assert_eq!(w.cmds().len(), 1);
-        w.answer(Event::Pulled {
-            id: "p".into(),
-            report: PullReport::default(),
-        });
-        // never while editing, or with a command in flight
-        let later = t0 + Duration::from_secs(10_000);
-        w.edit(0);
-        w.app.auto_pull_at(later, true);
-        assert!(w.cmds().is_empty(), "editing");
-        w.app.commit();
+        let t0 = w.app.polled["p"];
+        let at = |w: &mut Win, s: u64| {
+            w.app.poll_at(t0 + Duration::from_secs(s), false);
+            w.cmds()
+        };
+        assert_eq!(at(&mut w, 15), [poll("p", sync::poll_settle())]);
+        w.app.on_event(changed("p"));
+        for s in [30, 45] {
+            assert_eq!(at(&mut w, s), [poll("p", Skip::IfUnchanged)], "{s}");
+            w.app.on_event(skipped("p"));
+        }
+        assert_eq!(at(&mut w, 75), [poll("p", sync::poll_settle())], "a minute on");
+    }
+
+    #[test]
+    fn polls_wait_for_everything_else_and_never_double_up() {
+        let mut w = with_tabs(&["q"]);
+        let t0 = w.app.polled["p"];
+        let due = t0 + POLL_BG * 10;
+        // a command in flight, the switcher, the title editor, offline, no worker
         w.app.sent.push_back(Cmd::Search(String::new()));
-        w.app.auto_pull_at(later, true);
-        assert!(w.cmds().is_empty(), "in flight");
+        w.app.poll_at(due, false);
         w.app.sent.clear();
-        // offline: not again until something else clears the message
+        w.app.switcher = Some(Switcher::default());
+        w.app.poll_at(due, false);
+        w.app.switcher = None;
         w.app.last_error = Some("offline: NOTION_TOKEN not set".into());
-        w.app.auto_pull_at(later, true);
-        assert!(w.cmds().is_empty(), "offline");
+        w.app.poll_at(due, false);
+        w.app.last_error = None;
+        w.app.worker_gone = true;
+        w.app.poll_at(due, false);
+        w.app.worker_gone = false;
+        assert!(w.cmds().is_empty());
+        // free again: one poll, and while it is out no second one
+        w.app.poll_at(due, false);
+        w.app.poll_at(due + POLL_BG, false);
+        w.app.poll_at(due + POLL_BG * 2, true);
+        assert_eq!(w.cmds(), [poll("p", sync::poll_settle())]);
+        assert_eq!(w.app.sent.len(), 1);
     }
 
     #[test]
-    fn window_gaining_focus_triggers_the_auto_pull_in_a_frame() {
+    fn a_poll_runs_while_editing_and_leaves_buffer_and_cursor_alone() {
+        let mut w = Win::with_texts(&["a", "b"]);
+        let t0 = w.app.polled["p"];
+        w.edit(1);
+        w.type_text("!");
+        w.select(1, 1);
+        let id = crate::app::edit_id("p-1");
+        let cursor = |w: &Win| egui::text_edit::TextEditState::load(&w.ctx, id).unwrap().cursor.char_range();
+        let before = cursor(&w);
+        w.app.poll_at(t0 + POLL_OPEN, false);
+        assert_eq!(w.cmds(), [poll("p", sync::poll_settle())]);
+        // the edit was written first, so the pull keeps it (queued edits survive)
+        assert_eq!(w.queued(), 1);
+        // the remote changed the other block and the edited one
+        let kid = |id: &str, t: &str| {
+            crate::outline::tests::blk(id, "p", "paragraph", serde_json::json!({ "rich_text": crate::outline::tests::rt(t) }))
+        };
+        w.app.store.put_block(&kid("p-0", "remote")).unwrap();
+        w.answer(changed("p"));
+        assert_eq!(w.row_text("p-0"), "remote");
+        assert_eq!(w.text(), "b!");
+        assert_eq!(w.app.focus.as_ref().unwrap().idx, 1);
+        assert_eq!(cursor(&w), before);
+        // still typing into the same buffer, at the same cursor
+        w.type_text("?");
+        assert_eq!(w.text(), "b?!");
+        // a menu open: the poll waits
+        w.app.polled.insert("p".into(), t0);
+        w.type_text(" /");
+        w.app.poll_at(t0 + POLL_OPEN * 4, false);
+        assert!(w.menu().is_some() && w.cmds().is_empty());
+    }
+
+    #[test]
+    fn a_poll_highlights_only_changed_blocks_and_only_for_a_while() {
+        let mut w = Win::with_texts(&["a", "b", "c"]);
+        let t0 = w.app.polled["p"];
+        let put = |w: &Win, id: &str, t: &str| {
+            let b = crate::outline::tests::blk(id, "p", "paragraph", serde_json::json!({ "rich_text": crate::outline::tests::rt(t) }));
+            w.app.store.put_block(&b).unwrap();
+        };
+        // a pull the user started highlights nothing
+        w.app.pull(false);
+        put(&w, "p-0", "pulled");
+        w.answer(changed("p"));
+        assert!(w.app.flash.is_empty());
+        // a poll that skipped changes nothing
+        w.app.poll_at(t0 + POLL_OPEN, false);
+        w.answer(skipped("p"));
+        assert!(w.app.flash.is_empty());
+        // a poll that pulled: p-1 changed, p-2 did not
+        w.app.poll_at(t0 + POLL_OPEN * 2, false);
+        put(&w, "p-1", "B2");
+        w.answer(changed("p"));
+        assert_eq!(w.app.flash.keys().collect::<Vec<_>>(), ["p-1"]);
+        assert!(w.app.next_wake(Instant::now()) <= FLASH, "wakes for the end");
+        let end = Instant::now() + FLASH;
+        w.app.expire_flash(end - Duration::from_millis(100));
+        assert_eq!(w.app.flash.len(), 1);
+        w.app.expire_flash(end + Duration::from_millis(100));
+        assert!(w.app.flash.is_empty());
+        w.frames(vec![]); // drawn with a tint without trouble
+    }
+
+    /// Puts block `id` of page "p" in the store with text `t`.
+    fn put(w: &Win, id: &str, t: &str) {
+        let b = crate::outline::tests::blk(id, "p", "paragraph", serde_json::json!({ "rich_text": crate::outline::tests::rt(t) }));
+        w.app.store.put_block(&b).unwrap();
+    }
+
+    /// Polls "p" at `t0 + s` and answers with `ev`.
+    fn poll_answered(w: &mut Win, t0: Instant, s: u64, ev: Event) {
+        w.app.poll_at(t0 + Duration::from_secs(s), false);
+        assert_eq!(w.cmds().len(), 1);
+        w.answer(ev);
+    }
+
+    #[test]
+    fn polls_clear_undo_only_for_a_page_that_really_changed() {
+        let mut w = with_tabs(&["q"]);
+        let t0 = w.app.polled["p"];
+        w.edit(0);
+        w.type_text("x");
+        w.app.commit();
+        assert_eq!(w.app.undo.len(), 1);
+        // a full poll that finds nothing new keeps the steps
+        let same = PullReport { fetched: 2, updated: 0, skipped: false };
+        poll_answered(&mut w, t0, 15, Event::Pulled { id: "p".into(), report: same });
+        assert_eq!(w.app.undo.len(), 1);
+        // another tab changed: not this page's steps
+        w.app.sent.push_back(poll("q", Skip::Never));
+        w.app.on_event(changed("q"));
+        assert_eq!(w.app.undo.len(), 1);
+        // this page changed: its steps go
+        put(&w, "p-1", "B2");
+        poll_answered(&mut w, t0, 30, changed("p"));
+        assert!(w.app.undo.is_empty() && w.app.redo.is_empty());
+    }
+
+    #[test]
+    fn polls_while_typing_make_one_undo_step_until_a_commit_ends_it() {
         let mut w = Win::with_texts(&["a"]);
+        let t0 = w.app.polled["p"];
+        w.edit(0);
+        w.type_text("1");
+        poll_answered(&mut w, t0, 15, skipped("p"));
+        assert_eq!(w.app.undo.len(), 1);
+        w.type_text("2");
+        poll_answered(&mut w, t0, 30, skipped("p"));
+        assert_eq!(w.app.undo.len(), 1, "same step (each flush still queues its own op)");
+        // nothing typed: the step stands
+        poll_answered(&mut w, t0, 45, skipped("p"));
+        assert_eq!(w.app.undo.len(), 1);
+        // typing after the last poll, then an explicit commit: a step of its own
+        w.type_text("3");
+        w.app.commit();
+        assert_eq!(w.app.undo.len(), 2);
+        // and a later poll flush does not join that one
+        w.edit(0);
+        w.type_text("4");
+        poll_answered(&mut w, t0, 60, skipped("p"));
+        assert_eq!(w.app.undo.len(), 3);
+        w.app.undo_redo(true);
+        w.app.undo_redo(true);
+        w.app.undo_redo(true);
+        assert_eq!(w.row_text("p-0"), "a", "the typing session of 1 and 2 is one step");
+    }
+
+    #[test]
+    fn a_clean_editor_on_a_remotely_changed_block_shows_the_new_text() {
+        let mut w = Win::with_texts(&["a", "b"]);
+        let t0 = w.app.polled["p"];
+        w.edit(1);
+        put(&w, "p-1", "remote");
+        poll_answered(&mut w, t0, 15, changed("p"));
+        assert_eq!((w.text(), w.app.focus.as_ref().unwrap().original.as_str()), ("remote", "remote"));
+        assert_eq!(w.queued(), 0, "nothing written");
+        // typing continues from the new text, and its base is the new version
+        w.type_text("!");
+        assert!(w.text().contains('!') && w.text().len() == 7);
+        // a block typed in is not re-seeded: its edit was written, the cache kept it
+        let mut w = Win::with_texts(&["a", "b"]);
+        let t0 = w.app.polled["p"];
+        w.edit(1);
+        w.type_text("!");
+        put(&w, "p-1", "remote");
+        poll_answered(&mut w, t0, 15, changed("p"));
+        assert_eq!(w.text(), "b!");
+    }
+
+    #[test]
+    fn a_poll_flush_never_merges_into_another_page_or_block() {
+        let mut w = with_tabs(&["q"]);
+        add_page(&w.app.store, "q", None, &["x"]);
+        let t0 = w.app.polled["p"];
+        w.edit(0);
+        w.type_text("1");
+        poll_answered(&mut w, t0, 15, skipped("p"));
+        assert_eq!(w.app.undo.len(), 1);
+        // another block of the same page: a step of its own
+        w.edit(1);
+        w.type_text("2");
+        poll_answered(&mut w, t0, 30, skipped("p"));
+        assert_eq!(w.app.undo.len(), 2);
+        // another page: A's steps stay, B's is filed under B
+        w.app.commit();
+        w.app.switch_tab(1);
+        assert_eq!(w.app.current.as_deref(), Some("q"));
+        w.app.polled.insert("q".into(), t0);
+        w.edit(0);
+        w.type_text("3");
+        w.app.poll_at(t0 + Duration::from_secs(100), false);
+        assert_eq!(w.cmds(), [poll("q", sync::poll_settle())]);
+        w.answer(skipped("q"));
+        let pages: Vec<&str> = w.app.undo.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(pages, ["p", "p", "q"]);
+    }
+
+    #[test]
+    fn a_typed_in_block_that_changed_remotely_warns_and_a_reseed_follows_the_kind() {
+        let mut w = Win::with_texts(&["a", "b"]);
+        let t0 = w.app.polled["p"];
+        w.edit(1);
+        w.app.poll_at(t0 + POLL_OPEN, false);
+        w.cmds();
+        w.type_text("!"); // after the poll was sent
+        put(&w, "p-1", "remote");
+        w.answer(changed("p"));
+        assert_eq!(w.text(), "b!", "the buffer stays");
+        assert!(w.app.info.as_deref().unwrap().contains("edited in Notion"));
+        // a clean editor on a block that became code is a code editor
+        let mut w = Win::with_texts(&["a"]);
+        let t0 = w.app.polled["p"];
+        w.edit(0);
+        let code = crate::outline::tests::blk(
+            "p-0",
+            "p",
+            "code",
+            serde_json::json!({ "rich_text": crate::outline::tests::rt("fn"), "language": "rust" }),
+        );
+        w.app.store.put_block(&code).unwrap();
+        poll_answered(&mut w, t0, 15, changed("p"));
+        let f = w.app.focus.as_ref().unwrap();
+        assert_eq!((f.code, f.text.as_str()), (true, "fn"));
+    }
+
+    #[test]
+    fn an_offline_poll_error_sets_the_message_other_errors_stay_quiet() {
+        let mut w = Win::with_texts(&["a"]);
+        let t0 = w.app.polled["p"];
+        poll_answered(&mut w, t0, 15, Event::Error("502 bad gateway".into()));
+        assert_eq!(w.app.last_error, None);
+        poll_answered(&mut w, t0, 30, Event::Error("offline: NOTION_TOKEN not set".into()));
+        assert!(w.app.offline());
+        w.app.poll_at(t0 + POLL_OPEN * 10, false);
+        assert!(w.cmds().is_empty(), "backed off");
+    }
+
+    #[test]
+    fn a_background_poll_changes_neither_the_page_nor_a_pending_open() {
+        let mut w = with_tabs(&["q"]);
+        let t0 = w.app.polled["p"];
+        w.app.poll_at(t0, false); // stamps q
+        w.app.poll_at(t0 + POLL_BG, false); // the open page first
+        w.app.on_event(skipped("p"));
+        w.app.pending_open = Some("remote".into());
+        w.app.poll_at(t0 + POLL_BG, false);
+        assert_eq!(w.cmds(), [poll("p", sync::poll_settle()), poll("q", sync::poll_settle())]);
+        w.app.on_event(changed("q"));
+        assert_eq!(w.app.current.as_deref(), Some("p"));
+        assert_eq!(w.app.pending_open.as_deref(), Some("remote"));
+        assert!(w.app.flash.is_empty() && w.app.last_error.is_none());
+    }
+
+    #[test]
+    fn focus_gain_polls_the_open_page_unless_it_was_just_polled() {
+        let mut w = Win::with_texts(&["a"]);
+        let t0 = w.app.polled["p"];
+        w.app.poll_at(t0 + Duration::from_secs(3), true);
+        assert!(w.cmds().is_empty(), "focus flapping");
+        w.app.poll_at(t0 + Duration::from_secs(6), true);
+        assert_eq!(w.cmds().len(), 1);
+        // in a frame
+        w.app.sent.clear();
+        w.app.polled.insert("p".into(), Instant::now() - Duration::from_secs(6));
         w.app.was_focused = false; // the window was in the background
         w.frames(vec![]);
-        assert_eq!(w.cmds().len(), 1, "focused again: one pull");
+        assert_eq!(w.cmds().len(), 1, "focused again: one poll");
         assert!(w.app.was_focused);
     }
 

@@ -165,7 +165,7 @@ impl App {
         }
     }
 
-    fn offline(&self) -> bool {
+    pub(crate) fn offline(&self) -> bool {
         self.last_error.as_deref().is_some_and(|e| e.starts_with("offline"))
     }
 

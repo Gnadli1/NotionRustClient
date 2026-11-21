@@ -54,14 +54,45 @@ fn dedupe_users(found: Vec<User>) -> Vec<User> {
     out
 }
 
+/// When a pull may skip the block fetch because the page's `last_edited_time`
+/// is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Skip {
+    Never,
+    IfUnchanged,
+    /// Notion's time has minute precision: an edit in the same minute as the
+    /// last pull looks unchanged. Skip only if the time is also older than this.
+    IfUnchangedAndOlder(chrono::Duration),
+}
+
+/// How old an unchanged `last_edited_time` must be for a poll to trust it.
+pub fn poll_settle() -> Skip {
+    Skip::IfUnchangedAndOlder(chrono::Duration::minutes(2))
+}
+
 pub async fn pull_page(
     client: &Client,
     store: &Store,
     page_id: &str,
     force: bool,
 ) -> Result<PullReport> {
+    let skip = if force { Skip::Never } else { Skip::IfUnchanged };
+    pull_page_skip(client, store, page_id, skip).await
+}
+
+pub async fn pull_page_skip(
+    client: &Client,
+    store: &Store,
+    page_id: &str,
+    skip: Skip,
+) -> Result<PullReport> {
     let page = client.get_page(page_id).await?;
-    if !force {
+    let settled = match skip {
+        Skip::Never => false,
+        Skip::IfUnchanged => true,
+        Skip::IfUnchangedAndOlder(age) => Utc::now() - page.last_edited_time >= age,
+    };
+    if settled {
         if let Some(cached) = store.get_page(&page.id)? {
             // a row cached by pull_data_source has no blocks yet: fetch them
             if cached.last_edited_time == page.last_edited_time
@@ -1765,6 +1796,68 @@ mod tests {
         assert_eq!(ids(&store.children("p").unwrap()), ["a", "b"]);
         assert_eq!(ids(&store.children("a").unwrap()), ["a1"]);
         assert!(store.get_page("p").unwrap().is_some());
+    }
+
+    /// Mounts the page at `time`; the block fetch must happen `n` times.
+    async fn serve_page(s: &MockServer, time: &str, text: &str, n: u64) {
+        s.reset().await;
+        get(s, "/v1/pages/p", ok(page("p", pp("root"), time))).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/blocks/p/children"))
+            .respond_with(list(vec![blk("a", pp("p"), text, time, false)]))
+            .expect(n)
+            .mount(s)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn poll_trusts_an_unchanged_time_only_when_it_is_old() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let c = client(&s);
+        // old: one request (the page), no block fetch
+        serve_page(&s, T, "A", 1).await;
+        pull_page(&c, &store, "p", false).await.unwrap();
+        serve_page(&s, T, "A", 0).await;
+        let r = pull_page_skip(&c, &store, "p", poll_settle()).await.unwrap();
+        assert!(r.skipped);
+        assert_eq!(s.received_requests().await.unwrap().len(), 1);
+        s.verify().await;
+
+        // recent: the same minute may hide an edit, so it is pulled in full...
+        let recent = (Utc::now() - chrono::Duration::seconds(20)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let store = Store::open_in_memory().unwrap();
+        serve_page(&s, &recent, "A", 1).await;
+        pull_page(&c, &store, "p", false).await.unwrap();
+        serve_page(&s, &recent, "B", 1).await;
+        let r = pull_page_skip(&c, &store, "p", poll_settle()).await.unwrap();
+        assert!(!r.skipped);
+        assert_eq!(text(&store, "a"), "B");
+        s.verify().await;
+        // ...unless the caller already did that lately (`IfUnchanged`)
+        serve_page(&s, &recent, "C", 0).await;
+        let r = pull_page_skip(&c, &store, "p", Skip::IfUnchanged).await.unwrap();
+        assert!(r.skipped);
+        s.verify().await;
+    }
+
+    /// A poll while the user edits a block that changed remotely: the queued
+    /// edit keeps its cached version and its old base, so the push says conflict.
+    #[tokio::test]
+    async fn poll_keeps_a_queued_edit_and_the_push_finds_the_conflict() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let c = client(&s);
+        seed(&s, &store, &["b"]).await;
+        local_edit_text(&store, "b", "mine").unwrap();
+        get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
+        get(&s, "/v1/blocks/p/children", list(vec![blk("b", pp("p"), "theirs", T2, false)])).await;
+        get(&s, "/v1/blocks/b", ok(blk("b", pp("p"), "theirs", T2, false))).await;
+        let r = pull_page_skip(&c, &store, "p", poll_settle()).await.unwrap();
+        assert_eq!((r.skipped, r.updated), (false, 1));
+        assert_eq!(text(&store, "b"), "mine");
+        let r = push(&c, &store).await.unwrap();
+        assert_eq!((r.applied, r.conflicts), (0, 1));
     }
 
     #[tokio::test]

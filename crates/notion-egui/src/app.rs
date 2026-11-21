@@ -172,6 +172,9 @@ pub(crate) type Opener = Box<dyn Fn(&str) -> Result<(), String>>;
 /// ((editor id, name), "Edited by X · 5 min ago") of the page header.
 pub(crate) type PageHead = (Option<(String, String)>, String);
 
+/// (page, block, table cell) of an edit.
+pub(crate) type PollKey = (String, String, Option<(String, usize)>);
+
 pub struct App {
     pub(crate) store: Store,
     /// None once the worker is shut down.
@@ -259,11 +262,16 @@ pub struct App {
     /// A standing note from the users pull (the 403); outlives other pulls.
     pub(crate) users_note: Option<String>,
     pub(crate) switcher: Option<Switcher>,
-    pub(crate) last_auto: Option<Instant>,
-    /// The command in flight is an auto-pull.
-    pub(crate) auto_pulling: bool,
+    /// When each open page was last polled (see [`App::poll_at`]).
+    pub(crate) polled: HashMap<String, Instant>,
+    /// When each page was last pulled in full, by anyone.
+    pub(crate) full_at: HashMap<String, Instant>,
+    /// The (page, block, cell) of the last poll flush, the checkpoint under the
+    /// undo step it made, and that step: the next poll flush extends it (see `poll_flush`).
+    pub(crate) poll_cp: Option<(PollKey, sync::Checkpoint, crate::undo::Step)>,
+    /// Blocks a poll changed, with the end of their highlight.
+    pub(crate) flash: HashMap<String, Instant>,
     pub(crate) was_focused: bool,
-    pub(crate) next_tick: Instant,
     pub(crate) worker_gone: bool,
     /// The window title last sent.
     pub(crate) shown_title: String,
@@ -406,10 +414,11 @@ impl App {
             block_edits: Default::default(),
             users_note: None,
             switcher: None,
-            last_auto: None,
-            auto_pulling: false,
+            polled: HashMap::new(),
+            full_at: HashMap::new(),
+            poll_cp: None,
+            flash: HashMap::new(),
             was_focused: false,
-            next_tick: Instant::now() + crate::shell::AUTO_PULL_EVERY,
             worker_gone: false,
             shown_title: String::new(),
             keylog,
@@ -636,7 +645,15 @@ impl App {
                     ui.add_space(12.0);
                     for idx in 0..self.rows.len() {
                         if self.shown[idx] {
+                            // painted behind the row once its height is known
+                            let tint = self.flash.contains_key(&self.rows[idx].block_id);
+                            let bg = tint.then(|| ui.painter().add(egui::Shape::Noop));
+                            let top = ui.cursor().top();
                             acts.extend(self.row_ui(ui, idx));
+                            if let Some(bg) = bg {
+                                let r = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
+                                ui.painter().set(bg, egui::Shape::rect_filled(r, 3.0, c.accent.gamma_multiply(0.18)));
+                            }
                         }
                     }
                     ui.add_space(200.0);

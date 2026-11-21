@@ -838,6 +838,24 @@ mod tests {
         assert!(took < Duration::from_millis(1100), "{took:?}");
     }
 
+    /// Notion allows 3 requests a second on average: however many callers
+    /// (polls included) ask, the default limiter lets through at most
+    /// burst + 60 s * rate = 183 in a minute, and 3/s after the burst.
+    #[tokio::test(start_paused = true)]
+    async fn limiter_caps_a_minute_for_any_number_of_callers() {
+        let cfg = ClientConfig::default();
+        let l = Limiter::new(cfg.requests_per_sec, cfg.burst);
+        let start = Instant::now();
+        let mut in_first_minute = 0;
+        for _ in 0..400 {
+            l.acquire().await;
+            if start.elapsed() <= Duration::from_secs(60) {
+                in_first_minute += 1;
+            }
+        }
+        assert!((180..=183).contains(&in_first_minute), "{in_first_minute}");
+    }
+
     #[test]
     fn debug_hides_token() {
         let c = Client::new("secret-xyz".into(), ClientConfig::default());

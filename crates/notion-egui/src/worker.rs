@@ -10,13 +10,15 @@ use eframe::egui;
 use notion_core::api::Client;
 use notion_core::model::SearchResult;
 use notion_core::store::Store;
-use notion_core::sync::{self, PullReport, PushReport};
+use notion_core::sync::{self, PullReport, PushReport, Skip};
 use notion_core::Error;
 use tokio::sync::mpsc as tmpsc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     Pull { id: String, force: bool },
+    /// A background check of a page: like a pull, but may skip (see `Skip`).
+    Poll { id: String, skip: Skip },
     Push,
     Search(String),
     /// Fetches the threads of a page or block (`sync::pull_comments`).
@@ -59,6 +61,9 @@ pub async fn run(
         };
         let ev = match cmd {
             Cmd::Pull { id, force } => sync::pull_page(client, store, &id, force)
+                .await
+                .map(|report| Event::Pulled { id, report }),
+            Cmd::Poll { id, skip } => sync::pull_page_skip(client, store, &id, skip)
                 .await
                 .map(|report| Event::Pulled { id, report }),
             Cmd::Push => sync::push(client, store).await.map(Event::Pushed),
