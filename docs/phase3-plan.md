@@ -97,3 +97,10 @@ I pulled all 164 pages shared with the integration into the cache. One failed wi
 3. **Editing and deleting comments are documented only for API version 2026-03-11.** Under our 2025-09-03 they're untested. If Notion refuses them, they show as failed in the problem list.
 4. **The comment box doesn't have the `@` menu.** To mention a page there, you type the `@[label](page:id)` token yourself.
 5. **A block creation that fails right after it was sent can still post the block twice.** The same thing was fixed for comments in C1.
+
+## Known gaps after C2 (reviewed, deferred)
+1. **Users need a capability.** The integration needs "Read user information" (with or without email) at notion.so/my-integrations. Without it, a 403 shows one sticky message and user pulls stop.
+2. **Avatars are initials only.** Avatar images are F7.
+3. **People properties** in databases arrive with F4.
+4. **"Edited by" is Notion's last value.** It doesn't change after your local edits until the next pull.
+5. **No `@` menu in the comment box.** Mentions in comments are plain text for now.
