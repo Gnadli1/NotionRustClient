@@ -39,6 +39,13 @@ pub fn show(
     if sync.clicked() {
         act = Some(Action::SyncAll);
     }
+    let bin = super::item(ui, c, false, 30.0, |ui| {
+        ui.label("🗑");
+        ui.label("Trash");
+    });
+    if bin.clicked() {
+        act = Some(Action::Dlg(crate::pages::Dlg::Bin { sel: 0 }));
+    }
     ui.add_space(6.0);
     ui.label(RichText::new("  Pages").small().color(c.secondary));
     let list = rows(tree, open);

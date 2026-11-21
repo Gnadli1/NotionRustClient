@@ -43,6 +43,11 @@ impl History {
         self.pos = self.pages.len() - 1;
     }
 
+    /// Re-keys the pages (a pushed new page gets its real id).
+    pub fn remap(&mut self, f: impl Fn(&str) -> String) {
+        self.pages.iter_mut().for_each(|p| *p = f(p));
+    }
+
     /// The page one step back, if any. `pos` moves when `go` sees it shown.
     pub fn back(&mut self) -> Option<String> {
         self.want = Some(self.pos.checked_sub(1)?);

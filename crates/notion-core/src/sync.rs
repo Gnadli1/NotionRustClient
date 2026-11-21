@@ -457,6 +457,20 @@ fn conflict(
     Ok(changed.then(|| format!("remote edited at {}, base {}", ts(&remote_time), ts(&base))))
 }
 
+/// `Some(reason)` if the remote page differs from the base snapshot (our own
+/// last write in this push, else the op's) in a field this op writes. The
+/// page's edit time says nothing: any block edit bumps it.
+fn page_conflict(op: &Op, id: &str, own: &Own, remote: &Page, keys: &[&str]) -> Option<String> {
+    let base = own.get(id).map(|(_, raw)| raw).or(op.base_raw.as_ref())?;
+    let null = Value::Null;
+    let changed: Vec<&str> = keys
+        .iter()
+        .copied()
+        .filter(|k| base.get(*k).unwrap_or(&null) != remote.raw.get(*k).unwrap_or(&null))
+        .collect();
+    (!changed.is_empty()).then(|| format!("remote changed {}", changed.join(", ")))
+}
+
 fn record_block(own: &mut Own, b: &Block) -> Result<()> {
     own.insert(b.id.clone(), (b.last_edited_time, serde_json::to_value(b)?));
     Ok(())
@@ -592,6 +606,80 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
                 (p.last_edited_time, serde_json::to_value(&p)?),
             );
         }
+        OpKind::CreatePage {
+            local_id,
+            parent_id,
+            body,
+        } => {
+            let parent = store.resolve_id(parent_id)?;
+            if parent.starts_with("local-") {
+                return Ok(Outcome::Failed("its parent page was never created".into()));
+            }
+            let mut req = body.clone();
+            req["parent"] = json!({ "type": "page_id", "page_id": parent });
+            let resp = match client.create_page(&req).await {
+                // Never reached Notion (or it said no): safe to retry or fail as usual.
+                Err(e @ (Error::Api { .. } | Error::RetriesExhausted)) => return Err(e),
+                Err(Error::Http(e)) if e.is_connect() => return Err(Error::Http(e)),
+                // The POST may have landed: a retry could create it twice.
+                Err(_) => {
+                    return Ok(Outcome::Failed(
+                        "may have been created; check Notion before retrying".into(),
+                    ))
+                }
+                Ok(resp) => resp,
+            };
+            let Some(new_id) = resp["id"].as_str().map(str::to_string) else {
+                return Ok(Outcome::Failed("Notion's answer has no page id".into()));
+            };
+            // The page exists remotely: cache trouble must not fail the op.
+            let cached = store.atomic(|| {
+                store.rename_page(local_id, &new_id)?;
+                store.map_id(local_id, &new_id)?;
+                if let Ok(p) = serde_json::from_value::<Page>(resp.clone()) {
+                    store.upsert_page(&p)?;
+                    own.insert(p.id.clone(), (p.last_edited_time, serde_json::to_value(&p)?));
+                }
+                Ok(())
+            });
+            if let Err(e) = cached {
+                tracing::warn!("created page {local_id} not cached: {e}");
+            }
+        }
+        OpKind::UpdatePage { page_id, body } => {
+            let id = store.resolve_id(page_id)?;
+            if id.starts_with("local-") {
+                return Ok(Outcome::Failed("its page was never created".into()));
+            }
+            let remote = client.get_page(&id).await?;
+            let keys: Vec<&str> = body.as_object().into_iter().flat_map(|o| o.keys().map(String::as_str)).collect();
+            if let Some(c) = page_conflict(op, &id, own, &remote, &keys) {
+                return Ok(Outcome::Conflict(c));
+            }
+            let p = client.update_page(&id, body).await?;
+            store.upsert_page(&p)?;
+            own.insert(p.id.clone(), (p.last_edited_time, serde_json::to_value(&p)?));
+        }
+        OpKind::MovePage {
+            page_id,
+            new_parent_id,
+        } => {
+            let id = store.resolve_id(page_id)?;
+            let parent = store.resolve_id(new_parent_id)?;
+            if id.starts_with("local-") || parent.starts_with("local-") {
+                return Ok(Outcome::Failed("its page or new parent was never created".into()));
+            }
+            let remote = client.get_page(&id).await?;
+            if let Some(c) = page_conflict(op, &id, own, &remote, &["parent"]) {
+                return Ok(Outcome::Conflict(c));
+            }
+            let resp = client.move_page(&id, &parent).await?;
+            // the answer may be just {object, id}: the cache already shows the move
+            if let Ok(p) = serde_json::from_value::<Page>(resp) {
+                store.upsert_page(&p)?;
+                own.insert(p.id.clone(), (p.last_edited_time, serde_json::to_value(&p)?));
+            }
+        }
         OpKind::CreateBlock {
             parent_id,
             after,
@@ -599,6 +687,9 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
         } => {
             let local: Block = serde_json::from_value(block.clone())?;
             let parent = store.resolve_id(parent_id)?;
+            if parent.starts_with("local-") {
+                return Ok(Outcome::Failed("its page was never created".into()));
+            }
             let after = after.as_deref().map(|a| store.resolve_id(a)).transpose()?;
             let new = first(
                 client
@@ -813,6 +904,10 @@ pub async fn fetch_remote(client: &Client, store: &Store, op: &Op) -> Result<Opt
             .get_page(&id)
             .await
             .map(|p| (!p.in_trash).then_some(Remote::Page(p))),
+        // a restore's page is in the trash: still there
+        OpKind::UpdatePage { .. } | OpKind::MovePage { .. } => {
+            client.get_page(&id).await.map(|p| Some(Remote::Page(p)))
+        }
         OpKind::UpdateComment { .. } | OpKind::DeleteComment { .. } => {
             client.get_comment(&id).await.map(|c| Some(Remote::Comment(c)))
         }
@@ -938,6 +1033,23 @@ pub fn rebase_op(store: &Store, op_id: i64, remote: &Remote) -> Result<()> {
                     let t: String = items.iter().filter_map(|i| i["text"]["content"].as_str()).collect();
                     p.properties.insert(k.clone(), PropertyValue::Title(title_runs(&t)));
                 }
+                store.upsert_page(&p)?;
+            }
+            (OpKind::UpdatePage { body, .. }, Remote::Page(p)) => {
+                let mut p = p.clone();
+                for (k, v) in body.as_object().into_iter().flatten() {
+                    match k.as_str() {
+                        "in_trash" => p.in_trash = v.as_bool().unwrap_or(false),
+                        k => p.raw[k] = v.clone(),
+                    }
+                }
+                store.upsert_page(&p)?;
+            }
+            (OpKind::MovePage { new_parent_id, .. }, Remote::Page(p)) => {
+                let np = store.resolve_id(new_parent_id)?;
+                let mut p = p.clone();
+                p.raw["parent"] = json!({ "type": "page_id", "page_id": np });
+                p.parent = Parent::Page(np);
                 store.upsert_page(&p)?;
             }
             (OpKind::UpdateComment { rich_text, .. }, Remote::Comment(c)) => {
@@ -1195,29 +1307,52 @@ fn queued_props(store: &Store, page_id: &str) -> Result<Option<Op>> {
     Ok(None)
 }
 
-/// A remote `page` keeps the cached values of the properties a queued
-/// UpdatePageProperties op will write; the rest is taken from remote.
+/// A remote `page` keeps the cached values of what a queued
+/// UpdatePageProperties (properties), UpdatePage (icon, cover, trash, lock)
+/// or MovePage (parent) op will write; the rest is taken from remote.
 // ponytail: scans the queue per page; index by page id if queues get long
 fn keep_queued_props(store: &Store, page: &mut Page) -> Result<()> {
-    let Some(Op {
-        kind: OpKind::UpdatePageProperties { properties, .. },
-        ..
-    }) = queued_props(store, &page.id)?
-    else {
-        return Ok(());
-    };
     let Some(cached) = store.get_page(&page.id)? else {
         return Ok(());
     };
-    for k in properties.as_object().into_iter().flat_map(|o| o.keys()) {
-        match cached.properties.get(k) {
-            Some(v) => page.properties.insert(k.clone(), v.clone()),
-            None => page.properties.remove(k),
-        };
+    let mut kept = false;
+    if let Some(Op {
+        kind: OpKind::UpdatePageProperties { properties, .. },
+        ..
+    }) = queued_props(store, &page.id)?
+    {
+        for k in properties.as_object().into_iter().flat_map(|o| o.keys()) {
+            match cached.properties.get(k) {
+                Some(v) => page.properties.insert(k.clone(), v.clone()),
+                None => page.properties.remove(k),
+            };
+        }
+        kept = true;
+    }
+    for op in store.queued_ops()? {
+        match &op.kind {
+            OpKind::UpdatePage { page_id, body } if store.resolve_id(page_id)? == page.id => {
+                for k in body.as_object().into_iter().flat_map(|o| o.keys()) {
+                    match k.as_str() {
+                        "in_trash" => page.in_trash = cached.in_trash,
+                        k => page.raw[k] = cached.raw.get(k).cloned().unwrap_or(Value::Null),
+                    }
+                }
+                kept = true;
+            }
+            OpKind::MovePage { page_id, .. } if store.resolve_id(page_id)? == page.id => {
+                page.parent = cached.parent.clone();
+                page.raw["parent"] = cached.raw["parent"].clone();
+                kept = true;
+            }
+            _ => {}
+        }
     }
     // Keep the cached time too, so the pull after the op leaves the queue
-    // isn't skipped as "unchanged" while the cache still holds our title.
-    page.last_edited_time = cached.last_edited_time;
+    // isn't skipped as "unchanged" while the cache still holds our edit.
+    if kept {
+        page.last_edited_time = cached.last_edited_time;
+    }
     Ok(())
 }
 
@@ -1257,6 +1392,14 @@ pub fn local_set_title(store: &Store, page_id: &str, title: &str) -> Result<i64>
         .insert(key.clone(), PropertyValue::Title(runs));
     store.atomic(|| {
         store.upsert_page(&page)?;
+        // an unpushed page: its create carries the title (and its row in the parent shows it)
+        if let Some(op) = queued_create_page(store, &page.id)? {
+            if let Some(mut b) = store.get_block(&page.id)? {
+                b.kind = BlockKind::ChildPage { title: title.to_string() };
+                store.put_block(&b)?;
+            }
+            return set_create_body(store, op, "properties", json!({ "title": { "title": body } }));
+        }
         if let Some(Op {
             id,
             kind:
@@ -1282,6 +1425,217 @@ pub fn local_set_title(store: &Store, page_id: &str, title: &str) -> Result<i64>
                 page_id: page.id.clone(),
                 properties: json!({ key: { "title": body } }),
             },
+            Some(base.last_edited_time),
+            Some(serde_json::to_value(&base)?),
+        )
+    })
+}
+
+/// The queued CreatePage op that creates page `local_id`, if any.
+fn queued_create_page(store: &Store, local_id: &str) -> Result<Option<Op>> {
+    Ok(store
+        .queued_ops()?
+        .into_iter()
+        .find(|o| matches!(&o.kind, OpKind::CreatePage { local_id: l, .. } if l == local_id)))
+}
+
+/// Sets `body[key]` of a queued CreatePage op. Returns its id.
+fn set_create_body(store: &Store, op: Op, key: &str, value: Value) -> Result<i64> {
+    let OpKind::CreatePage { local_id, parent_id, mut body } = op.kind else {
+        return Err(Error::Invalid("not a page create".into()));
+    };
+    body[key] = value;
+    store.update_op_kind(op.id, &OpKind::CreatePage { local_id, parent_id, body })?;
+    Ok(op.id)
+}
+
+/// Caches a new untitled-or-titled page under the cached page `parent_id`
+/// with a temporary `local-…` id, shows it as a `child_page` row of the
+/// parent (after `after`, a block of the parent, else last) and queues its
+/// creation. A page's blocks may be edited before the push: their ops map
+/// through the id. Returns the page id.
+pub fn local_create_page(
+    store: &Store,
+    parent_id: &str,
+    after: Option<&str>,
+    title: &str,
+) -> Result<String> {
+    match store.get_page(parent_id)? {
+        Some(p) if !p.in_trash => {}
+        _ => return Err(Error::Invalid("the parent page is not cached or in the trash".into())),
+    }
+    let id = local_stamp("local");
+    let now = ts(&Utc::now());
+    let runs = title_runs(title);
+    let parent = json!({ "type": "page_id", "page_id": parent_id });
+    let page: Page = serde_json::from_value(json!({
+        "object": "page", "id": id, "parent": parent, "created_time": now,
+        "last_edited_time": now, "in_trash": false, "url": "", "icon": null, "cover": null,
+        "properties": { "title": { "id": "title", "type": "title", "title": runs } },
+    }))?;
+    let row: Block = serde_json::from_value(json!({
+        "object": "block", "id": id, "parent": parent, "type": "child_page",
+        "child_page": { "title": title }, "has_children": false, "in_trash": false,
+        "created_time": now, "last_edited_time": now,
+    }))?;
+    store.atomic(|| {
+        store.upsert_page(&page)?;
+        store.put_block(&row)?;
+        store.move_block_local(&id, parent_id, after)?;
+        store.enqueue(
+            OpKind::CreatePage {
+                local_id: id.clone(),
+                parent_id: parent_id.to_string(),
+                body: json!({ "properties": { "title": { "title": title_body(&runs) } } }),
+            },
+            None,
+            None,
+        )?;
+        Ok(())
+    })?;
+    Ok(id)
+}
+
+/// Writes `key` (`icon`, `cover`, `in_trash`, `is_locked`) of a cached page
+/// and queues the PATCH, merged into the page's queued one; an unpushed
+/// page's create carries it instead. Returns the op id.
+fn local_update_page(store: &Store, page_id: &str, key: &str, value: Value) -> Result<i64> {
+    let base = store
+        .get_page(page_id)?
+        .ok_or_else(|| Error::Invalid(format!("page {page_id} not cached")))?;
+    let mut page = base.clone();
+    match key {
+        "in_trash" => page.in_trash = value.as_bool().unwrap_or(false),
+        k => page.raw[k] = value.clone(),
+    }
+    store.atomic(|| {
+        store.upsert_page(&page)?;
+        if let Some(op) = queued_create_page(store, page_id)? {
+            return set_create_body(store, op, key, value);
+        }
+        for op in store.queued_ops()? {
+            if let OpKind::UpdatePage { page_id: p, mut body } = op.kind {
+                if store.resolve_id(&p)? == page_id {
+                    body[key] = value;
+                    store.update_op_kind(op.id, &OpKind::UpdatePage { page_id: p, body })?;
+                    return Ok(op.id);
+                }
+            }
+        }
+        store.enqueue(
+            OpKind::UpdatePage { page_id: page_id.to_string(), body: json!({ key: value }) },
+            Some(base.last_edited_time),
+            Some(serde_json::to_value(&base)?),
+        )
+    })
+}
+
+/// Sets (`Some`) or removes the page's emoji icon.
+pub fn local_set_icon(store: &Store, page_id: &str, emoji: Option<&str>) -> Result<i64> {
+    let icon = match emoji.map(str::trim) {
+        None => Value::Null,
+        // ponytail: "has a char >= U+2000 and no ASCII letters/digits", not a real emoji parse
+        Some(e)
+            if e.chars().count() > 16
+                || !e.chars().any(|c| c >= '\u{2000}')
+                || e.chars().any(|c| c.is_ascii_alphanumeric()) =>
+        {
+            return Err(Error::Invalid("the icon must be an emoji".into()))
+        }
+        Some(e) => json!({ "type": "emoji", "emoji": e }),
+    };
+    local_update_page(store, page_id, "icon", icon)
+}
+
+/// The host of an http(s) URL, else an error.
+pub fn cover_host(url: &str) -> Result<String> {
+    reqwest::Url::parse(url.trim())
+        .ok()
+        .filter(|u| matches!(u.scheme(), "http" | "https"))
+        .and_then(|u| u.host_str().map(str::to_string))
+        .ok_or_else(|| Error::Invalid("the cover must be an http or https image URL".into()))
+}
+
+/// Sets (`Some`, an external http(s) URL) or removes the page's cover.
+pub fn local_set_cover(store: &Store, page_id: &str, url: Option<&str>) -> Result<i64> {
+    let cover = match url {
+        None => Value::Null,
+        Some(u) => {
+            cover_host(u)?;
+            json!({ "type": "external", "external": { "url": u.trim() } })
+        }
+    };
+    local_update_page(store, page_id, "cover", cover)
+}
+
+/// Locks or unlocks the page in Notion's UI (the API ignores the lock).
+pub fn local_set_locked(store: &Store, page_id: &str, locked: bool) -> Result<i64> {
+    if page_id.starts_with("local-") {
+        return Err(Error::Invalid("this page isn't pushed yet: push it (Ctrl+S) first".into()));
+    }
+    local_update_page(store, page_id, "is_locked", json!(locked))
+}
+
+/// Trashes or restores a page. An unpushed page can't be (undo removes it).
+pub fn local_trash_page(store: &Store, page_id: &str, trashed: bool) -> Result<i64> {
+    if page_id.starts_with("local-") {
+        return Err(Error::Invalid("this page isn't pushed yet: push it (Ctrl+S) first".into()));
+    }
+    // restoring under a trashed parent would leave it invisible
+    let mut up = store.get_page(page_id)?.and_then(|p| match p.parent {
+        Parent::Page(id) => Some(id),
+        _ => None,
+    });
+    for _ in 0..64 {
+        let Some(parent) = up.take().and_then(|id| store.get_page(&id).ok().flatten()) else { break };
+        if !trashed && parent.in_trash {
+            return Err(Error::Invalid("restore the parent page first".into()));
+        }
+        up = match parent.parent {
+            Parent::Page(id) => Some(id),
+            _ => None,
+        };
+    }
+    local_update_page(store, page_id, "in_trash", json!(trashed))
+}
+
+/// Moves a cached page under the cached page `new_parent` and queues the
+/// move. Refused into itself, its own descendants, a trashed page, or when
+/// either page isn't pushed yet.
+pub fn local_move_page(store: &Store, page_id: &str, new_parent: &str) -> Result<i64> {
+    if page_id.starts_with("local-") || new_parent.starts_with("local-") {
+        return Err(Error::Invalid("an unpushed page can't be moved: push it (Ctrl+S) first".into()));
+    }
+    let base = store
+        .get_page(page_id)?
+        .ok_or_else(|| Error::Invalid(format!("page {page_id} not cached")))?;
+    match store.get_page(new_parent)? {
+        Some(p) if !p.in_trash => {}
+        _ => return Err(Error::Invalid("the new parent isn't a cached page".into())),
+    }
+    let tree = store.page_tree()?;
+    let mut up = Some(new_parent.to_string());
+    for _ in 0..=tree.len() {
+        let Some(at) = up else { break };
+        if at == page_id {
+            return Err(Error::Invalid("a page can't move into itself or its own subpages".into()));
+        }
+        up = tree.iter().find(|e| e.id == at).and_then(|e| e.parent.clone());
+    }
+    if base.parent == Parent::Page(new_parent.to_string()) {
+        return Err(Error::Invalid("it is already there".into()));
+    }
+    let mut page = base.clone();
+    page.raw["parent"] = json!({ "type": "page_id", "page_id": new_parent });
+    page.parent = Parent::Page(new_parent.to_string());
+    store.atomic(|| {
+        store.upsert_page(&page)?;
+        // its row in the old parent goes with it
+        if store.get_block(page_id)?.is_some() {
+            store.move_block_local(page_id, new_parent, None)?;
+        }
+        store.enqueue(
+            OpKind::MovePage { page_id: page_id.to_string(), new_parent_id: new_parent.to_string() },
             Some(base.last_edited_time),
             Some(serde_json::to_value(&base)?),
         )
@@ -1321,6 +1675,9 @@ pub fn op_block(k: &OpKind) -> Option<&str> {
             ..
         } => Some(b),
         OpKind::UpdatePageProperties { .. }
+        | OpKind::CreatePage { .. }
+        | OpKind::UpdatePage { .. }
+        | OpKind::MovePage { .. }
         | OpKind::CreateComment { .. }
         | OpKind::UpdateComment { .. }
         | OpKind::DeleteComment { .. } => None,
@@ -1943,12 +2300,15 @@ fn snapshot(store: &Store, pages: &[String]) -> Result<Rows> {
     for (table, sql, arg) in [
         (
             "pages",
-            "SELECT * FROM pages WHERE id IN (SELECT value FROM json_each(?1))",
+            // a new page isn't named before it exists: every unpushed one is in
+            "SELECT * FROM pages WHERE id IN (SELECT value FROM json_each(?1)) OR id LIKE 'local-%'",
             true,
         ),
         (
             "blocks",
-            "SELECT * FROM blocks WHERE page_id IN (SELECT value FROM json_each(?1))",
+            // a page's own child_page row (same id) lives in its parent
+            "SELECT * FROM blocks WHERE page_id IN (SELECT value FROM json_each(?1))
+               OR id IN (SELECT value FROM json_each(?1))",
             true,
         ),
         (
@@ -5422,6 +5782,300 @@ mod tests {
         let b = store.get_block(&new).unwrap().unwrap();
         assert!(matches!(b.kind, BlockKind::BulletedListItem(_)));
         assert_eq!(plain_text(&b.kind.text().unwrap().rich_text), "");
+    }
+
+    async fn post(s: &MockServer, p: &str, resp: ResponseTemplate, expect: u64) {
+        Mock::given(method("POST")).and(path(p)).respond_with(resp).expect(expect).mount(s).await;
+    }
+    async fn patch(s: &MockServer, p: &str, body: Value, resp: ResponseTemplate) {
+        Mock::given(method("PATCH"))
+            .and(path(p))
+            .and(body_partial_json(body))
+            .respond_with(resp)
+            .expect(1)
+            .mount(s)
+            .await;
+    }
+    fn report(applied: usize, conflicts: usize) -> PushReport {
+        PushReport { applied, conflicts, failed: 0 }
+    }
+
+    #[tokio::test]
+    async fn a_new_page_is_created_under_its_parent_and_later_blocks_follow_its_id() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        let id = local_create_page(&store, "p", Some("b"), "Notes").unwrap();
+        assert!(id.starts_with("local-"));
+        assert_eq!(ids(&store.children("p").unwrap()), ["b", id.as_str()]);
+        assert_eq!(store.page_tree().unwrap().iter().filter(|e| e.id == id).count(), 1);
+        // renaming and editing before the push rewrite the one create
+        local_set_title(&store, &id, "Ideas").unwrap();
+        local_set_icon(&store, &id, Some("📝")).unwrap();
+        let blk = local_create_block(&store, &id, None, BlockKind::Divider).unwrap();
+        let ops = store.queued_ops().unwrap();
+        assert_eq!(ops.len(), 2, "one create for the page, one for the block");
+        assert!(local_trash_page(&store, &id, true).is_err());
+
+        let mut real = page("real1", pp("p"), T2);
+        real["properties"] = json!({ "title": { "id": "title", "type": "title", "title": [
+            { "type": "text", "text": { "content": "Ideas" }, "plain_text": "Ideas", "annotations": {} }] } });
+        real["icon"] = json!({ "type": "emoji", "emoji": "📝" });
+        post(&s, "/v1/pages", ok(real), 1).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/pages"))
+            .and(body_partial_json(json!({
+                "parent": { "type": "page_id", "page_id": "p" },
+                "icon": { "type": "emoji", "emoji": "📝" },
+                "properties": { "title": { "title": [{ "text": { "content": "Ideas" } }] } },
+            })))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&s)
+            .await;
+        let mut div = blk_json_divider("d");
+        div["parent"] = pp("real1");
+        patch(&s, "/v1/blocks/real1/children", json!({ "children": [{ "type": "divider" }] }), list(vec![div])).await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!(r, report(2, 0));
+        assert_eq!(store.resolve_id(&id).unwrap(), "real1");
+        assert!(store.get_page(&id).unwrap().is_none());
+        assert_eq!(store.get_page("real1").unwrap().unwrap().title(), "Ideas");
+        assert_eq!(ids(&store.children("p").unwrap()), ["b", "real1"]);
+        assert_eq!(ids(&store.children("real1").unwrap()), ["d"]);
+        assert!(store.get_block(&blk).unwrap().is_none());
+        assert!(store.queued_ops().unwrap().is_empty());
+    }
+
+    fn blk_json_divider(id: &str) -> Value {
+        json!({ "object": "block", "id": id, "parent": pp("p"), "type": "divider", "divider": {},
+            "has_children": false, "in_trash": false, "created_time": T, "last_edited_time": T2 })
+    }
+
+    #[test]
+    fn a_page_can_only_be_created_under_a_cached_live_page() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(local_create_page(&store, "nope", None, "x").is_err());
+    }
+
+    /// Seeded "p" with a queued page op from `queue`, pushed against remote `remote`
+    /// and PATCH `want` (answered with `done`); returns the report.
+    async fn push_page_op(
+        queue: impl Fn(&Store),
+        remote: Value,
+        want: Value,
+        done: Value,
+    ) -> (PushReport, Store) {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        queue(&store);
+        get(&s, "/v1/pages/p", ok(remote)).await;
+        patch(&s, "/v1/pages/p", want, ok(done)).await;
+        let r = push(&client(&s), &store).await.unwrap();
+        (r, store)
+    }
+
+    #[tokio::test]
+    async fn icon_cover_trash_and_restore_are_one_patch_each() {
+        let mut done = page("p", pp("root"), T2);
+        done["icon"] = json!({ "type": "emoji", "emoji": "🚀" });
+        let (r, store) = push_page_op(
+            |st| {
+                local_set_icon(st, "p", Some("🚀")).unwrap();
+                // a second change merges into the queued PATCH
+                local_set_cover(st, "p", Some("https://img.example.com/a.png")).unwrap();
+                assert_eq!(st.queued_ops().unwrap().len(), 1);
+            },
+            page("p", pp("root"), T2),
+            json!({ "icon": { "type": "emoji", "emoji": "🚀" },
+                    "cover": { "type": "external", "external": { "url": "https://img.example.com/a.png" } } }),
+            done,
+        )
+        .await;
+        assert_eq!(r, report(1, 0));
+        assert_eq!(store.get_page("p").unwrap().unwrap().raw["icon"]["emoji"], "🚀");
+
+        // remove both
+        let (r, _) = push_page_op(
+            |st| {
+                local_set_icon(st, "p", None).unwrap();
+                local_set_cover(st, "p", None).unwrap();
+            },
+            page("p", pp("root"), T2),
+            json!({ "icon": null, "cover": null }),
+            page("p", pp("root"), T2),
+        )
+        .await;
+        assert_eq!(r, report(1, 0));
+
+        // trash, then restore from the cache of a trashed page
+        let mut trashed = page("p", pp("root"), T2);
+        trashed["in_trash"] = json!(true);
+        let (r, store) = push_page_op(
+            |st| {
+                local_trash_page(st, "p", true).unwrap();
+                assert!(st.page_tree().unwrap().is_empty(), "hidden at once");
+                assert_eq!(st.trashed_pages().unwrap().len(), 1);
+            },
+            page("p", pp("root"), T2),
+            json!({ "in_trash": true }),
+            trashed.clone(),
+        )
+        .await;
+        assert_eq!(r, report(1, 0));
+        assert!(store.get_page("p").unwrap().unwrap().in_trash);
+        local_trash_page(&store, "p", false).unwrap();
+        assert!(store.trashed_pages().unwrap().is_empty());
+        assert_eq!(store.page_tree().unwrap().len(), 1);
+
+        let s = MockServer::start().await;
+        get(&s, "/v1/pages/p", ok(trashed)).await;
+        patch(&s, "/v1/pages/p", json!({ "in_trash": false }), ok(page("p", pp("root"), T2))).await;
+        assert_eq!(push(&client(&s), &store).await.unwrap(), report(1, 0));
+        assert!(!store.get_page("p").unwrap().unwrap().in_trash);
+    }
+
+    #[test]
+    fn icon_and_cover_are_validated() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_page(&serde_json::from_value(page("p", pp("root"), T)).unwrap()).unwrap();
+        assert!(local_set_icon(&store, "p", Some("abc")).is_err());
+        assert!(local_set_icon(&store, "p", Some("")).is_err());
+        assert!(local_set_cover(&store, "p", Some("ftp://x/y.png")).is_err());
+        assert!(local_set_cover(&store, "p", Some("javascript:alert(1)")).is_err());
+        assert_eq!(cover_host("https://img.example.com/a.png").unwrap(), "img.example.com");
+        assert!(store.queued_ops().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_remote_icon_change_conflicts_but_an_edited_block_does_not() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        local_set_icon(&store, "p", Some("🚀")).unwrap();
+        let mut theirs = page("p", pp("root"), T2);
+        theirs["icon"] = json!({ "type": "emoji", "emoji": "🔥" });
+        get(&s, "/v1/pages/p", ok(theirs)).await;
+        assert_eq!(push(&client(&s), &store).await.unwrap(), report(0, 1));
+        let c = store.ops_by_status(OpStatus::Conflict).unwrap();
+        assert_eq!(c[0].error.as_deref(), Some("remote changed icon"));
+    }
+
+    #[tokio::test]
+    async fn a_pull_keeps_a_queued_trash_and_icon() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        local_trash_page(&store, "p", true).unwrap();
+        local_set_icon(&store, "p", Some("🚀")).unwrap();
+        get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
+        get(&s, "/v1/blocks/p/children", list(vec![blk("b", pp("p"), "b", T2, false)])).await;
+        pull_page(&client(&s), &store, "p", true).await.unwrap();
+        let p = store.get_page("p").unwrap().unwrap();
+        assert!(p.in_trash);
+        assert_eq!(p.raw["icon"]["emoji"], "🚀");
+    }
+
+    #[tokio::test]
+    async fn a_page_is_moved_with_the_move_endpoint() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        store.upsert_page(&serde_json::from_value(page("q", pp("root"), T)).unwrap()).unwrap();
+        store.upsert_page(&serde_json::from_value(page("r", pp("p"), T)).unwrap()).unwrap();
+        assert!(local_move_page(&store, "p", "p").is_err());
+        assert!(local_move_page(&store, "p", "r").is_err(), "into a descendant");
+        assert!(local_move_page(&store, "p", "nope").is_err());
+        assert!(local_move_page(&store, "p", "root").is_err());
+        assert!(store.queued_ops().unwrap().is_empty());
+        local_move_page(&store, "p", "q").unwrap();
+        assert_eq!(store.get_page("p").unwrap().unwrap().parent, Parent::Page("q".into()));
+        assert!(local_move_page(&store, "q", "r").is_err(), "r is under p, now under q");
+
+        // the move endpoint is a POST
+        get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/pages/p/move"))
+            .and(body_partial_json(json!({ "parent": { "type": "page_id", "page_id": "q" } })))
+            .respond_with(ok(page("p", pp("q"), T2)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        assert_eq!(push(&client(&s), &store).await.unwrap(), report(1, 0));
+        assert_eq!(store.get_page("p").unwrap().unwrap().parent, Parent::Page("q".into()));
+    }
+
+    #[tokio::test]
+    async fn a_move_conflicts_when_the_parent_changed_remotely() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        store.upsert_page(&serde_json::from_value(page("q", pp("root"), T)).unwrap()).unwrap();
+        local_move_page(&store, "p", "q").unwrap();
+        get(&s, "/v1/pages/p", ok(page("p", pp("elsewhere"), T2))).await;
+        assert_eq!(push(&client(&s), &store).await.unwrap(), report(0, 1));
+    }
+
+    #[tokio::test]
+    async fn a_pull_of_the_parent_keeps_an_unpushed_page_and_its_row() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        let id = local_create_page(&store, "p", Some("b"), "New").unwrap();
+        get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
+        get(&s, "/v1/blocks/p/children", list(vec![blk("b", pp("p"), "b", T2, false)])).await;
+        pull_page(&client(&s), &store, "p", true).await.unwrap();
+        assert_eq!(ids(&store.children("p").unwrap()), ["b", id.as_str()]);
+        assert!(store.get_page(&id).unwrap().is_some());
+        assert_eq!(store.queued_ops().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_page_under_a_parent_that_was_never_created_fails_without_a_request() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        let a = local_create_page(&store, "p", None, "A").unwrap();
+        local_create_page(&store, &a, None, "B").unwrap();
+        post(&s, "/v1/pages", ResponseTemplate::new(400).set_body_json(json!({
+            "object": "error", "status": 400, "code": "validation_error", "message": "no" })), 1).await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!((r.applied, r.failed), (0, 2), "the first fails at Notion, its child never starts");
+    }
+
+    #[tokio::test]
+    async fn a_block_on_a_page_that_failed_to_create_fails_without_a_request() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        let a = local_create_page(&store, "p", None, "A").unwrap();
+        local_create_block(&store, &a, None, BlockKind::Divider).unwrap();
+        post(&s, "/v1/pages", ResponseTemplate::new(400).set_body_json(json!({
+            "object": "error", "status": 400, "code": "validation_error", "message": "no" })), 1).await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!((r.applied, r.failed), (0, 2));
+        let f = store.ops_by_status(OpStatus::Failed).unwrap();
+        assert_eq!(f[1].error.as_deref(), Some("its page was never created"));
+    }
+
+    #[test]
+    fn lock_and_trash_refuse_unpushed_pages_and_restore_needs_a_live_parent() {
+        let store = Store::open_in_memory().unwrap();
+        for (id, parent) in [("p", "root"), ("c", "p")] {
+            store.upsert_page(&serde_json::from_value(page(id, pp(parent), T)).unwrap()).unwrap();
+        }
+        let new = local_create_page(&store, "p", None, "N").unwrap();
+        assert!(local_set_locked(&store, &new, true).is_err());
+        assert!(local_set_locked(&store, "c", true).is_ok());
+        local_trash_page(&store, "c", true).unwrap();
+        local_trash_page(&store, "p", true).unwrap();
+        let e = local_trash_page(&store, "c", false).unwrap_err().to_string();
+        assert!(e.contains("restore the parent page first"), "{e}");
+        local_trash_page(&store, "p", false).unwrap();
+        local_trash_page(&store, "c", false).unwrap();
+        assert!(local_set_icon(&store, "p", Some("🦄")).is_ok());
+        assert!(local_set_icon(&store, "p", Some("a🦄")).is_err());
     }
 
     fn ts_parse(t: &str) -> DateTime<Utc> {

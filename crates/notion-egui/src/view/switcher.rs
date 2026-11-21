@@ -23,7 +23,7 @@ pub fn show(ctx: &Context, c: &Colors, sw: &mut Switcher, items: &[Item]) -> Out
                 ui.set_width(540.0_f32.min(ui.available_width()));
                 let field = ui.add(
                     TextEdit::singleline(&mut sw.query)
-                        .hint_text("Search pages…")
+                        .hint_text(if sw.moving.is_some() { "Move to… (pick the new parent page)" } else { "Search pages…" })
                         .desired_width(f32::INFINITY)
                         .font(egui::TextStyle::Heading),
                 );

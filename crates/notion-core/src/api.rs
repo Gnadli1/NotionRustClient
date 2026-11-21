@@ -183,6 +183,24 @@ impl Client {
             .await
     }
 
+    /// `POST /v1/pages`. Raw: Notion may answer with just `{object, id}`.
+    pub async fn create_page(&self, body: &Value) -> Result<Value> {
+        self.send(Method::POST, "/v1/pages", &[], Some(body)).await
+    }
+
+    /// `PATCH /v1/pages/{id}` with `icon`, `cover`, `in_trash`, `is_locked`.
+    pub async fn update_page(&self, id: &str, body: &Value) -> Result<Page> {
+        self.call(Method::PATCH, &format!("/v1/pages/{id}"), Some(body))
+            .await
+    }
+
+    /// `POST /v1/pages/{id}/move` under the page `parent`.
+    pub async fn move_page(&self, id: &str, parent: &str) -> Result<Value> {
+        let body = json!({ "parent": { "type": "page_id", "page_id": parent } });
+        self.send(Method::POST, &format!("/v1/pages/{id}/move"), &[], Some(&body))
+            .await
+    }
+
     pub async fn get_data_source(&self, id: &str) -> Result<DataSource> {
         self.call(Method::GET, &format!("/v1/data_sources/{id}"), None)
             .await

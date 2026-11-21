@@ -125,13 +125,17 @@ impl Store {
     /// parent is its data source; rows of an uncached one are left out.
     pub fn page_tree(&self) -> Result<Vec<PageEntry>> {
         let mut st = self.conn.prepare(
-            "SELECT p.id, p.title,
+            "WITH RECURSIVE gone(id) AS (SELECT id FROM pages WHERE in_trash = 1
+               UNION SELECT d.id FROM data_sources d JOIN gone ON json_extract(d.raw, '$.database_parent.page_id') = gone.id
+               UNION SELECT p.id FROM pages p JOIN gone
+                 ON p.parent_type IN ('page_id', 'data_source_id') AND p.parent_id = gone.id)
+             SELECT p.id, p.title,
                CASE p.parent_type WHEN 'page_id' THEN p.parent_id WHEN 'data_source_id' THEN p.parent_id
                  WHEN 'block_id' THEN b.page_id END,
                CASE WHEN json_extract(p.raw, '$.icon.type') = 'emoji'
                  THEN json_extract(p.raw, '$.icon.emoji') END, 0
              FROM pages p LEFT JOIN blocks b ON p.parent_type = 'block_id' AND b.id = p.parent_id
-             WHERE p.in_trash = 0
+             WHERE p.id NOT IN (SELECT id FROM gone)
                AND (p.parent_type <> 'data_source_id' OR p.parent_id IN (SELECT id FROM data_sources))
              UNION ALL
              SELECT d.id, d.title,
@@ -139,9 +143,11 @@ impl Store {
                  WHEN 'page_id' THEN json_extract(d.raw, '$.database_parent.page_id')
                  WHEN 'block_id' THEN b.page_id END, NULL, 1
              FROM data_sources d LEFT JOIN blocks b ON b.id = json_extract(d.raw, '$.database_parent.block_id')
+             WHERE COALESCE(json_extract(d.raw, '$.database_parent.page_id'), '') NOT IN (SELECT id FROM gone)
              UNION ALL
              SELECT id, COALESCE(json_extract(raw, '$.child_page.title'), ''), page_id, NULL, 0
-             FROM blocks WHERE type = 'child_page' AND id NOT IN (SELECT id FROM pages)",
+             FROM blocks WHERE type = 'child_page' AND id NOT IN (SELECT id FROM pages)
+               AND page_id NOT IN (SELECT id FROM gone)",
         )?;
         let rows = st.query_map([], |r| {
             Ok(PageEntry {
@@ -153,6 +159,43 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The cached pages in the trash, last edited first.
+    pub fn trashed_pages(&self) -> Result<Vec<Page>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT raw FROM pages WHERE in_trash = 1 ORDER BY last_edited_time DESC")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
+    }
+
+    /// Drops a cached page and its blocks (a never-created `local-*` page).
+    pub fn delete_page(&self, id: &str) -> Result<()> {
+        self.atomic(|| {
+            self.conn.execute("DELETE FROM blocks WHERE page_id = ?1", [id])?;
+            self.conn.execute("DELETE FROM pages WHERE id = ?1", [id])?;
+            Ok(())
+        })
+    }
+
+    /// Re-keys a page (`local-<n>` → real id): its row, its `child_page`
+    /// block in the parent, its blocks, comments and child pages.
+    pub fn rename_page(&self, old: &str, new: &str) -> Result<()> {
+        self.atomic(|| {
+            for sql in [
+                "UPDATE pages SET id = ?2, raw = json_set(raw, '$.id', ?2) WHERE id = ?1",
+                "UPDATE blocks SET id = ?2, raw = json_set(raw, '$.id', ?2) WHERE id = ?1 AND type = 'child_page'",
+                "UPDATE blocks SET page_id = ?2 WHERE page_id = ?1",
+                "UPDATE blocks SET parent_id = ?2, raw = json_set(raw, '$.parent.page_id', ?2) WHERE parent_id = ?1",
+                "UPDATE comments SET parent_id = ?2, raw = json_set(raw, '$.parent.page_id', ?2) WHERE parent_id = ?1",
+                "UPDATE pages SET parent_id = ?2, raw = json_set(raw, '$.parent.page_id', ?2)
+                   WHERE parent_type = 'page_id' AND parent_id = ?1",
+            ] {
+                self.conn.execute(sql, [old, new])?;
+            }
+            Ok(())
+        })
     }
 
     /// Makes `blocks` the full, ordered child list of `parent_id`; cached
@@ -828,6 +871,31 @@ mod tests {
             rows.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
             ["r1"]
         );
+    }
+
+    #[test]
+    fn a_trashed_page_hides_its_databases_and_their_rows() {
+        let s = Store::open_in_memory().unwrap();
+        let d: DataSource = serde_json::from_value(json!({
+            "object": "data_source", "id": "ds1", "parent": { "type": "database_id", "database_id": "db1" },
+            "database_parent": { "type": "page_id", "page_id": "p" },
+            "title": [], "last_edited_time": T, "properties": {},
+        }))
+        .unwrap();
+        s.upsert_data_source(&d).unwrap();
+        s.upsert_page(&page("p", pp("root"), "P")).unwrap();
+        let ds = json!({ "type": "data_source_id", "data_source_id": "ds1", "database_id": "db1" });
+        s.upsert_page(&page("r1", ds, "row")).unwrap();
+        let ids = |s: &Store| {
+            let mut v: Vec<String> = s.page_tree().unwrap().into_iter().map(|e| e.id).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids(&s), ["ds1", "p", "r1"]);
+        let mut p = s.get_page("p").unwrap().unwrap();
+        p.in_trash = true;
+        s.upsert_page(&p).unwrap();
+        assert!(ids(&s).is_empty(), "{:?}", ids(&s));
     }
 
     #[test]

@@ -90,6 +90,9 @@ pub fn problem(store: &Store, op: &Op) -> notion_core::Result<Problem> {
         OpKind::DeleteBlock { .. } => ("delete", None),
         OpKind::MoveBlock { .. } => ("move", None),
         OpKind::UpdatePageProperties { .. } => ("title", None),
+        OpKind::CreatePage { local_id, .. } => ("new page", Some(local_id.clone())),
+        OpKind::UpdatePage { .. } => ("page", None),
+        OpKind::MovePage { .. } => ("move page", None),
         // only reached when the comment's parent is unknown (comment_problem)
         OpKind::CreateComment { .. } => ("comment", None),
         OpKind::UpdateComment { .. } => ("edit comment", None),
@@ -167,5 +170,6 @@ pub fn discard(store: &Store, p: &Problem) -> notion_core::Result<()> {
     if store.get_block(l)?.is_some() {
         store.delete_block(l)?;
     }
+    store.delete_page(l)?; // a never-created page (no-op for a block)
     Ok(())
 }

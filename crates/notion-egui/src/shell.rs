@@ -120,6 +120,7 @@ impl App {
             self.title.clear();
             self.title_editable = false;
             self.page_edit = None;
+            self.meta = Default::default();
             self.page_head = None;
             self.block_edits.clear();
             self.rows.clear();
@@ -130,6 +131,7 @@ impl App {
             .as_ref()
             .map(|p| (p.last_edited_by().map(str::to_string), p.last_edited_time.timestamp()));
         self.page_head = None;
+        self.meta = page.as_ref().map(crate::pages::Meta::of).unwrap_or_default();
         self.block_edits = self.store.block_edits(id)?;
         self.title = page
             .as_ref()
@@ -352,13 +354,15 @@ impl App {
 
     /// The pages to poll with their period: the open one, then the other
     /// tabs' (once each).
-    fn poll_pages(&self) -> Vec<(String, Duration)> {
+    pub(crate) fn poll_pages(&self) -> Vec<(String, Duration)> {
         let mut v: Vec<(String, Duration)> = self.current.iter().map(|p| (p.clone(), POLL_OPEN)).collect();
         for (i, t) in self.tabs.iter().enumerate() {
             if let Some(p) = t.page.as_ref().filter(|p| i != self.active && v.iter().all(|(q, _)| q != *p)) {
                 v.push((p.clone(), POLL_BG));
             }
         }
+        // a page that isn't pushed yet doesn't exist for Notion
+        v.retain(|(p, _)| !p.starts_with("local-"));
         v
     }
 
@@ -374,7 +378,7 @@ impl App {
     /// (a pull keeps blocks with queued edits) and the editor stays.
     pub(crate) fn pull(&mut self, force: bool) {
         self.flush();
-        if let Some(id) = self.current.clone() {
+        if let Some(id) = self.current.clone().filter(|id| !id.starts_with("local-")) {
             self.send(Cmd::Pull { id, force });
         }
     }
@@ -463,6 +467,8 @@ impl App {
                 }
             }
             Event::Pushed(r) => {
+                // a new page's title edit must write to its real id
+                self.remap_ids();
                 // ids of pushed local blocks are gone now: drop the focus
                 self.commit();
                 self.last_error = None;
@@ -721,7 +727,10 @@ impl App {
 
     /// The switcher picked `id`; `new_tab` opens it in a tab of its own.
     pub(crate) fn pick(&mut self, id: &str, new_tab: bool) {
-        self.switcher = None;
+        let moving = self.switcher.take().and_then(|s| s.moving);
+        if let Some(page) = moving {
+            return self.move_page(&page, id);
+        }
         if new_tab && !self.add_tab() {
             return;
         }
@@ -783,7 +792,7 @@ impl App {
         self.refresh();
         self.reveal_current();
         // e.g. a restored tab: pulled like any uncached page
-        if let Some(id) = self.current.clone().filter(|id| !self.cached(id)) {
+        if let Some(id) = self.current.clone().filter(|id| !self.cached(id) && !id.starts_with("local-")) {
             self.pending_open = Some(id.clone());
             self.send(Cmd::Pull { id, force: false });
         }
@@ -870,11 +879,20 @@ impl App {
         // undo steps may hold the discarded ops
         self.undo.clear();
         self.redo.clear();
+        // a never-created page can't be pulled; if it is gone, its tabs leave it
+        let gone = p.page.clone().filter(|id| id.starts_with("local-"));
+        let up = gone.as_ref().and_then(|id| self.store.get_page(id).ok().flatten()).and_then(|pg| match pg.parent {
+            notion_core::model::Parent::Page(x) => Some(x),
+            _ => None,
+        });
         if let Err(e) = problems::discard(&self.store, &p) {
             self.last_error = Some(e.to_string());
         }
+        if let Some(id) = gone.filter(|id| !self.cached(id)) {
+            self.leave_gone(&id, up);
+        }
         self.refresh();
-        if let Some(id) = p.page {
+        if let Some(id) = p.page.filter(|id| !id.starts_with("local-")) {
             self.send(Cmd::Pull { id, force: true });
         }
     }
@@ -1001,7 +1019,10 @@ impl App {
             self.sidebar = !self.sidebar;
             out.retain(|c| *c != Command::ToggleSidebar);
         }
-        if self.switcher.is_some() {
+        if self.dlg.is_some() {
+            // a page dialog is modal: it has the keys
+            out.clear();
+        } else if self.switcher.is_some() {
             // the switcher has Esc
         } else if let Some(p) = &self.conflict {
             // Esc closes it and changes nothing; Ctrl+Enter is Use merged
@@ -1047,6 +1068,7 @@ impl App {
         }
         // Esc closes the find bar when nothing else wants it
         let free = self.switcher.is_none()
+            && self.dlg.is_none()
             && self.conflict.is_none()
             && self.comments.is_none()
             && !self.problems_open
@@ -1062,6 +1084,21 @@ impl App {
         match c {
             Command::Back | Command::Forward | Command::Parent | Command::Find | Command::CopyLink
                 if self.switcher.is_some() || self.conflict.is_some() => {}
+            Command::NewPage
+            | Command::TrashPage
+            | Command::PageIcon
+            | Command::PageCover
+            | Command::MovePage
+            | Command::ToggleLock
+            | Command::TrashView
+                if self.switcher.is_some() || self.conflict.is_some() => {}
+            Command::NewPage
+            | Command::TrashPage
+            | Command::PageIcon
+            | Command::PageCover
+            | Command::MovePage
+            | Command::ToggleLock
+            | Command::TrashView => self.page_command(c),
             Command::ToggleAll
                 if self.switcher.is_some()
                     || self.conflict.is_some()
@@ -1216,6 +1253,9 @@ impl App {
         let shortcuts = self.shortcuts(&ctx);
         self.selection_keys(&ctx);
         self.switcher_keys(&ctx);
+        if let Some(d) = self.dlg_keys(&ctx) {
+            self.dlg_done(d);
+        }
         let focused = ctx.input(|i| i.focused);
         let gained = focused && !self.was_focused;
         self.was_focused = focused;
@@ -1344,6 +1384,9 @@ impl App {
                 Out::Close => {}
                 Out::Pick { id, new_tab } => self.pick(&id, new_tab),
             }
+        }
+        if let Some(d) = self.dlg_ui(&ctx, c) {
+            self.dlg_done(d);
         }
         blur_first(&mut acts);
         for a in acts {

@@ -48,6 +48,24 @@ pub enum OpKind {
     DeleteComment {
         comment_id: String,
     },
+    /// A new page under `parent_id`. `body` is the `POST /v1/pages` body
+    /// without `parent`: `properties` (title), `icon`, `cover`. `local_id` is
+    /// the cached page's temporary id; the push maps it to the real one.
+    CreatePage {
+        local_id: String,
+        parent_id: String,
+        body: Value,
+    },
+    /// `PATCH /v1/pages/{id}` with `icon`, `cover`, `in_trash` and/or `is_locked`.
+    UpdatePage {
+        page_id: String,
+        body: Value,
+    },
+    /// `POST /v1/pages/{id}/move` under a page.
+    MovePage {
+        page_id: String,
+        new_parent_id: String,
+    },
 }
 
 /// Where a new comment goes. Notion can't start a thread on a text range,
@@ -75,7 +93,10 @@ impl OpKind {
             OpKind::UpdateBlock { block_id, .. }
             | OpKind::DeleteBlock { block_id }
             | OpKind::MoveBlock { block_id, .. } => block_id,
-            OpKind::UpdatePageProperties { page_id, .. } => page_id,
+            OpKind::UpdatePageProperties { page_id, .. }
+            | OpKind::UpdatePage { page_id, .. }
+            | OpKind::MovePage { page_id, .. } => page_id,
+            OpKind::CreatePage { local_id, .. } => local_id,
             OpKind::CreateComment { parent, .. } => parent.id(),
             OpKind::UpdateComment { comment_id, .. }
             | OpKind::DeleteComment { comment_id } => comment_id,

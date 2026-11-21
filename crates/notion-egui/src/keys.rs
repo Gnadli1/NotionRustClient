@@ -233,6 +233,16 @@ pub enum Command {
     MoveDown,
     /// Ctrl+Alt+T: open every toggle, or close them all if all are open.
     ToggleAll,
+    /// Ctrl+N: a new subpage of the open page.
+    NewPage,
+    /// Ctrl+Shift+Backspace: trash the open page (asks first).
+    TrashPage,
+    /// The icon picker, the cover URL box, Move to…, lock, the Trash view.
+    PageIcon,
+    PageCover,
+    MovePage,
+    ToggleLock,
+    TrashView,
 }
 
 impl Command {
@@ -259,6 +269,13 @@ impl Command {
                 | Command::Find
                 | Command::CopyLink
                 | Command::ToggleAll
+                | Command::NewPage
+                | Command::TrashPage
+                | Command::PageIcon
+                | Command::PageCover
+                | Command::MovePage
+                | Command::ToggleLock
+                | Command::TrashView
         )
     }
 }
@@ -310,6 +327,13 @@ const NAMES: &[(&str, Command)] = &[
     ("move_up", Command::MoveUp),
     ("move_down", Command::MoveDown),
     ("toggle_all", Command::ToggleAll),
+    ("new_page", Command::NewPage),
+    ("trash_page", Command::TrashPage),
+    ("page_icon", Command::PageIcon),
+    ("page_cover", Command::PageCover),
+    ("move_page", Command::MovePage),
+    ("toggle_lock", Command::ToggleLock),
+    ("trash_view", Command::TrashView),
 ];
 
 /// Notion's Linux keys (Ctrl+Shift+0-9 for block types; 9, "page", has no
@@ -368,6 +392,13 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // AltGr+T (a typed "t" on the Austrian layout) arrives without Ctrl/Alt
     // in winit, so this chord cannot fire on it
     ("ctrl+alt+t", "toggle_all"),
+    ("ctrl+n", "new_page"),
+    ("ctrl+shift+backspace", "trash_page"),
+    ("ctrl+shift+i", "page_icon"),
+    ("ctrl+shift+c", "page_cover"),
+    ("ctrl+shift+p", "move_page"),
+    ("ctrl+shift+l", "toggle_lock"),
+    ("ctrl+shift+delete", "trash_view"),
 ];
 
 fn command(name: &str) -> Option<Command> {

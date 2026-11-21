@@ -115,6 +115,8 @@ pub enum Pick {
     Insert(String),
     /// Set the block's Notion colour (`red`, `blue_background`, ...).
     Color(String),
+    /// `/page`: a new subpage at the cursor.
+    NewPage,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,6 +149,10 @@ pub fn entries(menu: &Menu, q: &str, src: Sources) -> Vec<Entry> {
                     pick: Pick::Block(i.kind),
                 })
                 .collect();
+            // not in "Turn into": a block can't become a page
+            if menu.kind == Kind::Slash && (slash::word_prefix(q, "Page") || slash::word_prefix(q, "Seite")) {
+                out.push(Entry { label: "Page".into(), hint: "A new subpage".into(), pick: Pick::NewPage });
+            }
             out.extend(color_entries(q));
             out
         }

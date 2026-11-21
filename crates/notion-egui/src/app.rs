@@ -26,6 +26,7 @@ use crate::links::{self, Link};
 use crate::nav::{Find, History};
 use crate::menu::{self, menu_step, Kind, Menu, Outcome, Pick, Sources};
 use crate::outline::{self, Marker, Row};
+use crate::pages::{Dlg, Meta};
 use crate::problems::Problem;
 use crate::session;
 use crate::slash;
@@ -177,6 +178,10 @@ pub(crate) enum Action {
     Color { text: String, color: String },
     /// A multi-line paste into an empty row.
     Paste(String),
+    /// Ctrl+N, or `/page` with the editor's text without the trigger.
+    NewPage(Option<String>),
+    /// Opens a page dialog (icon, cover, trash view).
+    Dlg(Dlg),
     /// A slash pick or Markdown shortcut on the edited row: `text` is the
     /// editor's text without the trigger, `typed` as it was before, `at` the
     /// cursor (a char index into `text`).
@@ -302,6 +307,10 @@ pub struct App {
     /// A standing note from the users pull (the 403); outlives other pulls.
     pub(crate) users_note: Option<String>,
     pub(crate) switcher: Option<Switcher>,
+    /// The page dialog (icon, cover, trash confirm, trash view), while open.
+    pub(crate) dlg: Option<Dlg>,
+    /// The open page's icon, cover and lock.
+    pub(crate) meta: Meta,
     /// When each open page was last polled (see [`App::poll_at`]).
     pub(crate) polled: HashMap<String, Instant>,
     /// When each page was last pulled in full, by anyone.
@@ -343,7 +352,7 @@ fn look(m: &Marker) -> (f32, bool) {
 pub(crate) fn blur_first(acts: &mut Vec<Action>) {
     acts.sort_by_key(|a| !matches!(a, Action::Blur | Action::TitleCommit));
     let moving = |a: &Action| {
-        matches!(a, Action::Key(_) | Action::Run(_) | Action::Paste(_) | Action::Color { .. })
+        matches!(a, Action::Key(_) | Action::Run(_) | Action::Paste(_) | Action::Color { .. } | Action::NewPage(_))
     };
     if let Some(k) = acts.iter().position(moving) {
         let mut i = 0;
@@ -465,6 +474,8 @@ impl App {
             block_edits: Default::default(),
             users_note: None,
             switcher: None,
+            dlg: None,
+            meta: Meta::default(),
             polled: HashMap::new(),
             full_at: HashMap::new(),
             poll_cp: None,
@@ -613,6 +624,12 @@ impl App {
             Action::Run(c) => self.step(|s| s.block_cmd(c)),
             Action::Color { text, color } => self.step(|s| s.set_color(text, color)),
             Action::Paste(text) => self.step(|s| s.paste_lines(&text)),
+            Action::NewPage(text) => self.new_page(text),
+            Action::Dlg(d) => {
+                if self.commit() {
+                    self.dlg = Some(d);
+                }
+            }
             Action::Link { link, new_tab } => self.open_link(link, new_tab),
             Action::EditTitle => self.start_title(),
             Action::TitleCommit => {
@@ -700,6 +717,7 @@ impl App {
                 ui.vertical(|ui| {
                     ui.set_max_width(col);
                     ui.add_space(16.0);
+                    acts.extend(crate::pages::header(ui, c, &self.meta));
                     acts.extend(crate::view::breadcrumb(ui, c, &crumbs, &title));
                     ui.add_space(8.0);
                     acts.extend(self.title_ui(ui, &title));
@@ -1228,6 +1246,7 @@ impl App {
         }
         let mut convert = None;
         let mut color = None;
+        let mut new_page = false;
         let mut want_users = false;
         let was_picked = picked.is_some();
         let pick_in = picked.and_then(|p| f.menu.take().map(|m| (p, m)));
@@ -1252,6 +1271,11 @@ impl App {
                         new_cursor = Some(trigger_chars(&f.text));
                     }
                     color = Some(c);
+                }
+                Pick::NewPage => {
+                    f.text = m.replace(&f.text, col, "");
+                    new_cursor = Some(trigger_chars(&f.text));
+                    new_page = true;
                 }
                 // a mention goes in as its Markdown token and is committed
                 // with the row
@@ -1309,6 +1333,9 @@ impl App {
         f.prev_len = f.text.len();
         if let Some(color) = color {
             act = Some(Action::Color { text: f.text.clone(), color });
+        }
+        if new_page {
+            act = Some(Action::NewPage(Some(f.text.clone())));
         }
         if let Some((kind, typed)) = convert {
             let at = new_cursor.unwrap_or_else(|| f.text.chars().count());

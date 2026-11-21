@@ -17,10 +17,16 @@ impl App {
     // ponytail: snapshots the whole page + op table per step and keeps only the
     // changed rows; diff per block if huge pages make edits lag
     pub(crate) fn step<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let Some(page) = self.current.clone().filter(|_| !self.stepping) else {
+        self.step_page(self.current.iter().cloned().collect(), f)
+    }
+
+    /// [`step`](Self::step) for edits of `pages`, which needn't be open: the
+    /// first is the step's page (what undo shows), the rest are also changed.
+    pub(crate) fn step_page<R>(&mut self, pages: Vec<String>, f: impl FnOnce(&mut Self) -> R) -> R {
+        let Some(page) = pages.first().cloned().filter(|_| !self.stepping) else {
             return f(self);
         };
-        let cp = sync::checkpoint(&self.store, &[&page]);
+        let cp = sync::checkpoint(&self.store, &pages.iter().map(String::as_str).collect::<Vec<_>>());
         self.stepping = true;
         let r = f(self);
         self.stepping = false;
@@ -43,7 +49,7 @@ impl App {
     /// command is in flight (a pull writes rows it read before the undo) or
     /// the switcher is open; refused once the edit's op was completed.
     pub(crate) fn undo_redo(&mut self, back: bool) {
-        if !self.sent.is_empty() || self.switcher.is_some() || !self.flush() {
+        if !self.sent.is_empty() || self.switcher.is_some() || self.dlg.is_some() || !self.flush() {
             return;
         }
         let Some((page, c)) = (if back { &mut self.undo } else { &mut self.redo }).pop() else {
@@ -60,7 +66,9 @@ impl App {
             Ok(true) => {
                 let inv = (page.clone(), c.inverse());
                 if back { &mut self.redo } else { &mut self.undo }.push(inv);
-                if self.current.as_deref() != Some(page.as_str()) {
+                // not into a trashed page (redoing a trash, undoing a restore)
+                let trashed = self.store.get_page(&page).ok().flatten().is_none_or(|p| p.in_trash);
+                if self.current.as_deref() != Some(page.as_str()) && !trashed {
                     self.pending_open = None;
                     self.set_current(&page);
                 }
@@ -73,6 +81,11 @@ impl App {
                     _ => "can't undo: pushed or changed since".into(),
                 });
             }
+        }
+        // redoing a trash of the open page, or undoing its creation
+        if let Some(id) = self.current.clone().filter(|id| !self.cached(id) || self.store.get_page(id).ok().flatten().is_some_and(|p| p.in_trash)) {
+            self.current = None;
+            self.info = Some(format!("page {id} is gone"));
         }
         self.refresh();
         self.reveal_current();

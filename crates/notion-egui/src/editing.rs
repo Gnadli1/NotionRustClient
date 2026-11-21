@@ -328,6 +328,7 @@ impl App {
             || self.focus.is_some()
             || self.title_edit.is_some()
             || self.switcher.is_some()
+            || self.dlg.is_some()
             || self.conflict.is_some()
             || self.problems_open
             || self.comments.is_some()
@@ -1313,7 +1314,7 @@ mod tests {
         w.app.apply(Action::Open("p".into()));
         w.frames(vec![]);
         // the layout is unknown: scan the first card down the page
-        for y in (60..200).step_by(4) {
+        for y in (60..260).step_by(4) {
             let pos = Pos2::new(330.0, y as f32);
             let ev = |pressed| Event::PointerButton {
                 pos,

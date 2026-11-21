@@ -58,6 +58,8 @@ pub struct Switcher {
     /// The selected page's first rows (id, lines), loaded when the selection
     /// changes.
     pub preview: Option<(String, Vec<String>)>,
+    /// Move-to mode: the page being moved; a pick is its new parent.
+    pub moving: Option<String>,
     typed_at: Instant,
     searched: String,
 }
@@ -73,6 +75,7 @@ impl Default for Switcher {
             days: HashMap::new(),
             paths: HashMap::new(),
             preview: None,
+            moving: None,
             typed_at: Instant::now(),
             searched: String::new(),
         }
