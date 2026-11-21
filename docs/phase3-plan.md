@@ -134,3 +134,12 @@ I pulled all 164 pages shared with the integration into the cache. One failed wi
 3. **Empty pages and pages with a queued title edit** are re-fetched on every sync-all (cost only).
 4. **The iced app** shows database entries but refuses to open them.
 5. **Not yet run against live Notion.** Try `notion-cli sync-all` or Ctrl+Shift+Y.
+
+## Known gaps after F2 (reviewed, deferred)
+1. **heading_4** renders when Notion sends it but isn't offered in the `/` menu (API support unconfirmed).
+2. **Move up** re-creates the block above (new id, its backlinks lost); refused if that block has comments or can't be moved.
+3. **Delete/Cut on a selection** is refused when it contains images, child pages, tables or other non-text blocks.
+4. **Enter inside a mention, equation or link URL** doesn't split; it adds an empty block below.
+5. **Copy/paste** flattens nesting; multi-line code isn't fenced. Duplicating a callout loses its custom icon.
+6. **Colours** appear in the `/` menu only after 3+ typed letters (`/far`, `/col`, `/hin`).
+7. **Untested on screen:** Ctrl+Alt+T on the Austrian layout, colours, the selection highlight.
