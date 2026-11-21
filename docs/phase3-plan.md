@@ -90,3 +90,10 @@ I pulled all 164 pages shared with the integration into the cache. One failed wi
 5. **After undoing a block conversion** the editor loses focus.
 6. **No way back from the title** with ↓ or Enter.
 7. **Not clickable yet:** databases (F4) and links inside table cells.
+
+## Known gaps after C1 (reviewed, deferred)
+1. **The integration needs comment access.** Turn on "Read comments" and "Insert comments" under the integration's Capabilities at notion.so/my-integrations. Without them, Notion answers 403. Checked live on 2026-11-21: listing comments returned 403 `restricted_resource`.
+2. **Block comments are fetched only when the panel shows that block.** A pull fetches just the page's own threads, because Notion has no endpoint that lists every comment on a page. Until the panel has shown a block, its 💬 count is missing, and moving or converting it isn't refused even if it has comments on Notion. Those comments would be lost on Notion.
+3. **Editing and deleting comments are documented only for API version 2026-03-11.** Under our 2025-09-03 they're untested. If Notion refuses them, they show as failed in the problem list.
+4. **The comment box doesn't have the `@` menu.** To mention a page there, you type the `@[label](page:id)` token yourself.
+5. **A block creation that fails right after it was sent can still post the block twice.** The same thing was fixed for comments in C1.
