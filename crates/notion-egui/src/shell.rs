@@ -455,6 +455,20 @@ impl App {
                     self.last_error = Some(format!("users not loaded: {e}"));
                 }
             }
+            Event::Fetched { op, what } => {
+                if let Some(p) = self.conflict.as_mut().filter(|p| p.op == op) {
+                    p.got(what);
+                }
+            }
+            Event::Resolved(_) => {
+                self.conflict = None;
+                // the op and the cache changed under the undo steps
+                self.undo.clear();
+                self.redo.clear();
+                self.last_error = None;
+                self.info = Some("re-queued: Ctrl+S pushes it".into());
+                self.refresh();
+            }
             Event::SearchResults(r) => {
                 if let Some(sw) = &mut self.switcher {
                     sw.results = r;
@@ -462,8 +476,19 @@ impl App {
             }
             Event::Error(e) => {
                 // a failed comment fetch says nothing about the page being opened
-                if !matches!(answered, Some(Cmd::PullComments { .. } | Cmd::Me)) {
+                if !matches!(answered, Some(Cmd::PullComments { .. } | Cmd::Me | Cmd::Fetch { .. } | Cmd::Resolve { .. })) {
                     self.pending_open = None;
+                }
+                match (&answered, &mut self.conflict) {
+                    // only the open panel's own fetch: a late answer for a closed one is not its
+                    (Some(Cmd::Fetch { op }), Some(p)) if p.op == *op => p.error_fetching = Some(e.clone()),
+                    // Notion's text moved on: show the new one
+                    (Some(Cmd::Resolve { op, .. }), Some(p)) if p.op == *op && e.contains("changed again") => {
+                        p.fetched = None;
+                        p.error_fetching = None;
+                        self.send(Cmd::Fetch { op: *op });
+                    }
+                    _ => {}
                 }
                 // a push can fail after applying some ops
                 self.refresh();
@@ -676,6 +701,7 @@ impl App {
         if self.pushing() || !self.commit() {
             return;
         }
+        self.conflict = None;
         // undo steps may hold the discarded ops
         self.undo.clear();
         self.redo.clear();
@@ -809,11 +835,49 @@ impl App {
             self.sidebar = !self.sidebar;
             out.retain(|c| *c != Command::ToggleSidebar);
         }
-        if self.problems_open
-            && self.switcher.is_none()
-            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
-        {
-            self.problems_open = false;
+        if self.switcher.is_some() {
+            // the switcher has Esc
+        } else if let Some(p) = &self.conflict {
+            // Esc closes it and changes nothing; Ctrl+Enter is Use merged
+            let op = p.op;
+            // not while another text box (a comment draft, the editor) has the keys
+            let mine = !ctx.egui_wants_keyboard_input() || ctx.memory(|m| m.has_focus(p.merged_id));
+            let (esc, go) = if mine {
+                ctx.input_mut(|i| {
+                    (
+                        i.consume_key(Modifiers::NONE, Key::Escape),
+                        keys::take_exact(&mut i.events, Modifiers::CTRL, Key::Enter).0 > 0,
+                    )
+                })
+            } else {
+                (false, false)
+            };
+            if esc {
+                self.conflict = None;
+            } else if go {
+                self.merge_conflict(op);
+            }
+        } else if self.problems_open {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.problems_open = false;
+            } else if ctx.memory(|m| m.focused().is_none()) {
+                // the selected entry: Up/Down move it, Enter opens it
+                let (up, down, enter) = ctx.input_mut(|i| {
+                    (
+                        i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                        i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                        i.consume_key(Modifiers::NONE, Key::Enter),
+                    )
+                });
+                let last = self.problems.len().saturating_sub(1);
+                let sel = self.problem_sel.min(last);
+                self.problem_sel = if up { sel.saturating_sub(1) } else if down { (sel + 1).min(last) } else { sel };
+                if enter {
+                    if let Some(p) = self.problems.get(self.problem_sel) {
+                        self.open_conflict(p.op);
+                    }
+                }
+            }
         }
         out
     }
@@ -1042,8 +1106,10 @@ impl App {
         page.extend(acts);
         let mut acts = page;
         if self.problems_open {
-            acts.extend(view::status::problems(&ctx, c, &self.problems));
+            let sel = self.problem_sel.min(self.problems.len().saturating_sub(1));
+            acts.extend(view::status::problems(&ctx, c, &self.problems, sel));
         }
+        acts.extend(self.conflict_ui(&ctx, c));
         if let Some(mut sw) = self.switcher.take() {
             let items = sw.items(&self.tree, &self.recent);
             let out = view::switcher::show(&ctx, c, &mut sw, &items);

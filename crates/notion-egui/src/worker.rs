@@ -27,6 +27,12 @@ pub enum Cmd {
     Me,
     /// Fetches the workspace's users (`sync::pull_users`) into the cache.
     PullUsers,
+    /// Gets Notion's version of a conflict op's object, for the conflict panel.
+    Fetch { op: i64 },
+    /// Keep mine, or Merge with Markdown `merged`: re-queues the conflict op
+    /// against Notion's version (`sync::resolve_mine`), if its text is still
+    /// `seen`, the Notion text the panel showed.
+    Resolve { op: i64, merged: Option<String>, seen: Option<String> },
 }
 
 #[derive(Debug, PartialEq)]
@@ -43,6 +49,8 @@ pub enum Event {
     UsersPulled,
     /// `GET /v1/users` said 403: the integration lacks "read user information".
     UsersDenied,
+    Fetched { op: i64, what: sync::Fetched },
+    Resolved(i64),
     Error(String),
 }
 
@@ -76,6 +84,14 @@ pub async fn run(
                 Err(Error::Api { status: 403, .. }) => Ok(Event::UsersDenied),
                 Err(e) => Err(e),
             },
+            Cmd::Fetch { op } => sync::fetch_conflict(client, store, op)
+                .await
+                .map(|what| Event::Fetched { op, what }),
+            Cmd::Resolve { op, merged, seen } => {
+                sync::resolve_mine(client, store, op, merged.as_deref(), seen.as_deref())
+                    .await
+                    .map(|_| Event::Resolved(op))
+            }
             Cmd::Search(q) => client.search(&q).await.map(|rs| {
                 Event::SearchResults(
                     rs.into_iter()
@@ -233,6 +249,60 @@ mod tests {
         let (tx, rx, handle) = spawn_with(dir.path().join("cache.db"), egui::Context::default(), || None);
         tx.send(Cmd::PullUsers).unwrap();
         assert!(matches!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Event::Error(m) if m.starts_with("offline")));
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    /// Fetch and Resolve are each answered by exactly one event, whatever
+    /// Notion says: the app's `sent` queue pairs commands with events.
+    #[test]
+    fn fetch_and_resolve_are_answered_by_exactly_one_event() {
+        use notion_core::api::ClientConfig;
+        use notion_core::ops::{OpKind, OpStatus};
+        let block = r#"{"object":"block","id":"b","parent":{"type":"page_id","page_id":"p"},"type":"paragraph","paragraph":{"rich_text":[{"type":"text","text":{"content":"theirs"},"plain_text":"theirs","annotations":{}}]},"has_children":false,"in_trash":false,"created_time":"2025-01-01T00:00:00.000Z","last_edited_time":"2025-01-02T00:00:00.000Z"}"#;
+        let err = r#"{"object":"error","status":500,"code":"x","message":"m"}"#;
+        let gone = r#"{"object":"error","status":404,"code":"object_not_found","message":"m"}"#;
+        for (status, body) in [(200, block), (404, gone), (500, err)] {
+            for resolve in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = dir.path().join("cache.db");
+                let store = Store::open(&db).unwrap();
+                let rt = serde_json::json!([{"type":"text","text":{"content":"mine"},"plain_text":"mine","annotations":{}}]);
+                let op = store
+                    .enqueue(OpKind::UpdateBlock { block_id: "b".into(), body: serde_json::json!({ "paragraph": { "rich_text": rt } }) }, None, None)
+                    .unwrap();
+                store.mark_op(op, OpStatus::Conflict, Some("remote edited")).unwrap();
+                let url = serve(status, body);
+                let (tx, rx, handle) = spawn_with(db.clone(), egui::Context::default(), move || {
+                    Some(Client::new("t".into(), ClientConfig { base_url: url, max_retries: 0, ..Default::default() }))
+                });
+                tx.send(if resolve { Cmd::Resolve { op, merged: None, seen: None } } else { Cmd::Fetch { op } }).unwrap();
+                tx.send(Cmd::Me).unwrap(); // the next event is Me's: the first made just one
+                let ev = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                match (resolve, status) {
+                    (false, 200) => assert!(matches!(&ev, Event::Fetched { what: sync::Fetched::Text { theirs, .. }, .. } if theirs == "theirs"), "{ev:?}"),
+                    (false, 404) => assert_eq!(ev, Event::Fetched { op, what: sync::Fetched::Gone }),
+                    (true, 200) => {
+                        assert_eq!(ev, Event::Resolved(op));
+                        assert_eq!(store.queued_ops().unwrap().len(), 1, "re-queued");
+                    }
+                    (true, 404) => assert!(matches!(&ev, Event::Error(m) if m.contains("gone")), "{ev:?}"),
+                    _ => assert!(matches!(&ev, Event::Error(m) if m.contains("500")), "{ev:?}"),
+                }
+                assert!(matches!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Event::Me(_) | Event::Error(_)));
+                drop(tx);
+                handle.join().unwrap();
+                assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "no stray event");
+            }
+        }
+        // a conflict that is gone from the queue is an error too, not silence
+        let dir = tempfile::tempdir().unwrap();
+        let url = serve(200, block);
+        let (tx, rx, handle) = spawn_with(dir.path().join("cache.db"), egui::Context::default(), move || {
+            Some(Client::new("t".into(), ClientConfig { base_url: url, max_retries: 0, ..Default::default() }))
+        });
+        tx.send(Cmd::Fetch { op: 99 }).unwrap();
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Event::Error(m) if m.contains("not a conflict")));
         drop(tx);
         handle.join().unwrap();
     }

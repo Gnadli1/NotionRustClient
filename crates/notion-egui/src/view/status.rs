@@ -55,8 +55,9 @@ pub fn show(ui: &mut Ui, c: &Colors, s: &Status) -> Option<Action> {
 }
 
 /// The conflict/failed ops over the page's bottom-left corner: click one to
-/// go to it, or discard it (the remote version wins).
-pub fn problems(ctx: &Context, c: &Colors, list: &[Problem]) -> Option<Action> {
+/// go to it, or resolve it: the panel for a conflict, or Keep theirs (the
+/// remote version wins). Up/Down select, Enter opens the panel.
+pub fn problems(ctx: &Context, c: &Colors, list: &[Problem], sel: usize) -> Option<Action> {
     let mut act = None;
     Area::new(Id::unique("problems"))
         .order(Order::Foreground)
@@ -65,7 +66,7 @@ pub fn problems(ctx: &Context, c: &Colors, list: &[Problem]) -> Option<Action> {
             Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_width(480.0);
                 ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                    for p in list {
+                    for (i, p) in list.iter().enumerate() {
                         ui.horizontal(|ui| {
                             let mut job = LayoutJob::default();
                             job.append(
@@ -85,12 +86,18 @@ pub fn problems(ctx: &Context, c: &Colors, list: &[Problem]) -> Option<Action> {
                                     ..Default::default()
                                 },
                             );
-                            let w = ui.available_width() - 70.0;
-                            let open = Button::new(job).frame(false).min_size(egui::vec2(w, 0.0));
+                            let w = ui.available_width() - if p.conflict { 190.0 } else { 80.0 };
+                            let open = Button::new(job)
+                                .frame(false)
+                                .selected(i == sel)
+                                .min_size(egui::vec2(w, 0.0));
                             if ui.add(open).clicked() {
                                 act = Some(Action::OpenProblem(p.op));
                             }
-                            if ui.button("Discard").clicked() {
+                            if p.conflict && ui.button("Resolve…").clicked() {
+                                act = Some(Action::Resolve(p.op));
+                            }
+                            if ui.button(if p.conflict { "Keep theirs" } else { "Discard" }).clicked() {
                                 act = Some(Action::Discard(p.op));
                             }
                         });

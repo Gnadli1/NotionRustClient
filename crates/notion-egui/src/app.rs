@@ -144,7 +144,13 @@ pub(crate) enum Action {
     Search,
     ToggleProblems,
     OpenProblem(i64),
+    /// Keep theirs: the old Discard.
     Discard(i64),
+    /// Opens the conflict panel for an op.
+    Resolve(i64),
+    KeepMine(i64),
+    /// Use merged: the panel's text.
+    Merge(i64),
     /// A row's 💬 count: the comments panel on that row.
     OpenComments(String),
     CloseComments,
@@ -235,6 +241,10 @@ pub struct App {
     pub(crate) problem_ids: HashSet<String>,
     pub(crate) problems: Vec<Problem>,
     pub(crate) problems_open: bool,
+    /// The conflict list's selected entry (Up/Down, Enter opens it).
+    pub(crate) problem_sel: usize,
+    /// The conflict panel, while open.
+    pub(crate) conflict: Option<crate::resolve::Panel>,
     /// The comments panel, while open.
     pub(crate) comments: Option<crate::comments::Panel>,
     /// Cached comments per page or block of the open page (the 💬 counts).
@@ -402,6 +412,8 @@ impl App {
             problem_ids: HashSet::new(),
             problems: Vec::new(),
             problems_open: false,
+            problem_sel: 0,
+            conflict: None,
             comments: None,
             comment_counts: HashMap::new(),
             me: None,
@@ -597,9 +609,13 @@ impl App {
             Action::Search => self.open_switcher(),
             Action::ToggleProblems => {
                 self.problems_open = !self.problems_open && !self.problems.is_empty();
+                self.problem_sel = 0;
             }
             Action::OpenProblem(op) => self.open_problem(op),
             Action::Discard(op) => self.discard(op),
+            Action::Resolve(op) => self.open_conflict(op),
+            Action::KeepMine(op) => self.resolve(op, None),
+            Action::Merge(op) => self.merge_conflict(op),
             Action::OpenComments(block) => self.open_comments(Some(block)),
             Action::CloseComments => self.close_comments(false),
             Action::CommentSend(target, text) => self.send_comment(target, text),

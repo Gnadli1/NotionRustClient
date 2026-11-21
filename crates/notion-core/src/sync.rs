@@ -8,10 +8,10 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use crate::api::{BlockNode, Client};
-use crate::markdown::split_runs;
+use crate::markdown::{from_markdown, is_markdown_editable, split_runs, to_markdown};
 use crate::model::{
-    users_in, Block, BlockKind, Comment, Page, Parent, PropertyValue, RichText, TargetKind,
-    TextBlock, User,
+    plain_text, users_in, Block, BlockKind, Comment, Page, Parent, PropertyValue, RichText,
+    TargetKind, TextBlock, User,
 };
 use crate::ops::{CommentTarget, Op, OpKind, OpStatus};
 use crate::store::{ts, Store};
@@ -707,6 +707,252 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
     Ok(Outcome::Applied)
 }
 
+// ---------------------------------------------------------------- resolving conflicts
+
+/// The remote copy of what a conflicted op targets.
+pub enum Remote {
+    Block(Block),
+    Page(Page),
+    Comment(Comment),
+}
+
+/// What Notion has now, for the conflict panel.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fetched {
+    /// Deleted, trashed or no longer readable: only Keep theirs is left.
+    Gone,
+    /// Not a text edit: no texts to compare or merge.
+    Other,
+    /// A text edit: both versions as the editor shows them (Markdown).
+    Text { mine: String, theirs: String },
+}
+
+fn conflict_op(store: &Store, id: i64) -> Result<Op> {
+    store
+        .ops_by_status(OpStatus::Conflict)?
+        .into_iter()
+        .find(|o| o.id == id)
+        .ok_or_else(|| Error::Invalid(format!("op {id} is not a conflict")))
+}
+
+/// Gets the object an op targets; `None` if it is gone (404 or in the trash).
+pub async fn fetch_remote(client: &Client, store: &Store, op: &Op) -> Result<Option<Remote>> {
+    let id = store.resolve_id(op.kind.target_id())?;
+    let got = match &op.kind {
+        OpKind::UpdateBlock { .. } | OpKind::DeleteBlock { .. } | OpKind::MoveBlock { .. } => client
+            .get_block(&id)
+            .await
+            .map(|b| (!b.in_trash).then_some(Remote::Block(b))),
+        OpKind::UpdatePageProperties { .. } => client
+            .get_page(&id)
+            .await
+            .map(|p| (!p.in_trash).then_some(Remote::Page(p))),
+        OpKind::UpdateComment { .. } | OpKind::DeleteComment { .. } => {
+            client.get_comment(&id).await.map(|c| Some(Remote::Comment(c)))
+        }
+        _ => return Err(Error::Invalid("only edits, deletes and moves conflict".into())),
+    };
+    match got {
+        Err(Error::Api { status: 404, .. }) => Ok(None),
+        other => other,
+    }
+}
+
+/// The title property of an UpdatePageProperties body: its key and runs.
+fn title_items(props: &Value) -> Option<(&String, &Vec<Value>)> {
+    props
+        .as_object()?
+        .iter()
+        .find_map(|(k, v)| Some((k, v["title"].as_array()?)))
+}
+
+/// (yours, Notion's) as the editor shows them; `None` unless a text edit
+/// that Markdown carries (else a merge would drop formatting).
+fn texts(op: &Op, remote: &Remote) -> Option<(String, String)> {
+    let md = |rt: &[RichText], code| if code { plain_text(rt) } else { to_markdown(rt) };
+    let rich = |v: &Value| serde_json::from_value::<Vec<RichText>>(v.clone()).ok();
+    Some(match (&op.kind, remote) {
+        (OpKind::UpdateBlock { body, .. }, Remote::Block(b)) => {
+            let code = matches!(b.kind, BlockKind::Code { .. });
+            let mine = rich(&body[b.kind.type_name()]["rich_text"])?;
+            let theirs = &b.kind.text()?.rich_text;
+            if !code && !(is_markdown_editable(&mine) && is_markdown_editable(theirs)) {
+                return None;
+            }
+            (md(&mine, code), md(theirs, code))
+        }
+        (OpKind::UpdatePageProperties { properties, .. }, Remote::Page(p)) => {
+            // a merge rewrites the title only
+            if properties.as_object()?.len() != 1 {
+                return None;
+            }
+            let (_, items) = title_items(properties)?;
+            let mine = items.iter().filter_map(|i| i["text"]["content"].as_str());
+            (mine.collect(), p.title())
+        }
+        (OpKind::UpdateComment { rich_text, .. }, Remote::Comment(c)) => {
+            let mine = rich(rich_text)?;
+            if !(is_markdown_editable(&mine) && is_markdown_editable(&c.rich_text)) {
+                return None;
+            }
+            (to_markdown(&mine), to_markdown(&c.rich_text))
+        }
+        _ => return None,
+    })
+}
+
+/// Fetches Notion's version of a conflict op's object, for the panel.
+pub async fn fetch_conflict(client: &Client, store: &Store, op_id: i64) -> Result<Fetched> {
+    let op = conflict_op(store, op_id)?;
+    Ok(match fetch_remote(client, store, &op).await? {
+        None => Fetched::Gone,
+        Some(r) => match texts(&op, &r) {
+            Some((mine, theirs)) => Fetched::Text { mine, theirs },
+            None => Fetched::Other,
+        },
+    })
+}
+
+/// Re-queues a conflict op against `remote`: that version becomes its base,
+/// so the next push applies it. The cache shows what that push will write.
+pub fn rebase_op(store: &Store, op_id: i64, remote: &Remote) -> Result<()> {
+    let op = conflict_op(store, op_id)?;
+    let (time, raw) = match remote {
+        Remote::Block(b) => (b.last_edited_time, serde_json::to_value(b)?),
+        Remote::Page(p) => (p.last_edited_time, serde_json::to_value(p)?),
+        Remote::Comment(c) => (c.last_edited_time, serde_json::to_value(c)?),
+    };
+    // a later queued op on the object already left its version in the cache
+    let target = store.resolve_id(op.kind.target_id())?;
+    let mut later = false;
+    for o in store
+        .queued_ops()?
+        .into_iter()
+        .chain(store.ops_by_status(OpStatus::Conflict)?)
+        .chain(store.ops_by_status(OpStatus::Failed)?)
+    {
+        later |= o.id > op_id && store.resolve_id(o.kind.target_id())? == target;
+    }
+    store.atomic(|| {
+        match (&op.kind, remote) {
+            _ if later => {}
+            (OpKind::UpdateBlock { body, .. }, Remote::Block(b)) => {
+                // the remote block with the body's fields written over it
+                let t = b.kind.type_name();
+                let mut raw = b.raw.clone();
+                if let (Some(to), Some(from)) = (
+                    raw.get_mut(t).and_then(Value::as_object_mut),
+                    body.get(t).and_then(Value::as_object),
+                ) {
+                    to.extend(from.clone());
+                }
+                store.put_block(&serde_json::from_value(raw)?)?;
+            }
+            (OpKind::DeleteBlock { block_id }, _) => store.delete_block(&store.resolve_id(block_id)?)?,
+            (
+                OpKind::MoveBlock {
+                    block_id,
+                    new_parent_id,
+                    after,
+                },
+                _,
+            ) => {
+                let after = after.as_deref().map(|a| store.resolve_id(a)).transpose()?;
+                if let Err(e) = store.move_block_local(
+                    &store.resolve_id(block_id)?,
+                    &store.resolve_id(new_parent_id)?,
+                    after.as_deref(),
+                ) {
+                    tracing::warn!("rebased move of {block_id} not shown in cache: {e}");
+                }
+            }
+            (OpKind::UpdatePageProperties { properties, .. }, Remote::Page(p)) => {
+                let mut p = p.clone();
+                if let Some((k, items)) = title_items(properties) {
+                    let t: String = items.iter().filter_map(|i| i["text"]["content"].as_str()).collect();
+                    p.properties.insert(k.clone(), PropertyValue::Title(title_runs(&t)));
+                }
+                store.upsert_page(&p)?;
+            }
+            (OpKind::UpdateComment { rich_text, .. }, Remote::Comment(c)) => {
+                let mut c = c.clone();
+                c.rich_text = serde_json::from_value(rich_text.clone())?;
+                store.put_comment(&c)?;
+            }
+            _ => {}
+        }
+        store.conn.execute(
+            "UPDATE ops SET status = 'queued', error = NULL,
+               base_last_edited_time = ?2, base_raw = ?3 WHERE id = ?1",
+            rusqlite::params![op_id, ts(&time), raw.to_string()],
+        )?;
+        Ok(())
+    })
+}
+
+/// `op` with its text replaced by `md` (Markdown as the editor shows it,
+/// converted as the editor's commit does).
+fn merged_kind(op: &Op, remote: &Remote, md: &str) -> Result<OpKind> {
+    let bad = || Error::Invalid("only text edits can be merged".into());
+    let (mine, _) = texts(op, remote).ok_or_else(bad)?;
+    let mut kind = op.kind.clone();
+    // untouched: keep the rich text as it is, whatever Markdown can't carry
+    if mine == md {
+        return Ok(kind);
+    }
+    match (&mut kind, remote) {
+        (OpKind::UpdateBlock { body, .. }, Remote::Block(b)) => {
+            let rich = if matches!(b.kind, BlockKind::Code { .. }) {
+                title_runs(md)
+            } else {
+                from_markdown(md)
+            };
+            let slot = body
+                .get_mut(b.kind.type_name())
+                .and_then(|p| p.get_mut("rich_text"))
+                .ok_or_else(bad)?;
+            *slot = json!(split_runs(rich));
+        }
+        (OpKind::UpdatePageProperties { properties, .. }, _) => {
+            let key = title_items(properties).ok_or_else(bad)?.0.clone();
+            properties[key.as_str()] = json!({ "title": title_body(&title_runs(md)) });
+        }
+        (OpKind::UpdateComment { rich_text, .. }, _) => {
+            *rich_text = json!(split_runs(from_markdown(md)));
+        }
+        _ => return Err(bad()),
+    }
+    Ok(kind)
+}
+
+/// Keep mine / Merge: fetches Notion's version, rewrites the op's text from
+/// `merged` if given, and re-queues it against that version. Refused when
+/// the object is gone, or when Notion's text is no longer `seen` (what the
+/// panel showed): the user has to look at the new one.
+pub async fn resolve_mine(
+    client: &Client,
+    store: &Store,
+    op_id: i64,
+    merged: Option<&str>,
+    seen: Option<&str>,
+) -> Result<()> {
+    let op = conflict_op(store, op_id)?;
+    let remote = fetch_remote(client, store, &op).await?.ok_or_else(|| {
+        Error::Invalid("it is gone from Notion: only Keep theirs is left".into())
+    })?;
+    if let Some(seen) = seen {
+        if texts(&op, &remote).is_none_or(|(_, theirs)| theirs != seen) {
+            return Err(Error::Invalid("Notion changed again: review it".into()));
+        }
+    }
+    store.atomic(|| {
+        if let Some(md) = merged {
+            store.update_op_kind(op_id, &merged_kind(&op, &remote, md)?)?;
+        }
+        rebase_op(store, op_id, &remote)
+    })
+}
+
 // ---------------------------------------------------------------- local edits
 
 /// Moving (copy, then delete) or converting a block gives it a new id, which
@@ -895,6 +1141,22 @@ fn keep_queued_props(store: &Store, page: &mut Page) -> Result<()> {
     Ok(())
 }
 
+/// Plain text as runs (none for ""), split at Notion's length limit.
+fn title_runs(t: &str) -> Vec<RichText> {
+    if t.is_empty() {
+        Vec::new()
+    } else {
+        split_runs(vec![RichText::plain(t)])
+    }
+}
+
+/// The runs as a title property's request items.
+fn title_body(runs: &[RichText]) -> Vec<Value> {
+    runs.iter()
+        .map(|r| json!({ "type": "text", "text": { "content": r.plain_text } }))
+        .collect()
+}
+
 /// Sets a cached page's title (plain text) and queues
 /// `{"<title key>":{"title":[..]}}`, merged into this page's queued property
 /// update if there is one. Returns the op id.
@@ -908,15 +1170,8 @@ pub fn local_set_title(store: &Store, page_id: &str, title: &str) -> Result<i64>
         .find(|(_, v)| matches!(v, PropertyValue::Title(_)))
         .map(|(k, _)| k.clone())
         .ok_or_else(|| Error::Invalid(format!("page {page_id} has no title property")))?;
-    let runs = if title.is_empty() {
-        Vec::new()
-    } else {
-        split_runs(vec![RichText::plain(title)])
-    };
-    let body: Vec<Value> = runs
-        .iter()
-        .map(|r| json!({ "type": "text", "text": { "content": r.plain_text } }))
-        .collect();
+    let runs = title_runs(title);
+    let body = title_body(&runs);
     let mut page = base.clone();
     page.properties
         .insert(key.clone(), PropertyValue::Title(runs));
@@ -4412,4 +4667,254 @@ mod tests {
         assert!(matches!(e, Error::Api { status: 403, .. }), "{e:?}");
         assert_eq!(s.received_requests().await.unwrap().len(), 1, "no retry loop");
     }
+
+    // ---- resolving conflicts
+
+    /// Block "b" edited locally to "mine" and found in conflict with a remote
+    /// "theirs" at T2; returns the conflict op's id.
+    async fn conflicted(s: &MockServer, store: &Store) -> i64 {
+        seed(s, store, &["b"]).await;
+        let op = local_edit_text(store, "b", "mine").unwrap();
+        get(s, "/v1/blocks/b", ok(blk("b", pp("p"), "theirs", T2, false))).await;
+        let r = push(&client(s), store).await.unwrap();
+        assert_eq!((r.applied, r.conflicts), (0, 1));
+        op
+    }
+
+    #[tokio::test]
+    async fn keep_mine_rebases_and_the_next_push_applies_it_with_later_ops() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let op = conflicted(&s, &store).await;
+        // a later edit of the same block, queued after the conflict
+        local_edit_text(&store, "b", "mine 2").unwrap();
+        resolve_mine(&client(&s), &store, op, None, None).await.unwrap();
+        assert!(store.ops_by_status(OpStatus::Conflict).unwrap().is_empty());
+        let q = store.queued_ops().unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0].id, op);
+        assert_eq!(q[0].error, None);
+        assert_eq!(ts(&q[0].base_last_edited_time.unwrap()), T2);
+        assert_eq!(text(&store, "b"), "mine 2", "the later edit stays in the cache");
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/b"))
+            .respond_with(ok(blk("b", pp("p"), "mine 2", "2025-01-03T00:00:00.000Z", false)))
+            .expect(2)
+            .mount(&s)
+            .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!((r.applied, r.conflicts, r.failed), (2, 0, 0), "{r:?}");
+        assert!(store.queued_ops().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn keep_mine_shows_the_pushed_version_in_the_cache() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let op = conflicted(&s, &store).await;
+        // a pull in between brought Notion's text into the cache
+        get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
+        get(&s, "/v1/blocks/p/children", list(vec![blk("b", pp("p"), "theirs", T2, false)])).await;
+        pull_page(&client(&s), &store, "p", true).await.unwrap();
+        assert_eq!(text(&store, "b"), "theirs");
+        resolve_mine(&client(&s), &store, op, None, None).await.unwrap();
+        assert_eq!(text(&store, "b"), "mine");
+    }
+
+    #[tokio::test]
+    async fn keep_mine_on_a_gone_remote_is_refused() {
+        for gone in [
+            ResponseTemplate::new(404).set_body_json(json!({
+                "object": "error", "status": 404, "code": "object_not_found", "message": "gone" })),
+            ok({
+                let mut b = blk("b", pp("p"), "theirs", T2, false);
+                b["in_trash"] = json!(true);
+                b
+            }),
+        ] {
+            let s = MockServer::start().await;
+            let store = Store::open_in_memory().unwrap();
+            let op = conflicted(&s, &store).await;
+            s.reset().await;
+            get(&s, "/v1/blocks/b", gone).await;
+            assert_eq!(fetch_conflict(&client(&s), &store, op).await.unwrap(), Fetched::Gone);
+            let e = resolve_mine(&client(&s), &store, op, None, None).await.unwrap_err();
+            assert!(e.to_string().contains("gone"), "{e}");
+            assert_eq!(store.ops_by_status(OpStatus::Conflict).unwrap().len(), 1, "still a conflict");
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_writes_the_merged_rich_text() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let op = conflicted(&s, &store).await;
+        assert_eq!(
+            fetch_conflict(&client(&s), &store, op).await.unwrap(),
+            Fetched::Text { mine: "mine".into(), theirs: "theirs".into() }
+        );
+        resolve_mine(&client(&s), &store, op, Some("mine and **theirs**"), None).await.unwrap();
+        assert_eq!(text(&store, "b"), "mine and theirs");
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/b"))
+            .and(body_partial_json(json!({ "paragraph": { "rich_text": [
+                { "text": { "content": "mine and " } },
+                { "text": { "content": "theirs" }, "annotations": { "bold": true } } ] } })))
+            .respond_with(ok(blk("b", pp("p"), "mine and theirs", "2025-01-03T00:00:00.000Z", false)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!((r.applied, r.conflicts, r.failed), (1, 0, 0), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn merge_a_title_and_a_comment() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        // title
+        let c = client(&s);
+        store.upsert_page(&serde_json::from_value(titled("t", T, "old")).unwrap()).unwrap();
+        let op = local_set_title(&store, "t", "mine").unwrap();
+        get(&s, "/v1/pages/t", ok(titled("t", T2, "theirs"))).await;
+        let r = push(&c, &store).await.unwrap();
+        assert_eq!(r.conflicts, 1);
+        assert_eq!(
+            fetch_conflict(&c, &store, op).await.unwrap(),
+            Fetched::Text { mine: "mine".into(), theirs: "theirs".into() }
+        );
+        resolve_mine(&c, &store, op, Some("mine + theirs"), None).await.unwrap();
+        assert_eq!(store.get_page("t").unwrap().unwrap().title(), "mine + theirs");
+        Mock::given(method("PATCH"))
+            .and(path("/v1/pages/t"))
+            .and(body_partial_json(json!({ "properties": { "Name": { "title": [
+                { "text": { "content": "mine + theirs" } }] } } })))
+            .respond_with(ok(titled("t", "2025-01-03T00:00:00.000Z", "mine + theirs")))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let r = push(&c, &store).await.unwrap();
+        assert_eq!((r.applied, r.conflicts, r.failed), (1, 0, 0), "{r:?}");
+
+        // comment
+        store.put_comment(&serde_json::from_value(cm("c1", "d1", bp("a"), "old", T)).unwrap()).unwrap();
+        let op = local_edit_comment(&store, "c1", rt("mine")).unwrap();
+        get(&s, "/v1/comments/c1", ok(cm("c1", "d1", bp("a"), "theirs", T2))).await;
+        assert_eq!(push(&c, &store).await.unwrap().conflicts, 1);
+        assert_eq!(
+            fetch_conflict(&c, &store, op).await.unwrap(),
+            Fetched::Text { mine: "mine".into(), theirs: "theirs".into() }
+        );
+        resolve_mine(&c, &store, op, Some("both"), None).await.unwrap();
+        assert_eq!(comment_text(&store, "c1"), "both");
+        let q = store.queued_ops().unwrap();
+        assert!(matches!(&q[0].kind, OpKind::UpdateComment { rich_text, .. } if rich_text[0]["text"]["content"] == "both"));
+    }
+
+    #[tokio::test]
+    async fn keep_mine_requeues_a_delete_and_other_ops_have_no_texts() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        local_delete_block(&store, "b").unwrap().unwrap();
+        get(&s, "/v1/blocks/b", ok(blk("b", pp("p"), "theirs", T2, false))).await;
+        assert_eq!(push(&client(&s), &store).await.unwrap().conflicts, 1);
+        let op = store.ops_by_status(OpStatus::Conflict).unwrap()[0].id;
+        assert_eq!(fetch_conflict(&client(&s), &store, op).await.unwrap(), Fetched::Other);
+        assert!(resolve_mine(&client(&s), &store, op, Some("x"), None).await.is_err(), "nothing to merge");
+        resolve_mine(&client(&s), &store, op, None, None).await.unwrap();
+        assert!(store.get_block("b").unwrap().is_none(), "still deleted in the cache");
+        Mock::given(method("DELETE"))
+            .and(path("/v1/blocks/b"))
+            .respond_with(ok(blk("b", pp("p"), "theirs", T2, false)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!((r.applied, r.conflicts), (1, 0), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn a_remote_change_after_the_fetch_is_refused_and_nothing_is_written() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let op = conflicted(&s, &store).await;
+        let Fetched::Text { theirs, .. } = fetch_conflict(&client(&s), &store, op).await.unwrap() else { panic!() };
+        // Notion changes again before the user decides
+        s.reset().await;
+        get(&s, "/v1/blocks/b", ok(blk("b", pp("p"), "theirs, edited again", "2025-01-03T00:00:00.000Z", false))).await;
+        for merged in [None, Some("mine and theirs")] {
+            let e = resolve_mine(&client(&s), &store, op, merged, Some(&theirs)).await.unwrap_err();
+            assert!(e.to_string().contains("changed again"), "{e}");
+            let ops = store.ops_by_status(OpStatus::Conflict).unwrap();
+            assert_eq!(ops.len(), 1, "still a conflict");
+            assert_eq!(ts(&ops[0].base_last_edited_time.unwrap()), T, "not rebased");
+            assert_eq!(text(&store, "b"), "mine", "cache untouched");
+        }
+        // seeing the new text lets it through
+        let Fetched::Text { theirs, .. } = fetch_conflict(&client(&s), &store, op).await.unwrap() else { panic!() };
+        resolve_mine(&client(&s), &store, op, None, Some(&theirs)).await.unwrap();
+        assert_eq!(store.queued_ops().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn formatting_markdown_cannot_carry_offers_no_merge() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let op = conflicted(&s, &store).await;
+        // Notion's text holds a link preview, which has no Markdown form
+        let mut theirs = blk("b", pp("p"), "theirs", T2, false);
+        theirs["paragraph"]["rich_text"] = json!([{ "type": "mention", "plain_text": "x", "annotations": {},
+            "mention": { "type": "link_preview", "link_preview": { "url": "https://x.y" } } }]);
+        s.reset().await;
+        get(&s, "/v1/blocks/b", ok(theirs)).await;
+        assert_eq!(fetch_conflict(&client(&s), &store, op).await.unwrap(), Fetched::Other);
+        assert!(resolve_mine(&client(&s), &store, op, Some("x"), None).await.is_err());
+        // Keep mine still works
+        resolve_mine(&client(&s), &store, op, None, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_untouched_merge_keeps_the_original_rich_text() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        let mut u = RichText::plain("mine");
+        u.annotations.underline = true;
+        local_edit_rich(&store, "b", vec![u]).unwrap();
+        get(&s, "/v1/blocks/b", ok(blk("b", pp("p"), "theirs", T2, false))).await;
+        push(&client(&s), &store).await.unwrap();
+        let op = store.ops_by_status(OpStatus::Conflict).unwrap()[0].id;
+        resolve_mine(&client(&s), &store, op, Some("mine"), None).await.unwrap();
+        let q = store.queued_ops().unwrap();
+        assert!(matches!(&q[0].kind, OpKind::UpdateBlock { body, .. }
+            if body["paragraph"]["rich_text"][0]["annotations"]["underline"] == true), "{:?}", q[0].kind);
+    }
+
+    #[tokio::test]
+    async fn a_title_op_with_other_properties_offers_no_merge() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let c = client(&s);
+        store.upsert_page(&serde_json::from_value(titled("t", T, "old")).unwrap()).unwrap();
+        let op = store
+            .enqueue(
+                OpKind::UpdatePageProperties {
+                    page_id: "t".into(),
+                    properties: json!({ "Name": { "title": [{ "type": "text", "text": { "content": "mine" } }] },
+                        "Tag": { "select": { "name": "x" } } }),
+                },
+                Some(ts_parse(T)),
+                None,
+            )
+            .unwrap();
+        store.mark_op(op, OpStatus::Conflict, Some("x")).unwrap();
+        get(&s, "/v1/pages/t", ok(titled("t", T2, "theirs"))).await;
+        assert_eq!(fetch_conflict(&c, &store, op).await.unwrap(), Fetched::Other);
+    }
+
+    fn ts_parse(t: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc)
+    }
 }
+

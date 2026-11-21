@@ -16,6 +16,7 @@ mod md;
 mod menu;
 mod people;
 mod problems;
+mod resolve;
 mod shell;
 mod switcher;
 mod theme;

@@ -17,6 +17,8 @@ pub struct Problem {
     /// The block's text, or the page's title, or the id.
     pub label: String,
     pub error: String,
+    /// A conflict (it can be resolved), not a failure.
+    pub conflict: bool,
     /// A create's unpushed `local-*` block.
     local: Option<String>,
     /// A comment create's unpushed `local-*` comment.
@@ -65,6 +67,7 @@ fn comment_problem(store: &Store, op: &Op) -> notion_core::Result<Option<Problem
         page,
         label: label.chars().take(60).collect(),
         error: op.error.clone().unwrap_or_default(),
+        conflict: op.status == OpStatus::Conflict,
         local: None,
         local_comment: match &op.kind {
             OpKind::CreateComment { local_id, .. } => Some(local_id.clone()),
@@ -131,6 +134,7 @@ pub fn problem(store: &Store, op: &Op) -> notion_core::Result<Problem> {
         page: page_id,
         label: text.chars().take(60).collect(),
         error: op.error.clone().unwrap_or_default(),
+        conflict: op.status == OpStatus::Conflict,
         local,
         local_comment: None,
     })
