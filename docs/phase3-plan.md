@@ -112,3 +112,11 @@ I pulled all 164 pages shared with the integration into the cache. One failed wi
 4. **Undo tail.** Ctrl+Z after a poll flush first undoes the typing since that flush, then the earlier part.
 5. **Highlight** ignores remote deletions and reordering; the tint colour is untuned.
 6. **Pushes wait behind a running poll** (the worker is serial).
+
+## Known gaps after C4 (reviewed, deferred)
+1. **Two-way diff.** The panel compares your text with Notion's, not against the common base.
+2. **Merge needs Markdown-safe text.** Blocks with mentions Markdown can't carry (link previews, templates) get Keep mine / Keep theirs only. Underline and colour are still lost if you edit the merged text (same limit as the editor).
+3. **Keep mine re-sends the whole queued body.** It can undo a remote colour change on that block.
+4. **Failed ops** (not conflicts) still only have Discard.
+5. **No push after resolving.** Press Ctrl+S to send the re-queued op.
+6. **Title ops writing other properties** offer Keep mine / Keep theirs only.
