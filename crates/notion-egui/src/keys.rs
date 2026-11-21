@@ -226,6 +226,13 @@ pub enum Command {
     Find,
     /// Ctrl+L: copy the page's Notion URL.
     CopyLink,
+    /// Ctrl+D: duplicate the edited or selected block(s).
+    Duplicate,
+    /// Ctrl+Shift+Up / Down: move the edited or selected block(s) among siblings.
+    MoveUp,
+    MoveDown,
+    /// Ctrl+Alt+T: open every toggle, or close them all if all are open.
+    ToggleAll,
 }
 
 impl Command {
@@ -251,6 +258,7 @@ impl Command {
                 | Command::Parent
                 | Command::Find
                 | Command::CopyLink
+                | Command::ToggleAll
         )
     }
 }
@@ -298,6 +306,10 @@ const NAMES: &[(&str, Command)] = &[
     ("parent", Command::Parent),
     ("find", Command::Find),
     ("copy_link", Command::CopyLink),
+    ("duplicate", Command::Duplicate),
+    ("move_up", Command::MoveUp),
+    ("move_down", Command::MoveDown),
+    ("toggle_all", Command::ToggleAll),
 ];
 
 /// Notion's Linux keys (Ctrl+Shift+0-9 for block types; 9, "page", has no
@@ -350,6 +362,12 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("ctrl+shift+u", "parent"),
     ("ctrl+f", "find"),
     ("ctrl+l", "copy_link"),
+    ("ctrl+d", "duplicate"),
+    ("ctrl+shift+up", "move_up"),
+    ("ctrl+shift+down", "move_down"),
+    // AltGr+T (a typed "t" on the Austrian layout) arrives without Ctrl/Alt
+    // in winit, so this chord cannot fire on it
+    ("ctrl+alt+t", "toggle_all"),
 ];
 
 fn command(name: &str) -> Option<Command> {
@@ -776,6 +794,31 @@ mod tests {
         ];
         assert_eq!(take_exact(&mut v, Modifiers::NONE, Key::Enter), (1, 1));
         assert_eq!(v, [press(Key::Enter, None, Modifiers::SHIFT)]);
+    }
+
+    #[test]
+    fn block_edit_keys_and_altgr() {
+        let k = Keymap::default();
+        let alt = Modifiers { ctrl: true, alt: true, ..Modifiers::NONE };
+        for (key, m, want) in [
+            (Key::D, Modifiers::CTRL, Command::Duplicate),
+            (Key::ArrowUp, CTRL_SHIFT, Command::MoveUp),
+            (Key::ArrowDown, CTRL_SHIFT, Command::MoveDown),
+            (Key::T, alt, Command::ToggleAll),
+        ] {
+            let mut v = vec![press(key, Some(key), m)];
+            assert_eq!(take_commands(&mut v, true, &k, |_| true), [want]);
+        }
+        assert!(Command::ToggleAll.is_global() && !Command::Duplicate.is_global());
+        // AltGr+T on the Austrian layout (Linux): a typed "t", no Ctrl or Alt
+        let mut v = vec![press(Key::T, Some(Key::T), Modifiers::NONE), Event::Text("t".into())];
+        assert!(take_commands(&mut v, false, &k, |_| true).is_empty());
+        assert_eq!(v.len(), 2);
+        // a keys.json from before these actions still loads, with the new defaults
+        let (k, p) = Keymap::merge(entries(&[("ctrl+b", "bold"), ("ctrl+l", "copy_link")]));
+        assert!(p.is_empty(), "{p:?}");
+        assert_eq!(k.get(&ch("ctrl+d")), Some(Command::Duplicate));
+        assert_eq!(k.get(&ch("ctrl+alt+t")), Some(Command::ToggleAll));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use eframe::egui::{self, Frame, Id, Label, RichText as Text};
 use notion_core::markdown::to_markdown;
-use notion_core::model::{Annotations, RichText, RichTextKind, TargetKind, User};
+use notion_core::model::{Annotations, RichText, RichTextKind, TargetKind, User, COLORS};
 use notion_core::store::PageEntry;
 use serde_json::json;
 
@@ -113,6 +113,8 @@ pub enum Pick {
     Block(TargetKind),
     /// Put this Markdown at the trigger (a mention token).
     Insert(String),
+    /// Set the block's Notion colour (`red`, `blue_background`, ...).
+    Color(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,14 +138,18 @@ pub struct Sources<'a> {
 /// The entries of `menu` for the filter `q`.
 pub fn entries(menu: &Menu, q: &str, src: Sources) -> Vec<Entry> {
     match menu.kind {
-        Kind::Slash | Kind::TurnInto => slash::filter(q)
-            .into_iter()
-            .map(|i| Entry {
-                label: i.name.to_string(),
-                hint: i.hint.to_string(),
-                pick: Pick::Block(i.kind),
-            })
-            .collect(),
+        Kind::Slash | Kind::TurnInto => {
+            let mut out: Vec<Entry> = slash::filter(q)
+                .into_iter()
+                .map(|i| Entry {
+                    label: i.name.to_string(),
+                    hint: i.hint.to_string(),
+                    pick: Pick::Block(i.kind),
+                })
+                .collect();
+            out.extend(color_entries(q));
+            out
+        }
         Kind::Mention => {
             let mut out = page_entries(q, src);
             out.extend(user_entries(q, src.users));
@@ -152,6 +158,42 @@ pub fn entries(menu: &Menu, q: &str, src: Sources) -> Vec<Entry> {
         }
         Kind::PageLink => page_entries(q, src),
     }
+}
+
+/// German names of [`COLORS`], in the same order.
+const COLOR_DE: [&str; 10] = [
+    "Standard", "Grau", "Braun", "Orange", "Gelb", "Grün", "Blau", "Lila", "Rosa", "Rot",
+];
+
+/// "Color Red" / "Color Red background" entries (German: "Farbe Rot" /
+/// "Hintergrund") for a query of at least 3 characters: all 19 would bury the
+/// block types on a short one.
+fn color_entries(q: &str) -> Vec<Entry> {
+    if q.trim().chars().count() < 3 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for bg in [false, true] {
+        for (c, de) in COLORS.iter().zip(COLOR_DE) {
+            if bg && *c == "default" {
+                continue;
+            }
+            let cap = format!("{}{}", c[..1].to_uppercase(), &c[1..]);
+            let (en, de) = if bg {
+                (format!("Color {cap} background"), format!("Farbe {de} Hintergrund"))
+            } else {
+                (format!("Color {cap}"), format!("Farbe {de}"))
+            };
+            if slash::word_prefix(q, &en) || slash::word_prefix(q, &de) {
+                out.push(Entry {
+                    label: en,
+                    hint: if bg { "Background" } else { "Text colour" }.into(),
+                    pick: Pick::Color(if bg { format!("{c}_background") } else { (*c).into() }),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// The Markdown token of a mention (core's `@[label](kind:id)`).
@@ -355,17 +397,19 @@ mod tests {
     #[test]
     fn arrows_move_and_wrap() {
         let mut m = menu(Kind::Slash);
-        let es = slash_entries("head"); // Heading 1..3
+        let es = slash_entries("head"); // Heading 1..3, Toggle heading 1..3
+        assert_eq!(es.len(), 6);
         assert_eq!(menu_step(&mut m, &es, EditKey::Down), Outcome::Handled);
         assert_eq!(m.selected, 1);
-        menu_step(&mut m, &es, EditKey::Down);
-        menu_step(&mut m, &es, EditKey::Down);
+        for _ in 0..5 {
+            menu_step(&mut m, &es, EditKey::Down);
+        }
         assert_eq!(m.selected, 0, "wraps past the last item");
         menu_step(&mut m, &es, EditKey::Up);
-        assert_eq!(m.selected, 2, "wraps before the first item");
+        assert_eq!(m.selected, 5, "wraps before the first item");
         assert_eq!(
             menu_step(&mut m, &es, EditKey::Enter),
-            Outcome::Pick(Pick::Block(TargetKind::Heading3))
+            Outcome::Pick(Pick::Block(TargetKind::ToggleHeading3))
         );
     }
 

@@ -66,6 +66,15 @@ pub fn format(size: f32, s: Style) -> TextFormat {
     }
 }
 
+/// Gives the runs that take the widget's text colour `c` (a block colour).
+pub fn tint(job: &mut LayoutJob, c: Color32) {
+    for s in &mut job.sections {
+        if s.format.color == Color32::PLACEHOLDER {
+            s.format.color = c;
+        }
+    }
+}
+
 /// "@Name" for a user mention: the cached name, else what the API said
 /// (`plain_text`, "@" or not), else the id's first 8 characters.
 fn user_mention_text(m: &serde_json::Value, plain: &str, users: &[User]) -> Option<String> {

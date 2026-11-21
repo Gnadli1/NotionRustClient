@@ -499,6 +499,52 @@ pub fn from_markdown(s: &str) -> Vec<RichText> {
     )
 }
 
+/// Splits Markdown source at char index `at` into the rich text before and
+/// after it. A mark that spans the cut stays on both halves (the source is
+/// parsed once, with a sentinel at the cut). A cut strictly inside a token (a
+/// mention, an equation, a link URL, a mark delimiter such as the middle of
+/// `**`) keeps the whole text in the first half and the second empty.
+/// Limit: a literal U+E000 in `s` is the sentinel's own character, so such a
+/// text is cut by parsing each half alone (marks across the cut are lost).
+pub fn split_markdown(s: &str, at: usize) -> (Vec<RichText>, Vec<RichText>) {
+    const CUT: char = '\u{E000}';
+    let byte = s.char_indices().nth(at).map_or(s.len(), |(b, _)| b);
+    if s.contains(CUT) {
+        return (from_markdown(&s[..byte]), from_markdown(&s[byte..]));
+    }
+    let whole = from_markdown(s);
+    let mut marked = s.to_string();
+    marked.insert(byte, CUT);
+    let runs = from_markdown(&marked);
+    // inside plain text, taking the sentinel out gives back the unmarked parse
+    let text = |v: &[RichText]| v.iter().map(|r| r.plain_text.replace(CUT, "")).collect::<String>();
+    let hit = runs.iter().position(|r| r.plain_text.contains(CUT));
+    let Some(i) = hit.filter(|&i| {
+        text(&runs) == text(&whole) && matches!(runs[i].kind, RichTextKind::Text { .. })
+    }) else {
+        return (whole, Vec::new());
+    };
+    let content = runs[i].plain_text.clone();
+    let (l, r) = content.split_once(CUT).unwrap_or((&content, ""));
+    let piece = |text: &str| {
+        let mut p = runs[i].clone();
+        p.plain_text = text.to_string();
+        if let RichTextKind::Text { content, .. } = &mut p.kind {
+            *content = text.to_string();
+        }
+        p
+    };
+    let mut before: Vec<RichText> = runs[..i].to_vec();
+    let mut after: Vec<RichText> = runs[i + 1..].to_vec();
+    if !l.is_empty() {
+        before.push(piece(l));
+    }
+    if !r.is_empty() {
+        after.insert(0, piece(r));
+    }
+    (before, after)
+}
+
 /// True if editing `rt` as Markdown loses nothing beyond underline/colour:
 /// every mention is one the `@[label](kind:id)` token carries, and it survives
 /// `to_markdown` → `from_markdown` (an equation with a bare `$`, edge spaces,
@@ -573,6 +619,36 @@ pub fn markdown_shortcut(text: &str) -> Option<(TargetKind, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_keeps_marks_on_both_halves() {
+        let plain = |v: &[RichText]| v.iter().map(|r| r.plain_text.clone()).collect::<String>();
+        let (l, r) = split_markdown("a **bold tail** z", 7); // a **bol|d tail** z
+        assert_eq!((plain(&l), plain(&r)), ("a bol".into(), "d tail z".into()));
+        assert!(l[1].annotations.bold && r[0].annotations.bold && !r[1].annotations.bold);
+        let (l, r) = split_markdown("abc", 3);
+        assert_eq!((plain(&l), r.len()), ("abc".into(), 0));
+        let (l, r) = split_markdown("abc", 0);
+        assert_eq!((l.len(), plain(&r)), (0, "abc".into()));
+        // inside an equation both halves are parsed alone, nothing is lost
+        // inside a token: kept whole, the second half empty
+        for (s, at) in [
+            ("@[Label](page:abc)", 4),
+            ("$x+y$", 2),
+            ("[link](https://e.com/a)", 12),
+            ("**bold**", 1),
+            ("a \\*b", 3),
+        ] {
+            let (l, r) = split_markdown(s, at);
+            assert_eq!((to_markdown(&l), r.len()), (s.to_string(), 0), "{s} at {at}");
+        }
+        // next to a token is fine
+        let (l, r) = split_markdown("ab@[Label](page:abc)", 2);
+        assert_eq!((plain(&l), r.len()), ("ab".into(), 1));
+        // a literal U+E000 is cut without the sentinel
+        let (l, r) = split_markdown("a\u{E000}b", 1);
+        assert_eq!((plain(&l), plain(&r)), ("a".into(), "\u{E000}b".into()));
+    }
 
     fn rt(text: &str, link: Option<&str>, b: bool, i: bool, s: bool, c: bool) -> RichText {
         let mut r = RichText::plain(text);

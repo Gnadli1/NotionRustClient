@@ -82,6 +82,20 @@ fn default_color() -> String {
     "default".into()
 }
 
+/// Notion's colour names; each also exists as `<name>_background`
+/// (`default_background` is not one of them: 19 values in all).
+pub const COLORS: [&str; 10] = [
+    "default", "gray", "brown", "orange", "yellow", "green", "blue", "purple", "pink", "red",
+];
+
+/// Is `c` one of Notion's 19 block colours?
+pub fn is_color(c: &str) -> bool {
+    match c.strip_suffix("_background") {
+        Some(base) => base != "default" && COLORS.contains(&base),
+        None => COLORS.contains(&c),
+    }
+}
+
 // ---------------------------------------------------------------- rich text
 
 #[derive(Debug, Clone, PartialEq)]
@@ -301,6 +315,9 @@ pub enum BlockKind {
     Heading1(Heading),
     Heading2(Heading),
     Heading3(Heading),
+    /// Only arrives from API versions that have `heading_4` (UNVERIFIED for
+    /// 2025-09-03, where Notion sends it as `unsupported`).
+    Heading4(Heading),
     BulletedListItem(TextBlock),
     NumberedListItem(TextBlock),
     ToDo {
@@ -351,6 +368,7 @@ impl BlockKind {
             BlockKind::Heading1(_) => "heading_1",
             BlockKind::Heading2(_) => "heading_2",
             BlockKind::Heading3(_) => "heading_3",
+            BlockKind::Heading4(_) => "heading_4",
             BlockKind::BulletedListItem(_) => "bulleted_list_item",
             BlockKind::NumberedListItem(_) => "numbered_list_item",
             BlockKind::ToDo { .. } => "to_do",
@@ -376,15 +394,16 @@ impl BlockKind {
             | BlockKind::Callout(t)
             | BlockKind::ToDo { text: t, .. }
             | BlockKind::Code { text: t, .. } => Some(t),
-            BlockKind::Heading1(h) | BlockKind::Heading2(h) | BlockKind::Heading3(h) => {
-                Some(&h.text)
-            }
+            BlockKind::Heading1(h)
+            | BlockKind::Heading2(h)
+            | BlockKind::Heading3(h)
+            | BlockKind::Heading4(h) => Some(&h.text),
             _ => None,
         }
     }
 
-    pub fn set_text(&mut self, rt: Vec<RichText>) -> Result<()> {
-        let t = match self {
+    fn text_mut(&mut self) -> Option<&mut TextBlock> {
+        match self {
             BlockKind::Paragraph(t)
             | BlockKind::BulletedListItem(t)
             | BlockKind::NumberedListItem(t)
@@ -392,16 +411,37 @@ impl BlockKind {
             | BlockKind::Quote(t)
             | BlockKind::Callout(t)
             | BlockKind::ToDo { text: t, .. }
-            | BlockKind::Code { text: t, .. } => t,
-            BlockKind::Heading1(h) | BlockKind::Heading2(h) | BlockKind::Heading3(h) => &mut h.text,
-            other => {
-                return Err(Error::Invalid(format!(
-                    "block type `{}` has no text",
-                    other.type_name()
-                )))
-            }
-        };
+            | BlockKind::Code { text: t, .. } => Some(t),
+            BlockKind::Heading1(h)
+            | BlockKind::Heading2(h)
+            | BlockKind::Heading3(h)
+            | BlockKind::Heading4(h) => Some(&mut h.text),
+            _ => None,
+        }
+    }
+
+    pub fn set_text(&mut self, rt: Vec<RichText>) -> Result<()> {
+        let name = self.type_name().to_string();
+        let t = self
+            .text_mut()
+            .ok_or_else(|| Error::Invalid(format!("block type `{name}` has no text")))?;
         t.rich_text = rt;
+        Ok(())
+    }
+
+    /// Sets the block's `color` (one of [`COLORS`], plain or `_background`).
+    /// Code blocks have none (their payload drops it), nor do non-text blocks.
+    pub fn set_color(&mut self, color: &str) -> Result<()> {
+        if !is_color(color) {
+            return Err(Error::Invalid(format!("unknown color `{color}`")));
+        }
+        let name = self.type_name().to_string();
+        match self {
+            BlockKind::Code { .. } => None,
+            k => k.text_mut(),
+        }
+        .ok_or_else(|| Error::Invalid(format!("block type `{name}` has no color")))?
+        .color = color.to_string();
         Ok(())
     }
 
@@ -435,7 +475,10 @@ impl BlockKind {
             | BlockKind::Toggle(t)
             | BlockKind::Quote(t)
             | BlockKind::Callout(t) => text(t),
-            BlockKind::Heading1(h) | BlockKind::Heading2(h) | BlockKind::Heading3(h) => heading(h),
+            BlockKind::Heading1(h)
+            | BlockKind::Heading2(h)
+            | BlockKind::Heading3(h)
+            | BlockKind::Heading4(h) => heading(h),
             BlockKind::ToDo { text: t, checked } => {
                 let mut v = text(t);
                 v["checked"] = json!(checked);
@@ -469,6 +512,7 @@ impl BlockKind {
             "heading_1" => BlockKind::Heading1(heading()?),
             "heading_2" => BlockKind::Heading2(heading()?),
             "heading_3" => BlockKind::Heading3(heading()?),
+            "heading_4" => BlockKind::Heading4(heading()?),
             "bulleted_list_item" => BlockKind::BulletedListItem(text()?),
             "numbered_list_item" => BlockKind::NumberedListItem(text()?),
             "to_do" => BlockKind::ToDo {
@@ -500,6 +544,9 @@ pub enum TargetKind {
     Heading1,
     Heading2,
     Heading3,
+    ToggleHeading1,
+    ToggleHeading2,
+    ToggleHeading3,
     Bulleted,
     Numbered,
     ToDo,
@@ -516,6 +563,9 @@ impl TargetKind {
     pub fn of(kind: &BlockKind) -> Option<Self> {
         Some(match kind {
             BlockKind::Paragraph(_) => Self::Paragraph,
+            BlockKind::Heading1(h) if h.is_toggleable => Self::ToggleHeading1,
+            BlockKind::Heading2(h) if h.is_toggleable => Self::ToggleHeading2,
+            BlockKind::Heading3(h) if h.is_toggleable => Self::ToggleHeading3,
             BlockKind::Heading1(_) => Self::Heading1,
             BlockKind::Heading2(_) => Self::Heading2,
             BlockKind::Heading3(_) => Self::Heading3,
@@ -539,11 +589,18 @@ impl TargetKind {
             text,
             is_toggleable: false,
         };
+        let toggle = |text| Heading {
+            text,
+            is_toggleable: true,
+        };
         match self {
             Self::Paragraph => BlockKind::Paragraph(text),
             Self::Heading1 => BlockKind::Heading1(heading(text)),
             Self::Heading2 => BlockKind::Heading2(heading(text)),
             Self::Heading3 => BlockKind::Heading3(heading(text)),
+            Self::ToggleHeading1 => BlockKind::Heading1(toggle(text)),
+            Self::ToggleHeading2 => BlockKind::Heading2(toggle(text)),
+            Self::ToggleHeading3 => BlockKind::Heading3(toggle(text)),
             Self::Bulleted => BlockKind::BulletedListItem(text),
             Self::Numbered => BlockKind::NumberedListItem(text),
             Self::ToDo => BlockKind::ToDo {
@@ -1048,6 +1105,24 @@ mod tests {
 
     fn text_of(b: &Block) -> String {
         plain_text(&b.kind.text().unwrap().rich_text)
+    }
+
+    #[test]
+    fn heading_4_toggle_headings_and_colours() {
+        let h4 = BlockKind::parse("heading_4", &json!({ "rich_text": [rt("x")], "color": "red" })).unwrap();
+        assert!(matches!(h4, BlockKind::Heading4(_)) && h4.type_name() == "heading_4");
+        assert_eq!(h4.to_request_json().unwrap()["heading_4"]["color"], "red");
+        assert_eq!(TargetKind::of(&h4), None, "not offered in the menu");
+        let tg = BlockKind::parse("heading_2", &json!({ "rich_text": [rt("x")], "is_toggleable": true })).unwrap();
+        assert_eq!(TargetKind::of(&tg), Some(TargetKind::ToggleHeading2));
+        let made = TargetKind::ToggleHeading3.block_kind(TextBlock { rich_text: vec![], color: "default".into() });
+        assert!(matches!(&made, BlockKind::Heading3(h) if h.is_toggleable));
+        let mut k = BlockKind::parse("paragraph", &json!({ "rich_text": [rt("x")] })).unwrap();
+        k.set_color("pink_background").unwrap();
+        assert_eq!(k.text().unwrap().color, "pink_background");
+        assert!(k.set_color("default_background").is_err() && k.set_color("teal").is_err());
+        assert!(is_color("gray") && is_color("gray_background") && !is_color("default_background"));
+        assert_eq!(COLORS.len() * 2 - 1, 19);
     }
 
     #[test]

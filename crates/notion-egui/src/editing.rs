@@ -6,8 +6,8 @@
 use eframe::egui::{
     self, text_edit::TextEditState, Id, Key, Label, Modifiers, RichText, Sense, Ui,
 };
-use notion_core::markdown::{from_markdown, to_markdown};
-use notion_core::model::{BlockKind, TextBlock};
+use notion_core::markdown::{from_markdown, markdown_shortcut, to_markdown};
+use notion_core::model::{plain_text, BlockKind, TargetKind, TextBlock};
 use notion_core::sync;
 
 use crate::app::{neighbour, set_cursor, Action, App, Focus, Grab, TitleEdit};
@@ -56,8 +56,20 @@ impl App {
         let f = self.focus.as_mut()?;
         let row = f.cell.is_none();
         let empty = f.text.is_empty();
+        f.cursor = cursor_of(ctx, id, &f.text);
+        let mut paste = None;
         let (cmds, [enter, tab, shift_tab, bs, esc]) = ctx.input_mut(|i| {
             let ev = &mut i.events;
+            // several lines pasted into an empty row become one block each
+            if row && empty && !f.code {
+                ev.retain(|e| match e {
+                    egui::Event::Paste(t) if t.trim_end().contains('\n') => {
+                        paste = Some(t.clone());
+                        false
+                    }
+                    _ => true,
+                });
+            }
             let cmds = keys::take_commands(ev, ctrl, map, |c| !c.is_global());
             let mut take = |m: Modifiers, k: Key| keys::take_exact(ev, m, k).0;
             let n = [
@@ -79,9 +91,9 @@ impl App {
             }
             (cmds, n)
         });
-        let mut act = None;
+        let mut act = paste.map(Action::Paste);
         for (n, a) in [
-            (esc, Action::Blur),
+            (esc, if row { Action::Select } else { Action::Blur }),
             (enter, Action::Key(EditKey::Enter)),
             (tab, Action::Key(EditKey::Indent)),
             (shift_tab, Action::Key(EditKey::Outdent)),
@@ -93,8 +105,15 @@ impl App {
         }
         let turn_into_open = f.menu.as_ref().is_some_and(|m| m.kind == Kind::TurnInto);
         for c in cmds {
+            // the block commands never act while a menu is open
+            if f.menu.is_some() && matches!(c, Command::Duplicate | Command::MoveUp | Command::MoveDown) {
+                continue;
+            }
             f.menu = None;
             match c {
+                Command::Duplicate | Command::MoveUp | Command::MoveDown if row => {
+                    act = Some(Action::Run(c));
+                }
                 // Ctrl+/ again closes it
                 Command::TurnInto if row && !turn_into_open => {
                     f.menu = Some(Menu::new(Kind::TurnInto, 0, 0, Default::default()));
@@ -150,7 +169,7 @@ impl App {
         }
         let idx = f.idx;
         match action {
-            KeyAction::NewBlockAfter => self.new_block_after(),
+            KeyAction::NewBlockAfter => self.split_row(),
             KeyAction::DeleteRow => self.delete_row(idx),
             KeyAction::Indent => self.move_editing(outline::indent_target),
             KeyAction::Outdent => self.move_editing(outline::outdent_target),
@@ -167,6 +186,30 @@ impl App {
             .position(|r| r.block_id == id && r.editable)
         {
             self.start_edit(i, grab);
+        }
+    }
+
+    /// Enter: the text after the cursor moves to a new block (a list item
+    /// continues the list, anything else gives a paragraph) and is edited; an
+    /// empty list item becomes a paragraph. Code rows just get an empty block.
+    fn split_row(&mut self) {
+        let Some(f) = &self.focus else { return };
+        let row = &self.rows[f.idx];
+        let list = matches!(row.marker, Marker::Bullet | Marker::Number(_) | Marker::Todo(_));
+        if f.code || row.locked || !row.editable {
+            return self.new_block_after();
+        }
+        if f.text.is_empty() && list {
+            return self.convert(TargetKind::Paragraph, String::new(), String::new(), 0);
+        }
+        let (id, text, at) = (f.block_id.clone(), f.text.clone(), f.cursor.min(f.text.chars().count()));
+        match self.store.resolve_id(&id).and_then(|id| sync::local_split_block(&self.store, &id, &text, at)) {
+            Ok(new) => {
+                self.focus = None;
+                self.refresh();
+                self.focus_block(&new, Grab::Start);
+            }
+            Err(e) => self.last_error = Some(e.to_string()),
         }
     }
 
@@ -242,6 +285,326 @@ impl App {
             self.last_error = Some(e.to_string());
         }
         self.refresh();
+    }
+
+    // ---------------------------------------------------- block editing
+
+    /// Row indices of the selected run of siblings.
+    pub(crate) fn sel_idx(&self) -> Vec<usize> {
+        let Some((a, b)) = &self.sel else { return Vec::new() };
+        let pos = |id: &str| self.rows.iter().position(|r| r.block_id == id);
+        let (Some(a), Some(b)) = (pos(a), pos(b)) else { return Vec::new() };
+        let (lo, hi) = (a.min(b), a.max(b));
+        let parent = &self.rows[lo].parent;
+        (lo..=hi).filter(|&i| self.rows[i].parent == *parent).collect()
+    }
+
+    /// The rows to highlight: the selected blocks and their subtrees.
+    pub(crate) fn sel_rows(&self) -> std::ops::Range<usize> {
+        let idx = self.sel_idx();
+        match (idx.first(), idx.last()) {
+            (Some(&a), Some(&b)) => a..b + 1 + outline::subtree(&self.rows, b).len(),
+            _ => 0..0,
+        }
+    }
+
+    /// The next (`dir` 1) or previous (-1) row with the same parent.
+    fn sibling(&self, i: usize, dir: isize) -> Option<usize> {
+        let same = |&j: &usize| self.rows[j].parent == self.rows[i].parent;
+        if dir < 0 {
+            (0..i).rev().find(same)
+        } else {
+            (i + 1..self.rows.len()).find(same)
+        }
+    }
+
+    /// The keys of a block selection, taken before any widget runs: Esc
+    /// clears it, Shift+Up/Down extend it, Delete / Backspace / Ctrl+X remove
+    /// it, Ctrl+C copies it as Markdown, Enter edits its first block and the
+    /// keymap's duplicate / move commands act on it. Only with no editor, no
+    /// other text box and no overlay wanting the keys.
+    pub(crate) fn selection_keys(&mut self, ctx: &egui::Context) {
+        if self.sel.is_none()
+            || self.focus.is_some()
+            || self.title_edit.is_some()
+            || self.switcher.is_some()
+            || self.conflict.is_some()
+            || self.problems_open
+            || self.comments.is_some()
+            || ctx.egui_wants_keyboard_input()
+        {
+            return;
+        }
+        let ctrl = ctx.input(|i| i.modifiers.ctrl);
+        let map = &self.keys;
+        let (cmds, [esc, up, down, del, enter, copy, cut]) = ctx.input_mut(|i| {
+            let cmds = keys::take_commands(&mut i.events, ctrl, map, |c| {
+                matches!(c, Command::Duplicate | Command::MoveUp | Command::MoveDown)
+            });
+            let (mut copy, mut cut) = (0, 0);
+            i.events.retain(|e| match e {
+                egui::Event::Copy => {
+                    copy += 1;
+                    false
+                }
+                egui::Event::Cut => {
+                    cut += 1;
+                    false
+                }
+                _ => true,
+            });
+            let mut take = |m: Modifiers, k: Key| {
+                let (fresh, repeats) = keys::take_exact(&mut i.events, m, k);
+                fresh + repeats
+            };
+            let n = [
+                take(Modifiers::NONE, Key::Escape),
+                take(Modifiers::SHIFT, Key::ArrowUp),
+                take(Modifiers::SHIFT, Key::ArrowDown),
+                take(Modifiers::NONE, Key::Delete) + take(Modifiers::NONE, Key::Backspace),
+                take(Modifiers::NONE, Key::Enter),
+                copy,
+                cut,
+            ];
+            (cmds, n)
+        });
+        for (n, dir) in [(up, -1), (down, 1)] {
+            for _ in 0..n {
+                let head = self.sel.as_ref().and_then(|(_, h)| self.rows.iter().position(|r| r.block_id == *h));
+                if let Some(j) = head.and_then(|h| self.sibling(h, dir)) {
+                    let id = self.rows[j].block_id.clone();
+                    self.sel.as_mut().expect("checked").1 = id;
+                }
+            }
+        }
+        if copy > 0 {
+            ctx.copy_text(self.sel_markdown());
+        }
+        if del + cut > 0 && self.sel_deletable() {
+            if cut > 0 {
+                ctx.copy_text(self.sel_markdown());
+            }
+            self.step(Self::delete_selected);
+        }
+        for c in cmds {
+            self.step(|s| s.block_cmd(c));
+        }
+        if enter > 0 {
+            if let Some(&i) = self.sel_idx().first().filter(|&&i| self.rows[i].editable) {
+                self.start_edit(i, Grab::End);
+            }
+        }
+        if esc > 0 {
+            self.sel = None;
+        }
+    }
+
+    /// The selected blocks and their children as Markdown, one block per line
+    /// (children indented two spaces per level).
+    fn sel_markdown(&self) -> String {
+        let mut out = Vec::new();
+        for i in self.sel_idx() {
+            let d0 = self.rows[i].depth;
+            for r in std::iter::once(&self.rows[i]).chain(outline::subtree(&self.rows, i)) {
+                let md = to_markdown(&r.rich_text);
+                let line = match &r.marker {
+                    Marker::Heading(n) => format!("{} {md}", "#".repeat(usize::from(*n))),
+                    Marker::Bullet => format!("- {md}"),
+                    Marker::Number(n) => format!("{n}. {md}"),
+                    Marker::Todo(c) => format!("[{}] {md}", if *c { "x" } else { " " }),
+                    Marker::Quote => format!("> {md}"),
+                    Marker::Divider => "---".into(),
+                    // ponytail: one line per block, so a multi-line code block is not fenced
+                    Marker::Code(_) => format!("```{}", plain_text(&r.rich_text)),
+                    Marker::Equation => format!("$$ {}", plain_text(&r.rich_text)),
+                    _ => md,
+                };
+                out.push(format!("{}{line}", "  ".repeat(r.depth - d0)));
+            }
+        }
+        out.join("\n")
+    }
+
+    fn resolved(&self, i: usize) -> notion_core::Result<String> {
+        self.store.resolve_id(&self.rows[i].block_id)
+    }
+
+    /// Delete and cut only take plain text-like blocks (and subtrees of them):
+    /// a child page, table or synced block would be lost with no way back.
+    fn sel_deletable(&mut self) -> bool {
+        let bad = self.sel_idx().into_iter().find_map(|i| outline::unmovable_in_subtree(&self.rows, i));
+        if let Some(m) = bad {
+            self.last_error = Some(format!("not deleting: the selection contains {}", m.label()));
+        }
+        bad.is_none()
+    }
+
+    /// Deletes the selected blocks (one undo step).
+    fn delete_selected(&mut self) {
+        let idx = self.sel_idx();
+        if self.pushing() {
+            self.last_error = Some("editing is paused while a push runs".into());
+            return;
+        }
+        let res = self.store.atomic(|| {
+            for &i in &idx {
+                sync::local_delete_block(&self.store, &self.resolved(i)?)?;
+            }
+            Ok(())
+        });
+        if let Err(e) = res {
+            self.last_error = Some(e.to_string());
+        }
+        self.sel = None;
+        self.refresh();
+    }
+
+    /// Ctrl+D / Ctrl+Shift+Up / Ctrl+Shift+Down on the edited row (kept
+    /// open) or the selected blocks.
+    pub(crate) fn block_cmd(&mut self, c: Command) {
+        if self.pushing() {
+            self.last_error = Some("editing is paused while a push runs".into());
+            return;
+        }
+        let editing = self.focus.as_ref().filter(|f| f.cell.is_none()).map(|f| f.block_id.clone());
+        if editing.is_some() && !self.flush() {
+            return;
+        }
+        let idx = match editing {
+            Some(id) => self.rows.iter().position(|r| r.block_id == id).into_iter().collect(),
+            None => self.sel_idx(),
+        };
+        let (Some(&first), Some(&last)) = (idx.first(), idx.last()) else { return };
+        let res = self.store.atomic(|| match c {
+            Command::Duplicate => {
+                // copies go after the last block, in order
+                let mut after = self.resolved(last)?;
+                let mut copies = Vec::new();
+                for &i in &idx {
+                    after = sync::local_duplicate_block(&self.store, &self.resolved(i)?, Some(&after))?;
+                    copies.push(after.clone());
+                }
+                Ok(Some(copies))
+            }
+            _ => {
+                // up: the sibling before swaps past the run; down: the run
+                // goes after the sibling behind it (nothing can be put first)
+                let (moved, anchor): (Vec<usize>, usize) = if c == Command::MoveUp {
+                    match self.sibling(first, -1) {
+                        Some(p) => (vec![p], last),
+                        None => return Ok(None),
+                    }
+                } else {
+                    match self.sibling(last, 1) {
+                        Some(n) => (idx.clone(), n),
+                        None => return Ok(None),
+                    }
+                };
+                let parent = self.store.resolve_id(&self.rows[first].parent)?;
+                let mut anchor = self.resolved(anchor)?;
+                if c == Command::MoveUp && self.store.subtree_has_comments(&self.resolved(moved[0])?)? {
+                    return Err(notion_core::Error::Invalid(
+                        "the block above has comments; moving it would lose them".into(),
+                    ));
+                }
+                for i in moved {
+                    if let Some(m) = outline::unmovable_in_subtree(&self.rows, i) {
+                        return Err(notion_core::Error::Invalid(format!(
+                            "can't move: its subtree contains {}",
+                            m.label()
+                        )));
+                    }
+                    let id = self.resolved(i)?;
+                    sync::local_move_block(&self.store, &id, &parent, Some(&anchor))?;
+                    anchor = id;
+                }
+                Ok(None)
+            }
+        });
+        match res {
+            Ok(copies) => {
+                if let (Some(copies), true) = (copies, self.sel.is_some()) {
+                    self.sel = copies.first().cloned().zip(copies.last().cloned());
+                }
+            }
+            Err(e) => self.last_error = Some(e.to_string()),
+        }
+        self.refresh();
+    }
+
+    /// A `/` colour pick: writes the text without the trigger, then the colour.
+    pub(crate) fn set_color(&mut self, text: String, color: String) {
+        if self.pushing() {
+            self.last_error = Some("editing is paused while a push runs".into());
+            return;
+        }
+        let Some(f) = &mut self.focus else { return };
+        f.text = text;
+        if !self.flush() {
+            return;
+        }
+        let Some(f) = &self.focus else { return };
+        if self.rows[f.idx].locked {
+            self.last_error = Some("can't edit inside a synced block".into());
+            return;
+        }
+        let id = f.block_id.clone();
+        if let Err(e) = self.store.resolve_id(&id).and_then(|id| sync::local_set_color(&self.store, &id, &color)) {
+            self.last_error = Some(e.to_string());
+        }
+        self.refresh();
+    }
+
+    /// A multi-line paste into the empty edited row: one block per non-blank
+    /// line after it (Markdown shortcuts pick the types), then the empty row
+    /// goes, unless it has children. The last new block is edited.
+    // ponytail: nesting is flattened and a fenced code block is one line per block
+    pub(crate) fn paste_lines(&mut self, text: &str) {
+        if self.pushing() {
+            self.last_error = Some("editing is paused while a push runs".into());
+            return;
+        }
+        let Some(idx) = self.focus.as_ref().map(|f| f.idx) else { return };
+        // the emptied text is written first: the row may stay (children)
+        if !self.flush() {
+            return;
+        }
+        let kids = !outline::subtree(&self.rows, idx).is_empty();
+        let res = self.store.atomic(|| {
+            let parent = self.store.resolve_id(&self.rows[idx].parent)?;
+            let old = self.resolved(idx)?;
+            let mut after = old.clone();
+            for line in text.lines().map(str::trim_start).filter(|l| !l.trim().is_empty()) {
+                let (kind, rest) = markdown_shortcut(line).unwrap_or((TargetKind::Paragraph, line));
+                let body = TextBlock { rich_text: from_markdown(rest), color: "default".into() };
+                after = sync::local_create_block(&self.store, &parent, Some(&after), kind.block_kind(body))?;
+            }
+            if !kids {
+                sync::local_delete_block(&self.store, &old)?;
+            }
+            Ok(after)
+        });
+        self.focus = None;
+        self.refresh();
+        match res {
+            Ok(last) => self.focus_block(&last, Grab::End),
+            Err(e) => self.last_error = Some(e.to_string()),
+        }
+    }
+
+    /// Ctrl+Alt+T: opens every toggle, or closes them all when all are open.
+    pub(crate) fn toggle_all(&mut self) {
+        let all: Vec<String> = self.rows.iter().filter(|r| r.toggle).map(|r| r.block_id.clone()).collect();
+        if all.iter().any(|id| !self.open.contains(id)) {
+            self.open.extend(all);
+        } else {
+            self.open.retain(|id| !all.contains(id));
+            // the edited row stays in sight
+            if let Some(f) = &self.focus {
+                self.open.extend(outline::ancestors(&self.rows, f.idx).into_iter().filter(|a| all.iter().any(|x| x == a)).map(String::from));
+            }
+        }
+        self.shown = outline::shown(&self.rows, &self.open);
     }
 
     // ------------------------------------------------------------ title
@@ -1043,5 +1406,355 @@ mod tests {
         assert_eq!((w.app.tabs.len(), w.app.current.as_deref()), (2, Some(PID)));
         let w = click_link(PointerButton::Middle, Modifiers::NONE);
         assert_eq!(w.app.tabs.len(), 2);
+    }
+    // ---------------------------------------------------- block editing
+
+    fn win_with(kids: &[(&str, &str, serde_json::Value)]) -> Win {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_page(&page_in("p", None)).unwrap();
+        let blocks: Vec<_> = kids.iter().map(|(id, t, pl)| blk(id, "p", t, pl.clone())).collect();
+        store.replace_children("p", "p", &blocks).unwrap();
+        let mut w = Win::new(store);
+        w.app.apply(Action::Open("p".into()));
+        w.frames(vec![]);
+        w
+    }
+
+    fn texts(w: &Win) -> Vec<String> {
+        w.app.rows.iter().map(|r| plain_text(&r.rich_text)).collect()
+    }
+
+    fn sel(w: &Win) -> Vec<usize> {
+        w.app.sel_idx()
+    }
+
+    const CTRL_ALT: Modifiers = Modifiers { ctrl: true, alt: true, ..Modifiers::NONE };
+
+    #[test]
+    fn esc_selects_shift_extends_and_the_selection_acts() {
+        let mut w = Win::with_texts(&["a", "b", "c", "d"]);
+        w.edit(1);
+        w.press(Key::Escape, Modifiers::NONE);
+        assert!(w.app.focus.is_none(), "the editor closed");
+        assert_eq!(sel(&w), [1]);
+        w.frames(vec![]);
+        assert_eq!(sel(&w), [1], "and the selection stays");
+        w.press(Key::ArrowDown, Modifiers::SHIFT);
+        assert_eq!(sel(&w), [1, 2]);
+        w.press(Key::ArrowDown, Modifiers::SHIFT);
+        w.press(Key::ArrowDown, Modifiers::SHIFT);
+        assert_eq!(sel(&w), [1, 2, 3], "stops at the last sibling");
+        w.press(Key::ArrowUp, Modifiers::SHIFT);
+        assert_eq!(sel(&w), [1, 2]);
+        // Ctrl+C: Markdown on the clipboard, nothing changed
+        w.send(Event::Copy);
+        assert_eq!(w.copied, ["b\nc"]);
+        assert_eq!((w.app.rows.len(), w.queued()), (4, 0));
+        // Delete: one undo step
+        w.press(Key::Delete, Modifiers::NONE);
+        assert_eq!(ids(&w), ["p-0", "p-3"]);
+        assert_eq!((w.app.sel.is_none(), w.app.undo.len()), (true, 1));
+        w.press(Key::Z, Modifiers::CTRL);
+        assert_eq!(ids(&w), ["p-0", "p-1", "p-2", "p-3"]);
+        // Ctrl+X copies, then deletes
+        w.app.sel = Some(("p-2".into(), "p-3".into()));
+        w.send(Event::Cut);
+        assert_eq!(w.copied, ["b\nc", "c\nd"]);
+        assert_eq!(ids(&w), ["p-0", "p-1"]);
+        assert_eq!(w.app.undo.len(), 1);
+        // Esc clears; typing and Backspace then do nothing
+        w.app.sel = Some(("p-0".into(), "p-0".into()));
+        w.press(Key::Escape, Modifiers::NONE);
+        assert!(w.app.sel.is_none());
+        w.press(Key::Backspace, Modifiers::NONE);
+        assert_eq!(ids(&w).len(), 2);
+    }
+
+    #[test]
+    fn enter_edits_the_first_selected_block_and_backspace_deletes() {
+        let mut w = Win::with_texts(&["a", "b", "c"]);
+        w.app.sel = Some(("p-2".into(), "p-1".into()));
+        w.press(Key::Enter, Modifiers::NONE);
+        assert_eq!(focus_idx(&w), Some(1));
+        assert!(w.app.sel.is_none());
+        w.press(Key::Escape, Modifiers::NONE);
+        w.press(Key::Backspace, Modifiers::NONE);
+        assert_eq!(ids(&w), ["p-0", "p-2"]);
+    }
+
+    #[test]
+    fn esc_closes_a_menu_first_and_block_keys_wait_for_it() {
+        let mut w = Win::with_texts(&["", "b"]);
+        w.edit(0);
+        w.type_text("/");
+        assert!(w.menu().is_some());
+        w.press(Key::D, Modifiers::CTRL);
+        w.press(Key::ArrowDown, CS);
+        w.press(Key::T, CTRL_ALT);
+        assert_eq!(ids(&w), ["p-0", "p-1"]);
+        assert_eq!(w.queued(), 0);
+        assert!(w.menu().is_some(), "still open");
+        w.press(Key::Escape, Modifiers::NONE);
+        assert!(w.menu().is_none() && w.app.focus.is_some() && w.app.sel.is_none());
+        w.press(Key::Escape, Modifiers::NONE);
+        assert!(w.app.focus.is_none() && w.app.sel.is_some());
+    }
+
+    #[test]
+    fn ctrl_d_duplicates_the_edited_or_selected_blocks_one_step_each() {
+        let mut w = Win::with_texts(&["a", "b"]);
+        w.edit(0);
+        w.press(Key::D, Modifiers::CTRL);
+        assert_eq!(texts(&w), ["a", "a", "b"]);
+        assert_eq!(focus_idx(&w), Some(0), "the editor stays on the original");
+        assert_eq!(w.app.undo.len(), 1);
+        assert_eq!(kinds(&w), ["create_block"]);
+        w.press(Key::Z, Modifiers::CTRL);
+        assert_eq!(texts(&w), ["a", "b"]);
+        // a selection: copies follow the whole run, in order
+        w.press(Key::Escape, Modifiers::NONE);
+        w.press(Key::ArrowDown, Modifiers::SHIFT);
+        assert_eq!(sel(&w), [0, 1]);
+        w.press(Key::D, Modifiers::CTRL);
+        assert_eq!(texts(&w), ["a", "b", "a", "b"]);
+        assert_eq!(sel(&w), [2, 3], "the copies are selected");
+        assert_eq!(w.app.undo.len(), 1);
+        w.press(Key::Z, Modifiers::CTRL);
+        assert_eq!(texts(&w), ["a", "b"]);
+    }
+
+    #[test]
+    fn duplicate_takes_the_children_along() {
+        let mut w = win_with(&[("t", "toggle", json!({ "rich_text": rt("T") }))]);
+        let kid = blk("k", "t", "paragraph", json!({ "rich_text": rt("kid") }));
+        w.app.store.replace_children("t", "t", &[kid]).unwrap();
+        w.app.refresh();
+        w.app.sel = Some(("t".into(), "t".into()));
+        w.press(Key::D, Modifiers::CTRL);
+        assert_eq!(texts(&w), ["T", "kid", "T", "kid"]);
+        assert_eq!(kinds(&w), ["create_block", "create_block"]);
+    }
+
+    #[test]
+    fn ctrl_shift_arrows_move_among_siblings_one_step_each() {
+        let mut w = Win::with_texts(&["a", "b", "c"]);
+        w.edit(2);
+        w.press(Key::ArrowUp, CS);
+        assert_eq!(texts(&w), ["a", "c", "b"]);
+        assert_eq!(focus_idx(&w), Some(1), "the editor goes along");
+        assert_eq!(w.app.undo.len(), 1);
+        assert_eq!(kinds(&w), ["move_block"]);
+        w.press(Key::ArrowUp, CS);
+        assert_eq!(texts(&w), ["c", "a", "b"]);
+        let n = (w.app.undo.len(), w.queued());
+        w.press(Key::ArrowUp, CS);
+        assert_eq!((w.app.undo.len(), w.queued()), n, "at the top: nothing");
+        assert_eq!(texts(&w), ["c", "a", "b"]);
+        w.press(Key::Z, Modifiers::CTRL);
+        assert_eq!(texts(&w), ["a", "c", "b"]);
+        // a selected run moves down as one
+        w.press(Key::Escape, Modifiers::NONE);
+        w.app.sel = Some((w.app.rows[0].block_id.clone(), w.app.rows[1].block_id.clone()));
+        w.press(Key::ArrowDown, CS);
+        assert_eq!(texts(&w), ["b", "a", "c"]);
+        assert_eq!(sel(&w), [1, 2]);
+        w.press(Key::ArrowDown, CS);
+        assert_eq!(texts(&w), ["b", "a", "c"], "at the bottom: nothing");
+    }
+
+    #[test]
+    fn a_commented_block_is_not_moved() {
+        let mut w = Win::with_texts(&["a", "b"]);
+        let c: notion_core::model::Comment = serde_json::from_value(json!({
+            "object": "comment", "id": "c1", "discussion_id": "d1",
+            "parent": { "type": "block_id", "block_id": "p-0" },
+            "created_time": "2025-01-01T00:00:00.000Z", "last_edited_time": "2025-01-01T00:00:00.000Z",
+            "created_by": { "object": "user", "id": "u" },
+            "rich_text": [{ "type": "text", "text": { "content": "x" }, "plain_text": "x", "annotations": {} }],
+        }))
+        .unwrap();
+        w.app.store.put_comment(&c).unwrap();
+        w.app.refresh();
+        w.app.sel = Some(("p-0".into(), "p-0".into()));
+        w.press(Key::ArrowDown, CS);
+        assert_eq!(texts(&w), ["a", "b"]);
+        assert!(w.app.last_error.as_deref().unwrap_or("").contains("comments"));
+        // up: the block above is the one that would be re-created
+        w.app.last_error = None;
+        w.app.sel = Some(("p-1".into(), "p-1".into()));
+        w.press(Key::ArrowUp, CS);
+        assert!(w.app.last_error.as_deref().unwrap_or("").contains("the block above has comments"));
+        assert_eq!((w.queued(), w.app.undo.len()), (0, 0));
+    }
+
+    #[test]
+    fn unmovable_neighbours_and_undeletable_selections_are_refused() {
+        let img = json!({ "type": "external", "external": { "url": "https://e.com/a.png" } });
+        let mut w = win_with(&[
+            ("i", "image", img),
+            ("a", "paragraph", json!({ "rich_text": rt("a") })),
+            ("c", "child_page", json!({ "title": "Sub" })),
+        ]);
+        // up past an image: nothing queued
+        w.app.sel = Some(("a".into(), "a".into()));
+        w.press(Key::ArrowUp, CS);
+        assert!(w.app.last_error.as_deref().unwrap_or("").contains("can't move"));
+        assert_eq!((ids(&w), w.queued(), w.app.undo.len()), (vec!["i".to_string(), "a".into(), "c".into()], 0, 0));
+        // a run holding a child page is neither deleted nor cut
+        w.app.last_error = None;
+        w.app.sel = Some(("a".into(), "c".into()));
+        w.press(Key::Delete, Modifiers::NONE);
+        w.send(Event::Cut);
+        assert_eq!((w.app.rows.len(), w.queued(), w.copied.len()), (3, 0, 0));
+        assert!(w.app.last_error.as_deref().unwrap_or("").contains("not deleting"));
+        // copy still works
+        w.send(Event::Copy);
+        assert_eq!(w.copied.len(), 1);
+        // Enter on a selection that starts at a non-editable block edits nothing
+        w.app.sel = Some(("i".into(), "i".into()));
+        w.press(Key::Enter, Modifiers::NONE);
+        assert!(w.app.focus.is_none());
+    }
+
+    #[test]
+    fn colours_via_the_slash_menu_render_in_both_themes_and_undo() {
+        let mut w = Win::with_texts(&[""]);
+        w.edit(0);
+        w.type_text("/");
+        w.type_text("color red");
+        assert_eq!(
+            w.menu().map(|m| m.kind),
+            Some(crate::menu::Kind::Slash),
+            "the colour entries keep the menu open"
+        );
+        w.press(Key::Enter, Modifiers::NONE);
+        assert_eq!(w.app.rows[0].color, "red");
+        assert_eq!(w.text(), "", "the trigger text is gone");
+        assert_eq!(kinds(&w), ["update_block"]);
+        let body = serde_json::to_value(&w.app.store.queued_ops().unwrap()[0].kind).unwrap();
+        assert_eq!(body["body"]["paragraph"]["color"], "red");
+        w.press(Key::Escape, Modifiers::NONE);
+        // a background tint, German name
+        w.edit(0);
+        w.type_text("/");
+        w.type_text("farbe blau hinter");
+        w.press(Key::Enter, Modifiers::NONE);
+        assert_eq!(w.app.rows[0].color, "blue_background");
+        for theme in [egui::ThemePreference::Dark, egui::ThemePreference::Light] {
+            w.ctx.set_theme(theme);
+            w.frames(vec![]);
+            w.frames(vec![]);
+            w.frames(vec![]);
+        }
+        w.press(Key::Escape, Modifiers::NONE);
+        w.press(Key::Z, Modifiers::CTRL);
+        w.press(Key::Z, Modifiers::CTRL);
+        assert_eq!((w.app.rows[0].color.as_str(), w.queued()), ("default", 0));
+    }
+
+    #[test]
+    fn toggle_headings_collapse_and_heading_4_renders() {
+        let mut w = win_with(&[
+            ("h", "heading_2", json!({ "rich_text": rt("Head"), "is_toggleable": true })),
+            ("h4", "heading_4", json!({ "rich_text": rt("Four"), "is_toggleable": false })),
+        ]);
+        w.app.store.replace_children("h", "h", &[blk("k", "h", "paragraph", json!({ "rich_text": rt("kid") }))]).unwrap();
+        w.app.refresh();
+        w.frames(vec![]);
+        assert!(w.app.rows[0].toggle);
+        assert_eq!(w.app.rows[2].marker, Marker::Heading(4));
+        assert!(w.shown.contains('▸') && w.shown.contains("Four") && !w.shown.contains("kid"));
+        w.app.apply(Action::Toggle(0));
+        w.frames(vec![]);
+        assert!(w.shown.contains('▾') && w.shown.contains("kid"));
+        // and the `/` menu makes one from a paragraph
+        let mut w = Win::with_texts(&[""]);
+        w.edit(0);
+        w.type_text("/");
+        w.type_text("th3");
+        w.press(Key::Enter, Modifiers::NONE);
+        assert_eq!((w.app.rows[0].marker.clone(), w.app.rows[0].toggle), (Marker::Heading(3), true));
+    }
+
+    #[test]
+    fn enter_splits_at_the_cursor_and_keeps_marks() {
+        let mut w = win_with(&[(
+            "a",
+            "paragraph",
+            json!({ "rich_text": [{ "type": "text", "text": { "content": "bold tail" },
+                "plain_text": "bold tail", "annotations": { "bold": true } }] }),
+        )]);
+        w.edit(0);
+        w.select(6, 6); // **bold| tail**
+        w.press(Key::Enter, Modifiers::NONE);
+        assert_eq!(texts(&w), ["bold", " tail"]);
+        assert!(w.app.rows.iter().all(|r| r.rich_text[0].annotations.bold));
+        assert_eq!(focus_idx(&w), Some(1));
+        assert_eq!(w.app.undo.len(), 1);
+        assert_eq!(kinds(&w), ["update_block", "create_block"]);
+        w.press(Key::Z, Modifiers::CTRL);
+        assert_eq!(texts(&w), ["bold tail"]);
+    }
+
+    #[test]
+    fn enter_continues_lists_ends_headings_and_empties_a_list_item() {
+        let mut w = win_with(&[
+            ("b", "bulleted_list_item", json!({ "rich_text": rt("ab") })),
+            ("h", "heading_1", json!({ "rich_text": rt("Head") })),
+        ]);
+        w.edit(0);
+        w.select(1, 1);
+        w.press(Key::Enter, Modifiers::NONE);
+        assert_eq!(texts(&w), ["a", "b", "Head"]);
+        assert_eq!((w.app.rows[0].marker.clone(), w.app.rows[1].marker.clone()), (Marker::Bullet, Marker::Bullet));
+        // Enter on the now-empty item turns it into a paragraph
+        w.press(Key::Delete, Modifiers::NONE);
+        assert_eq!(w.text(), "");
+        w.press(Key::Enter, Modifiers::NONE);
+        assert_eq!((texts(&w).len(), w.app.rows[1].marker.clone()), (3, Marker::None));
+        // a heading's tail goes to a paragraph
+        w.app.focus = None;
+        w.edit(2);
+        w.press(Key::Enter, Modifiers::NONE);
+        assert_eq!(w.app.rows[2].marker, Marker::Heading(1));
+        assert_eq!((w.app.rows[3].marker.clone(), texts(&w)[3].as_str()), (Marker::None, ""));
+    }
+
+    #[test]
+    fn pasting_lines_into_an_empty_row_makes_a_block_each() {
+        let mut w = Win::with_texts(&["", "z"]);
+        w.edit(0);
+        w.send(Event::Paste("# Title\n- one\n\nplain **x**".into()));
+        assert_eq!(texts(&w), ["Title", "one", "plain x", "z"]);
+        let m: Vec<_> = w.app.rows.iter().map(|r| r.marker.clone()).collect();
+        assert_eq!(m[..3], [Marker::Heading(1), Marker::Bullet, Marker::None]);
+        assert_eq!(w.app.undo.len(), 1);
+        w.press(Key::Z, Modifiers::CTRL);
+        assert_eq!(texts(&w), ["", "z"]);
+        // one line, or a non-empty row: plain text for the editor
+        w.edit(1);
+        w.send(Event::Paste("a\nb".into()));
+        assert_eq!(ids(&w).len(), 2);
+    }
+
+    #[test]
+    fn ctrl_alt_t_opens_all_toggles_or_closes_them() {
+        let mut w = win_with(&[
+            ("t1", "toggle", json!({ "rich_text": rt("T1") })),
+            ("t2", "heading_1", json!({ "rich_text": rt("T2"), "is_toggleable": true })),
+        ]);
+        w.press(Key::T, CTRL_ALT);
+        assert!(w.app.open.contains("t1") && w.app.open.contains("t2"));
+        w.press(Key::T, CTRL_ALT);
+        assert!(w.app.open.is_empty());
+        w.app.open.insert("t1".into());
+        w.press(Key::T, CTRL_ALT);
+        assert_eq!(w.app.open.len(), 2, "any closed: open all");
+        // AltGr+T types a letter: no Ctrl or Alt reaches the app
+        w.press(Key::T, Modifiers::NONE);
+        assert_eq!(w.app.open.len(), 2);
+        w.edit(0);
+        w.type_text("t");
+        assert!(w.text().ends_with('t'));
     }
 }

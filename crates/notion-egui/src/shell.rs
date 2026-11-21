@@ -83,6 +83,13 @@ impl App {
                 }
             }
         }
+        if let Some((a, b)) = self.sel.take() {
+            let r = |id: String| self.store.resolve_id(&id).unwrap_or(id);
+            self.sel = Some((r(a), r(b)));
+            if self.sel_idx().is_empty() {
+                self.sel = None;
+            }
+        }
         // a push renames local-* toggles: keep them expanded
         let open = std::mem::take(&mut self.open);
         self.open = open
@@ -604,6 +611,7 @@ impl App {
             self.scroll = 0.0;
             self.pending_scroll = Some(0.0);
             self.find = None;
+            self.sel = None;
         }
         let from = self.current.take();
         self.hist().go(from.as_deref(), id);
@@ -767,6 +775,7 @@ impl App {
         // Ctrl+W / Ctrl+Tab with the switcher open: it goes with the tab
         self.switcher = None;
         self.find = None;
+        self.sel = None;
         self.current = t.page;
         self.open = t.open;
         self.scroll = t.scroll;
@@ -1053,6 +1062,11 @@ impl App {
         match c {
             Command::Back | Command::Forward | Command::Parent | Command::Find | Command::CopyLink
                 if self.switcher.is_some() || self.conflict.is_some() => {}
+            Command::ToggleAll
+                if self.switcher.is_some()
+                    || self.conflict.is_some()
+                    || self.focus.as_ref().is_some_and(|f| f.menu.is_some()) => {}
+            Command::ToggleAll => self.toggle_all(),
             Command::Back => self.go_history(true),
             Command::Forward => self.go_history(false),
             Command::Parent => self.open_parent(),
@@ -1200,6 +1214,7 @@ impl App {
             self.window = (r.width(), r.height());
         }
         let shortcuts = self.shortcuts(&ctx);
+        self.selection_keys(&ctx);
         self.switcher_keys(&ctx);
         let focused = ctx.input(|i| i.focused);
         let gained = focused && !self.was_focused;

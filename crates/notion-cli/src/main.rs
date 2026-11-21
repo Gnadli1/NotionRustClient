@@ -120,6 +120,7 @@ fn render_block(b: &Block, depth: usize, out: &mut String) {
         BlockKind::Heading1(_) => "# ",
         BlockKind::Heading2(_) => "## ",
         BlockKind::Heading3(_) => "### ",
+        BlockKind::Heading4(_) => "#### ",
         BlockKind::BulletedListItem(_) => "- ",
         BlockKind::NumberedListItem(_) => "1. ",
         BlockKind::ToDo { checked: true, .. } => "[x] ",

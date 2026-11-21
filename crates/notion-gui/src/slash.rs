@@ -39,6 +39,24 @@ pub const ITEMS: &[Item] = &[
         aliases: &["h3", "###", "Überschrift 3", "Überschrift"],
     },
     Item {
+        kind: TargetKind::ToggleHeading1,
+        name: "Toggle heading 1",
+        hint: "Collapsible heading",
+        aliases: &["th1"],
+    },
+    Item {
+        kind: TargetKind::ToggleHeading2,
+        name: "Toggle heading 2",
+        hint: "Collapsible heading",
+        aliases: &["th2"],
+    },
+    Item {
+        kind: TargetKind::ToggleHeading3,
+        name: "Toggle heading 3",
+        hint: "Collapsible heading",
+        aliases: &["th3"],
+    },
+    Item {
         kind: TargetKind::Bulleted,
         name: "Bulleted list",
         hint: "Simple bulleted list",
@@ -214,7 +232,8 @@ mod tests {
     fn filters_by_name_and_alias() {
         assert_eq!(names("").len(), ITEMS.len());
         assert_eq!(names("h1"), ["Heading 1"]);
-        assert_eq!(names("HEAD"), ["Heading 1", "Heading 2", "Heading 3"]);
+        assert_eq!(names("HEAD").len(), 6, "headings and toggle headings");
+        assert_eq!(names("th2"), ["Toggle heading 2"]);
         assert_eq!(names("todo"), ["To-do list"]);
         assert_eq!(names("bullet"), ["Bulleted list"]);
         assert!(names("zzz").is_empty(), "no match: the menu closes");

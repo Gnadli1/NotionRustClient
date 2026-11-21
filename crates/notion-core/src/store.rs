@@ -346,7 +346,7 @@ impl Store {
     }
 
     /// Runs `f` atomically: rolled back if it fails. Nests (uses a SAVEPOINT).
-    pub(crate) fn atomic<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    pub fn atomic<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         self.conn.execute_batch("SAVEPOINT atomic")?;
         match f() {
             Ok(v) => {

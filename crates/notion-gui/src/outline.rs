@@ -124,6 +124,8 @@ pub struct Row {
     pub locked: bool,
     /// Toggle block or toggleable heading: its children can be collapsed.
     pub toggle: bool,
+    /// Notion colour of a text block (`default`, `red`, `blue_background`, ...).
+    pub color: String,
     /// Bullets / numbers: how many same-kind list items it is nested in.
     pub level: usize,
 }
@@ -249,10 +251,9 @@ pub fn indent_target(rows: &[Row], idx: usize) -> Option<(String, Option<String>
     let d = rows[idx].depth;
     let j = rows[..idx].iter().rposition(|r| r.depth <= d)?;
     let prev = &rows[j];
-    // a heading that already has children is toggleable
     let has_kids = rows.get(j + 1).is_some_and(|r| r.depth > d);
-    let holds =
-        can_have_children(&prev.marker) || (matches!(prev.marker, Marker::Heading(_)) && has_kids);
+    let holds = can_have_children(&prev.marker)
+        || (matches!(prev.marker, Marker::Heading(_)) && (prev.toggle || has_kids));
     if prev.depth < d || !holds {
         return None; // first child, or a sibling that can't hold children
     }
@@ -275,10 +276,11 @@ pub fn outdent_target(rows: &[Row], idx: usize) -> Option<(String, Option<String
     Some((parent.parent.clone(), Some(parent.block_id.clone())))
 }
 
-/// First block in the subtree that push's copy-then-delete can't recreate
-/// (anything not modelled in core).
+/// First block of row `idx` and its subtree that push's copy-then-delete
+/// can't recreate (anything not modelled in core).
 pub fn unmovable_in_subtree(rows: &[Row], idx: usize) -> Option<&Marker> {
-    subtree(rows, idx).iter().map(|r| &r.marker).find(|m| {
+    let block = std::iter::once(&rows[idx]).chain(subtree(rows, idx));
+    block.map(|r| &r.marker).find(|m| {
         !matches!(
             m,
             Marker::None
@@ -431,6 +433,7 @@ fn walk(
             BlockKind::Heading1(_) => Marker::Heading(1),
             BlockKind::Heading2(_) => Marker::Heading(2),
             BlockKind::Heading3(_) => Marker::Heading(3),
+            BlockKind::Heading4(_) => Marker::Heading(4),
             BlockKind::BulletedListItem(_) => Marker::Bullet,
             BlockKind::NumberedListItem(_) => Marker::Number(number),
             BlockKind::ToDo { checked, .. } => Marker::Todo(*checked),
@@ -476,9 +479,10 @@ fn walk(
         let locked = locked || marker == Marker::Synced;
         let toggle = match &b.kind {
             BlockKind::Toggle(_) => true,
-            BlockKind::Heading1(h) | BlockKind::Heading2(h) | BlockKind::Heading3(h) => {
-                h.is_toggleable
-            }
+            BlockKind::Heading1(h)
+            | BlockKind::Heading2(h)
+            | BlockKind::Heading3(h)
+            | BlockKind::Heading4(h) => h.is_toggleable,
             _ => false,
         };
         let (level, kids) = match marker {
@@ -495,6 +499,7 @@ fn walk(
             editable: editable && !locked,
             locked,
             toggle,
+            color: b.kind.text().map(|t| t.color.clone()).unwrap_or_default(),
             level,
         });
         if !leaf {
@@ -545,6 +550,7 @@ pub(crate) mod tests {
             rich_text: Vec::new(),
             editable: true,
             locked: false,
+            color: String::new(),
             level: 0,
         }
     }

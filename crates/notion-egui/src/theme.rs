@@ -49,6 +49,36 @@ pub fn colors(ui: &egui::Ui) -> &'static Colors {
     }
 }
 
+/// Notion's block colours as (text, background tint) for a colour name
+/// (`red`, `blue_background`); `None` for `default` and anything unknown.
+/// Hand-picked per theme, close to Notion's own.
+pub fn block_color(name: &str, dark: bool) -> (Option<Color32>, Option<Color32>) {
+    let (base, bg) = match name.strip_suffix("_background") {
+        Some(b) => (b, true),
+        None => (name, false),
+    };
+    // (text light, text dark, tint light, tint dark)
+    let [tl, td, bl, bd]: [u32; 4] = match base {
+        "gray" => [0x787774, 0x9B9B9B, 0xF1F1EF, 0x2F2F2F],
+        "brown" => [0x9F6B53, 0xBA856F, 0xF4EEEE, 0x4A3228],
+        "orange" => [0xD9730D, 0xC77D48, 0xFBECDD, 0x5C3B23],
+        "yellow" => [0xCB912F, 0xCA9849, 0xFBF3DB, 0x564328],
+        "green" => [0x448361, 0x529E72, 0xEDF3EC, 0x243D30],
+        "blue" => [0x337EA9, 0x5E87C9, 0xE7F3F8, 0x143A4E],
+        "purple" => [0x9065B0, 0x9D68D3, 0xF6F3F9, 0x3C2D49],
+        "pink" => [0xC14C8A, 0xD15796, 0xFAF1F5, 0x4E2C3C],
+        "red" => [0xD44C47, 0xDF5452, 0xFDEBEC, 0x5D2A28],
+        _ => return (None, None),
+    };
+    let rgb = |v: u32| Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8);
+    let pick = |l, d| rgb(if dark { d } else { l });
+    if bg {
+        (None, Some(pick(bl, bd)))
+    } else {
+        (Some(pick(tl, td)), None)
+    }
+}
+
 /// `c` as egui visuals. The text colour goes into the widget strokes, not
 /// `override_text_color`, so spans with their own colour keep it.
 pub fn visuals(c: &Colors, dark: bool) -> Visuals {
@@ -104,6 +134,22 @@ mod tests {
         assert_eq!(d.panel_fill, DARK.bg);
         assert_eq!(d.widgets.noninteractive.fg_stroke.color, DARK.text);
         assert_eq!(l.override_text_color, None);
+    }
+
+    #[test]
+    fn block_colours_per_theme() {
+        use notion_core::model::COLORS;
+        assert_eq!(block_color("default", false), (None, None));
+        assert_eq!(block_color("nope", true), (None, None));
+        for c in &COLORS[1..] {
+            for dark in [false, true] {
+                let (t, b) = block_color(c, dark);
+                assert!(t.is_some() && b.is_none(), "{c}");
+                let (t, b) = block_color(&format!("{c}_background"), dark);
+                assert!(t.is_none() && b.is_some(), "{c}_background");
+            }
+            assert_ne!(block_color(c, false), block_color(c, true), "{c}: a palette per theme");
+        }
     }
 
     #[test]

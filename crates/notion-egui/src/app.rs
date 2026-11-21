@@ -21,7 +21,7 @@ use notion_core::store::{PageEntry, Store};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::edit::EditKey;
-use crate::keys::Keymap;
+use crate::keys::{Command, Keymap};
 use crate::links::{self, Link};
 use crate::nav::{Find, History};
 use crate::menu::{self, menu_step, Kind, Menu, Outcome, Pick, Sources};
@@ -79,6 +79,8 @@ pub(crate) struct Focus {
     scroll: bool,
     /// The last write of this text failed: a second Esc leaves without it.
     pub(crate) failed: bool,
+    /// The cursor (char index) as the keys that need it last saw it.
+    pub(crate) cursor: usize,
 }
 
 impl Focus {
@@ -104,6 +106,7 @@ impl Focus {
             grab: Some(grab),
             scroll: true,
             failed: false,
+            cursor: 0,
         }
     }
 
@@ -166,6 +169,14 @@ pub(crate) enum Action {
     CommentDelete(String),
     /// Esc in a comment box.
     CommentsBack,
+    /// Esc in the editor: commit and select the block.
+    Select,
+    /// A block-editing command on the edited row (Ctrl+D, Ctrl+Shift+Up/Down).
+    Run(Command),
+    /// A `/` colour pick: the editor's text without the trigger, the colour.
+    Color { text: String, color: String },
+    /// A multi-line paste into an empty row.
+    Paste(String),
     /// A slash pick or Markdown shortcut on the edited row: `text` is the
     /// editor's text without the trigger, `typed` as it was before, `at` the
     /// cursor (a char index into `text`).
@@ -208,6 +219,8 @@ pub struct App {
     /// Table cells by (row, table row, column).
     pub(crate) table_jobs: HashMap<(usize, usize, usize), LayoutJob>,
     pub(crate) focus: Option<Focus>,
+    /// The selected blocks: first and last of a run of siblings (ids).
+    pub(crate) sel: Option<(String, String)>,
     pub(crate) keys: Keymap,
     pub(crate) title_edit: Option<TitleEdit>,
     /// The title has no mentions or equations (plain text round-trips).
@@ -329,7 +342,10 @@ fn look(m: &Marker) -> (f32, bool) {
 /// (create, delete, move) ran, so those after it are dropped.
 pub(crate) fn blur_first(acts: &mut Vec<Action>) {
     acts.sort_by_key(|a| !matches!(a, Action::Blur | Action::TitleCommit));
-    if let Some(k) = acts.iter().position(|a| matches!(a, Action::Key(_))) {
+    let moving = |a: &Action| {
+        matches!(a, Action::Key(_) | Action::Run(_) | Action::Paste(_) | Action::Color { .. })
+    };
+    if let Some(k) = acts.iter().position(moving) {
         let mut i = 0;
         acts.retain(|a| {
             i += 1;
@@ -457,6 +473,7 @@ impl App {
             worker_gone: false,
             shown_title: String::new(),
             keylog,
+            sel: None,
             clock: notion_core::markdown::local_date_iso,
         };
         app.refresh();
@@ -475,6 +492,7 @@ impl App {
     /// The editor on row `i`, with `typed` in it if the text differs from the
     /// row's (a conversion keeps what was typed).
     pub(crate) fn open_editor(&mut self, i: usize, grab: Grab, typed: Option<String>) {
+        self.sel = None;
         let r = &self.rows[i];
         let code = r.marker == Marker::Equation || matches!(r.marker, Marker::Code(_));
         let original = if code {
@@ -516,7 +534,7 @@ impl App {
 
     /// Converts the edited block through core (a new id for a synced block)
     /// and goes on editing it with `text`. Mirrors notion-gui's `convert`.
-    fn convert(&mut self, kind: TargetKind, text: String, typed: String, at: usize) {
+    pub(crate) fn convert(&mut self, kind: TargetKind, text: String, typed: String, at: usize) {
         if self.pushing() {
             return self.refuse(typed, "editing is paused while a push runs".into());
         }
@@ -585,6 +603,16 @@ impl App {
         match act {
             Action::Edit(i, _) | Action::Toggle(i) | Action::Check(i) if i >= self.rows.len() => {}
             Action::Key(k) => self.on_edit_key(k),
+            Action::Select => {
+                let id = self.focus.as_ref().map(|f| f.block_id.clone());
+                self.apply(Action::Blur);
+                if let Some(id) = id.filter(|_| self.focus.is_none()) {
+                    self.sel = Some((id.clone(), id));
+                }
+            }
+            Action::Run(c) => self.step(|s| s.block_cmd(c)),
+            Action::Color { text, color } => self.step(|s| s.set_color(text, color)),
+            Action::Paste(text) => self.step(|s| s.paste_lines(&text)),
             Action::Link { link, new_tab } => self.open_link(link, new_tab),
             Action::EditTitle => self.start_title(),
             Action::TitleCommit => {
@@ -685,20 +713,26 @@ impl App {
                         });
                     }
                     ui.add_space(12.0);
+                    let selected = self.sel_rows();
                     for idx in 0..self.rows.len() {
                         if self.shown[idx] {
-                            // painted behind the row once its height is known
+                            // painted behind the row once its height is known: the
+                            // block colour, then the flash / find / selection tint
                             let tint = if self.flash.contains_key(&self.rows[idx].block_id) {
                                 Some(0.18)
+                            } else if selected.contains(&idx) {
+                                Some(0.25)
                             } else {
                                 self.find.as_ref().and_then(|f| f.tint(idx))
                             };
-                            let bg = tint.map(|t| (ui.painter().add(egui::Shape::Noop), t));
+                            let block = theme::block_color(&self.rows[idx].color, ui.visuals().dark_mode).1;
+                            let fills = block.into_iter().chain(tint.map(|t| c.accent.gamma_multiply(t)));
+                            let bgs: Vec<_> = fills.map(|f| (ui.painter().add(egui::Shape::Noop), f)).collect();
                             let top = ui.cursor().top();
                             acts.extend(self.row_ui(ui, idx));
                             let r = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
-                            if let Some((bg, t)) = bg {
-                                ui.painter().set(bg, egui::Shape::rect_filled(r, 3.0, c.accent.gamma_multiply(t)));
+                            for (bg, f) in bgs {
+                                ui.painter().set(bg, egui::Shape::rect_filled(r, 3.0, f));
                             }
                             if self.goto == Some(idx) {
                                 self.goto = None;
@@ -991,7 +1025,11 @@ impl App {
             }
         });
         let linked = rows[idx].rich_text.iter().any(|r| links::run_link(r).is_some());
-        let mut l = Label::new(job.clone()).wrap();
+        let mut tinted = job.clone();
+        if let Some(t) = theme::block_color(&rows[idx].color, ui.visuals().dark_mode).0 {
+            md::tint(&mut tinted, t);
+        }
+        let mut l = Label::new(tinted).wrap();
         if editable || linked {
             l = l.sense(Sense::click()).selectable(false);
         }
@@ -1036,6 +1074,7 @@ impl App {
         let id = edit_id(&self.focus.as_ref()?.block_id);
         let dim = ui.visuals().weak_text_color();
         let (size, bold) = look(&self.rows[idx].marker);
+        let text_color = theme::block_color(&self.rows[idx].color, ui.visuals().dark_mode).0;
         let f = self.focus.as_mut()?;
         let mut act = None;
 
@@ -1130,6 +1169,9 @@ impl App {
         let src = Sources { tree: &self.tree, recent: &self.recent, users: &self.users };
         let mut layouter = |ui: &Ui, text: &dyn TextBuffer, wrap: f32| {
             let mut job = md::md_job(text.as_str(), size, bold, dim);
+            if let Some(t) = text_color {
+                md::tint(&mut job, t);
+            }
             job.wrap.max_width = wrap;
             ui.fonts_mut(|f| f.layout_job(job))
         };
@@ -1155,6 +1197,7 @@ impl App {
             act = Some(Action::Blur);
         }
         let cur = out.cursor_range.map_or(cur, |r| r.primary.index.0);
+        f.cursor = cur;
         let (line, col) = line_col(&f.text, cur);
         let typed = resp.changed() && f.text.len() > f.prev_len;
         let mut new_cursor = None;
@@ -1184,6 +1227,7 @@ impl App {
             }
         }
         let mut convert = None;
+        let mut color = None;
         let mut want_users = false;
         let was_picked = picked.is_some();
         let pick_in = picked.and_then(|p| f.menu.take().map(|m| (p, m)));
@@ -1199,6 +1243,15 @@ impl App {
                         new_cursor = Some(trigger_chars(&f.text));
                     }
                     convert = Some((kind, before));
+                }
+                Pick::Color(c) => {
+                    if m.kind == Kind::TurnInto {
+                        new_cursor = Some(cur);
+                    } else {
+                        f.text = m.replace(&f.text, col, "");
+                        new_cursor = Some(trigger_chars(&f.text));
+                    }
+                    color = Some(c);
                 }
                 // a mention goes in as its Markdown token and is committed
                 // with the row
@@ -1254,6 +1307,9 @@ impl App {
             out.state.store(&ctx, id);
         }
         f.prev_len = f.text.len();
+        if let Some(color) = color {
+            act = Some(Action::Color { text: f.text.clone(), color });
+        }
         if let Some((kind, typed)) = convert {
             let at = new_cursor.unwrap_or_else(|| f.text.chars().count());
             act = Some(Action::Convert {

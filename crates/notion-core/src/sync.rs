@@ -8,7 +8,9 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use crate::api::{BlockNode, Client};
-use crate::markdown::{from_markdown, is_markdown_editable, split_runs, to_markdown};
+use crate::markdown::{
+    from_markdown, is_markdown_editable, split_markdown, split_runs, to_markdown,
+};
 use crate::model::{
     plain_text, users_in, Block, BlockKind, Comment, Page, Parent, PropertyValue, RichText,
     SearchResult, TargetKind, TextBlock, User,
@@ -1091,11 +1093,25 @@ pub fn local_edit_rich(store: &Store, block_id: &str, rich_text: Vec<RichText>) 
     }
     let mut block = base.clone();
     block.kind.set_text(split_runs(rich_text))?;
+    enqueue_kind(store, &base, &block)
+}
+
+/// Queues a PATCH of `block`'s whole payload (text, colour, ...).
+fn enqueue_kind(store: &Store, base: &Block, block: &Block) -> Result<i64> {
     let mut body = block.kind.to_request_json()?;
     if let Some(o) = body.as_object_mut() {
         o.remove("type");
     }
-    enqueue_update(store, &base, &block, body)
+    enqueue_update(store, base, block, body)
+}
+
+/// Sets a cached block's `color` (one of [`crate::model::COLORS`], plain or
+/// `_background`) and queues the PATCH. Returns the op id.
+pub fn local_set_color(store: &Store, block_id: &str, color: &str) -> Result<i64> {
+    let base = cached(store, block_id)?;
+    let mut block = base.clone();
+    block.kind.set_color(color)?;
+    enqueue_kind(store, &base, &block)
 }
 
 /// Replaces cell `col` of a cached `table_row` and queues
@@ -1524,6 +1540,72 @@ pub fn local_create_block(
         )
     })?;
     Ok(id)
+}
+
+/// Copies a cached block and its subtree as new `local-*` blocks, right
+/// after `after` (default: the block itself), and queues the creates.
+/// Returns the copy's id. Like a move's copy it is rebuilt from the modelled
+/// fields only, so a callout's custom icon is lost; a subtree with a block
+/// core can't write (child page, unsupported type) is refused and nothing is
+/// queued. Comments stay with the original.
+pub fn local_duplicate_block(store: &Store, block_id: &str, after: Option<&str>) -> Result<String> {
+    fn copy(store: &Store, id: &str, parent: &str, after: Option<&str>) -> Result<String> {
+        let block = cached(store, id)?;
+        let kids = store.children(id)?;
+        if block.has_children && kids.is_empty() {
+            return Err(Error::Invalid("its children are not cached; pull the page first".into()));
+        }
+        let new = local_create_block(store, parent, after, block.kind)?;
+        let mut prev: Option<String> = None;
+        for c in kids {
+            prev = Some(copy(store, &c.id, &new, prev.as_deref())?);
+        }
+        Ok(new)
+    }
+    store.atomic(|| {
+        let block = cached(store, block_id)?;
+        let parent = block
+            .parent
+            .id()
+            .ok_or_else(|| Error::Invalid(format!("block {block_id} has no parent id")))?;
+        copy(store, block_id, parent, Some(after.unwrap_or(block_id)))
+    })
+}
+
+/// Enter at char `at` of a text block whose Markdown is `md`: the text before
+/// the cut stays (queued as an edit if it changed), the text after goes to a
+/// new block right after it, empty if `at` is the end. The new block continues
+/// a list (bulleted, numbered, to-do) and is a paragraph otherwise. Marks
+/// that span the cut stay on both halves; a cut inside a token (mention,
+/// equation, link URL, mark delimiter) leaves the text whole and adds an
+/// empty block. The block's children stay with it, the colour is copied.
+/// Returns the new block's id.
+pub fn local_split_block(store: &Store, block_id: &str, md: &str, at: usize) -> Result<String> {
+    store.atomic(|| {
+        let base = cached(store, block_id)?;
+        let t = base.kind.text().ok_or_else(|| {
+            Error::Invalid(format!("block type `{}` has no text", base.kind.type_name()))
+        })?;
+        let (before, after) = split_markdown(md, at);
+        if to_markdown(&before) != to_markdown(&t.rich_text) {
+            local_edit_rich(store, block_id, before)?;
+        }
+        let kind = match base.kind {
+            BlockKind::BulletedListItem(_) => TargetKind::Bulleted,
+            BlockKind::NumberedListItem(_) => TargetKind::Numbered,
+            BlockKind::ToDo { .. } => TargetKind::ToDo,
+            _ => TargetKind::Paragraph,
+        }
+        .block_kind(TextBlock {
+            rich_text: split_runs(after),
+            color: t.color.clone(),
+        });
+        let parent = base
+            .parent
+            .id()
+            .ok_or_else(|| Error::Invalid(format!("block {block_id} has no parent id")))?;
+        local_create_block(store, parent, Some(block_id), kind)
+    })
 }
 
 /// What `local_change_type` did to the block's id.
@@ -5109,6 +5191,237 @@ mod tests {
         store.mark_op(op, OpStatus::Conflict, Some("x")).unwrap();
         get(&s, "/v1/pages/t", ok(titled("t", T2, "theirs"))).await;
         assert_eq!(fetch_conflict(&c, &store, op).await.unwrap(), Fetched::Other);
+    }
+
+    // ------------------------------------------------ block editing (F2)
+
+    #[tokio::test]
+    async fn duplicate_pushes_a_create_after_the_original_and_its_children() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let c = client(&s);
+        get(&s, "/v1/pages/p", ok(page("p", pp("root"), T))).await;
+        get(
+            &s,
+            "/v1/blocks/p/children",
+            list(vec![
+                blk("a", pp("p"), "A", T, true),
+                blk("b", pp("p"), "B", T, false),
+            ]),
+        )
+        .await;
+        get(&s, "/v1/blocks/a/children", list(vec![blk("a1", bp("a"), "A1", T, false)])).await;
+        pull_page(&c, &store, "p", true).await.unwrap();
+        s.reset().await;
+
+        let copy = local_duplicate_block(&store, "a", None).unwrap();
+        assert_eq!(ids(&store.children("p").unwrap()), ["a", copy.as_str(), "b"]);
+        assert_eq!(text(&store, &copy), "A");
+        let kid = store.children(&copy).unwrap();
+        assert_eq!((kid.len(), text(&store, &kid[0].id)), (1, "A1".into()));
+        assert_eq!(store.queued_ops().unwrap().len(), 2);
+
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/p/children"))
+            .and(body_partial_json(json!({ "after": "a" })))
+            .and(body_string_contains("\"A\""))
+            .respond_with(list(vec![blk("na", pp("p"), "A", T2, false)]))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/na/children"))
+            .and(body_string_contains("A1"))
+            .respond_with(list(vec![blk("na1", bp("na"), "A1", T2, false)]))
+            .expect(1)
+            .mount(&s)
+            .await;
+        assert_eq!(push(&c, &store).await.unwrap().applied, 2);
+        assert_eq!(ids(&store.children("p").unwrap()), ["a", "na", "b"]);
+        assert_eq!(ids(&store.children("na").unwrap()), ["na1"]);
+        s.verify().await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_refuses_what_core_cannot_write_and_queues_nothing() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        let mut img = blk("i", pp("p"), "", T, false);
+        img["type"] = json!("image");
+        store
+            .replace_children("p", "p", &[serde_json::from_value(img).unwrap()])
+            .unwrap();
+        assert!(local_duplicate_block(&store, "i", None).is_err());
+        assert!(store.queued_ops().unwrap().is_empty());
+        assert_eq!(ids(&store.children("p").unwrap()), ["i"]);
+    }
+
+    #[tokio::test]
+    async fn moving_a_block_up_or_down_pushes_copy_then_delete() {
+        for (moved, anchor, order) in [
+            // up: c after a; down: a after b
+            ("c", "a", ["a", "n", "b"]),
+            ("a", "b", ["b", "n", "c"]),
+        ] {
+            let s = MockServer::start().await;
+            let store = Store::open_in_memory().unwrap();
+            seed(&s, &store, &["a", "b", "c"]).await;
+            local_move_block(&store, moved, "p", Some(anchor)).unwrap().unwrap();
+            get(&s, &format!("/v1/blocks/{moved}"), ok(blk(moved, pp("p"), moved, T, false))).await;
+            Mock::given(method("PATCH"))
+                .and(path("/v1/blocks/p/children"))
+                .and(body_partial_json(json!({ "after": anchor })))
+                .respond_with(list(vec![blk("n", pp("p"), moved, T2, false)]))
+                .expect(1)
+                .mount(&s)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path(format!("/v1/blocks/{moved}")))
+                .respond_with(ok(blk(moved, pp("p"), moved, T2, false)))
+                .expect(1)
+                .mount(&s)
+                .await;
+            assert_eq!(push(&client(&s), &store).await.unwrap().applied, 1);
+            let mut want = order.to_vec();
+            if moved == "a" {
+                want = vec!["b", "n", "c"];
+            }
+            assert_eq!(ids(&store.children("p").unwrap()), want);
+            s.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_commented_block_is_not_moved() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a", "b"]).await;
+        let c: Comment = serde_json::from_value(json!({
+            "object": "comment", "id": "c1", "discussion_id": "d1",
+            "parent": { "type": "block_id", "block_id": "b" },
+            "created_time": T, "last_edited_time": T,
+            "created_by": { "object": "user", "id": "u" },
+            "rich_text": [{ "type": "text", "text": { "content": "hi" }, "plain_text": "hi", "annotations": {} }],
+        }))
+        .unwrap();
+        store.put_comment(&c).unwrap();
+        let e = local_move_block(&store, "b", "p", None).unwrap_err().to_string();
+        assert!(e.contains("comments"), "{e}");
+        assert!(store.queued_ops().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_colour_change_pushes_a_patch_with_color() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        local_set_color(&store, "a", "red_background").unwrap();
+        assert!(local_set_color(&store, "a", "teal").is_err());
+        assert!(local_set_color(&store, "a", "default_background").is_err());
+        get(&s, "/v1/blocks/a", ok(blk("a", pp("p"), "a", T, false))).await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/a"))
+            .and(body_partial_json(json!({ "paragraph": { "color": "red_background" } })))
+            .respond_with(ok(blk("a", pp("p"), "a", T2, false)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        assert_eq!(push(&client(&s), &store).await.unwrap().applied, 1);
+        s.verify().await;
+        // a code block has no colour
+        let mut code = blk("k", pp("p"), "x", T, false);
+        code["type"] = json!("code");
+        code["code"] = json!({ "rich_text": code["paragraph"]["rich_text"], "language": "rust" });
+        store
+            .replace_children("p", "p", &[serde_json::from_value(code).unwrap()])
+            .unwrap();
+        assert!(local_set_color(&store, "k", "red").is_err());
+    }
+
+    #[tokio::test]
+    async fn split_produces_an_edit_and_a_create_and_keeps_marks() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let c = client(&s);
+        seed(&s, &store, &["a", "b"]).await;
+        store
+            .replace_children(
+                "p",
+                "p",
+                &[
+                    serde_json::from_value(blk("a", pp("p"), "bold tail", T, false)).unwrap(),
+                    serde_json::from_value(blk("b", pp("p"), "B", T, false)).unwrap(),
+                ],
+            )
+            .unwrap();
+        // bold across the cut: **bold tail**, cut after "bold" (char 6)
+        let new = local_split_block(&store, "a", "**bold tail**", 6).unwrap();
+        assert_eq!(ids(&store.children("p").unwrap()), ["a", new.as_str(), "b"]);
+        let (l, r) = (rich(&store, "a"), rich(&store, &new));
+        assert_eq!((plain_text(&l), plain_text(&r)), ("bold".into(), " tail".into()));
+        assert!(l[0].annotations.bold && r[0].annotations.bold);
+        let kinds: Vec<_> = store
+            .queued_ops()
+            .unwrap()
+            .iter()
+            .map(|o| matches!(o.kind, OpKind::UpdateBlock { .. }))
+            .collect();
+        assert_eq!(kinds, [true, false], "an edit, then a create");
+
+        get(&s, "/v1/blocks/a", ok(blk("a", pp("p"), "bold tail", T, false))).await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/a"))
+            .and(body_string_contains("\"bold\""))
+            .respond_with(ok(blk("a", pp("p"), "bold", T2, false)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/p/children"))
+            .and(body_partial_json(json!({ "after": "a" })))
+            .and(body_string_contains(" tail"))
+            .respond_with(list(vec![blk("nt", pp("p"), " tail", T2, false)]))
+            .expect(1)
+            .mount(&s)
+            .await;
+        assert_eq!(push(&c, &store).await.unwrap().applied, 2);
+        s.verify().await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_refuses_uncached_children_and_split_keeps_the_colour() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        let mut parent = blk("a", pp("p"), "a", T, true);
+        parent["paragraph"]["color"] = json!("blue");
+        store
+            .replace_children("p", "p", &[serde_json::from_value(parent).unwrap()])
+            .unwrap();
+        // has_children, none cached: refused, nothing queued
+        let e = local_duplicate_block(&store, "a", None).unwrap_err().to_string();
+        assert!(e.contains("not cached"), "{e}");
+        assert!(store.queued_ops().unwrap().is_empty());
+        let new = local_split_block(&store, "a", "a", 1).unwrap();
+        assert_eq!(store.get_block(&new).unwrap().unwrap().kind.text().unwrap().color, "blue");
+    }
+
+    #[test]
+    fn split_at_the_end_only_creates_and_a_list_continues() {
+        let store = Store::open_in_memory().unwrap();
+        let mut bullet = blk("a", pp("p"), "x", T, false);
+        bullet["type"] = json!("bulleted_list_item");
+        bullet["bulleted_list_item"] = bullet["paragraph"].take();
+        store.upsert_page(&serde_json::from_value(page("p", pp("root"), T)).unwrap()).unwrap();
+        store
+            .replace_children("p", "p", &[serde_json::from_value(bullet).unwrap()])
+            .unwrap();
+        let new = local_split_block(&store, "a", "x", 1).unwrap();
+        assert_eq!(store.queued_ops().unwrap().len(), 1, "no edit: nothing changed");
+        let b = store.get_block(&new).unwrap().unwrap();
+        assert!(matches!(b.kind, BlockKind::BulletedListItem(_)));
+        assert_eq!(plain_text(&b.kind.text().unwrap().rich_text), "");
     }
 
     fn ts_parse(t: &str) -> DateTime<Utc> {
