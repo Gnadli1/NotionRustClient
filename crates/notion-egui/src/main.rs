@@ -14,6 +14,7 @@ mod keys;
 mod links;
 mod md;
 mod menu;
+mod nav;
 mod people;
 mod problems;
 mod resolve;

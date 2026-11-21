@@ -13,12 +13,13 @@ use notion_core::ops::OpStatus;
 use notion_core::sync::{self, Skip};
 
 use crate::app::{blur_first, Action, App, Grab};
+use crate::nav::{self, Find, History};
 use crate::outline::{self, Marker, Row};
 use crate::problems::{self, problem};
 use crate::session::{self, Session};
 use crate::switcher::{Out, Switcher};
 use crate::tabs::{self, Tab};
-use crate::view::{self, untitled};
+use crate::view::{self, untitled, FindOut};
 use crate::worker::{Cmd, Event};
 use crate::keys::{self, Command};
 use crate::{sidebar, theme};
@@ -49,6 +50,7 @@ impl App {
     pub(crate) fn refresh(&mut self) {
         if let Some(id) = &self.current {
             session::touch(&mut self.recent, id);
+            self.visited.insert(id.clone(), crate::comments::now_secs());
         }
         if let Err(e) = self.load_page().and_then(|()| self.load_ops()) {
             self.last_error = Some(e.to_string());
@@ -96,6 +98,10 @@ impl App {
             }
         }
         self.shown = outline::shown(&self.rows, &self.open);
+        self.heads = nav::headings(&self.rows);
+        if let Some(f) = &mut self.find {
+            f.search(&self.rows);
+        }
     }
 
     fn load_page(&mut self) -> notion_core::Result<()> {
@@ -552,8 +558,89 @@ impl App {
         if self.current.as_deref() != Some(id) {
             self.scroll = 0.0;
             self.pending_scroll = Some(0.0);
+            self.find = None;
         }
+        let from = self.current.take();
+        self.hist().go(from.as_deref(), id);
         self.current = Some(id.to_string());
+    }
+
+    /// The active tab's page history (the list grows with the tabs).
+    fn hist(&mut self) -> &mut History {
+        let n = self.tabs.len().max(self.active + 1);
+        self.hists.resize_with(n, Default::default);
+        &mut self.hists[self.active]
+    }
+
+    /// Back / forward in the tab's history; it is not a new step.
+    fn go_history(&mut self, back: bool) {
+        if !self.commit() {
+            return;
+        }
+        let h = self.hist();
+        if let Some(id) = if back { h.back() } else { h.forward() } {
+            self.open_or_pull(&id);
+        }
+    }
+
+    /// Ctrl+Shift+U: the page above the open one, if it is cached.
+    fn open_parent(&mut self) {
+        let parent = self.current.as_ref().and_then(|id| self.tree.iter().find(|e| e.id == *id));
+        match parent.and_then(|e| e.parent.clone()).filter(|p| self.cached(p)) {
+            Some(p) => self.open_or_pull(&p),
+            None => self.info = Some("no cached parent page".into()),
+        }
+    }
+
+    /// Scrolls row `i` into view on the next frame, opening the toggles above it.
+    pub(crate) fn show_row(&mut self, i: usize) {
+        let up = outline::ancestors(&self.rows, i);
+        let toggles: Vec<String> = (self.rows.iter())
+            .filter(|r| r.toggle && up.contains(&r.block_id.as_str()))
+            .map(|r| r.block_id.clone())
+            .collect();
+        self.open.extend(toggles);
+        self.shown = outline::shown(&self.rows, &self.open);
+        self.goto = Some(i);
+    }
+
+    fn find_out(&mut self, out: FindOut) {
+        let Some(f) = &mut self.find else { return };
+        let row = match out {
+            FindOut::Typed => {
+                f.restart(&self.rows);
+                f.hits.first().copied()
+            }
+            FindOut::Step(d) => f.step(d, &self.rows),
+            FindOut::Close => {
+                self.find = None;
+                return;
+            }
+        };
+        if let Some(i) = row {
+            self.show_row(i);
+        }
+    }
+
+    /// The first rows of a page's text, for the switcher's preview.
+    fn preview_lines(&self, id: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        self.preview_under(id, &mut out);
+        out
+    }
+
+    /// Depth-first, stopping at 10 text rows. Child pages are leaves.
+    fn preview_under(&self, parent: &str, out: &mut Vec<String>) {
+        for b in self.store.children(parent).unwrap_or_default() {
+            if out.len() >= 10 {
+                return;
+            }
+            let text = b.kind.text().map(|t| plain_text(&t.rich_text));
+            out.extend(text.filter(|t| !t.is_empty()));
+            if !matches!(b.kind, BlockKind::ChildPage { .. } | BlockKind::ChildDatabase { .. }) {
+                self.preview_under(&b.id, out);
+            }
+        }
     }
 
     /// Shows a cached page, or pulls an uncached one and opens it on arrival.
@@ -586,7 +673,18 @@ impl App {
 
     pub(crate) fn open_switcher(&mut self) {
         if self.commit() {
-            self.switcher = Some(Switcher::default());
+            let today = notion_core::markdown::local_day(crate::comments::now_secs());
+            let day = |id: &String| {
+                let t = self.visited.get(id).copied().or_else(|| {
+                    let p = self.store.get_page(id).ok().flatten();
+                    p.map(|p| p.last_edited_time.timestamp())
+                });
+                t.map(|t| (id.clone(), notion_core::markdown::local_day(t)))
+            };
+            let days = self.recent.iter().filter_map(day).collect();
+            let mut sw = Switcher::default();
+            (sw.today, sw.days, sw.paths) = (today, days, crate::switcher::paths(&self.tree));
+            self.switcher = Some(sw);
             self.ensure_users();
         }
     }
@@ -619,6 +717,7 @@ impl App {
         self.pending_open = None;
         // Ctrl+W / Ctrl+Tab with the switcher open: it goes with the tab
         self.switcher = None;
+        self.find = None;
         self.current = t.page;
         self.open = t.open;
         self.scroll = t.scroll;
@@ -655,15 +754,23 @@ impl App {
             return;
         }
         if i != self.active {
-            self.active = tabs::close(&mut self.tabs, self.active, i);
+            self.drop_tab(i);
             return;
         }
         if !self.commit() {
             return;
         }
-        self.active = tabs::close(&mut self.tabs, self.active, i);
+        self.drop_tab(i);
         let t = self.tabs[self.active].clone();
         self.load_tab(t);
+    }
+
+    /// Removes tab `i` and its history.
+    fn drop_tab(&mut self, i: usize) {
+        self.active = tabs::close(&mut self.tabs, self.active, i);
+        if i < self.hists.len() {
+            self.hists.remove(i);
+        }
     }
 
     /// Ctrl+Tab / Ctrl+Shift+Tab.
@@ -831,6 +938,7 @@ impl App {
         let map = &self.keys;
         let mut out =
             ctx.input_mut(|i| keys::take_commands(&mut i.events, ctrl, map, Command::is_global));
+        out.extend(ctx.input(|i| keys::mouse_nav(&i.events)));
         if out.contains(&Command::ToggleSidebar) {
             self.sidebar = !self.sidebar;
             out.retain(|c| *c != Command::ToggleSidebar);
@@ -879,11 +987,36 @@ impl App {
                 }
             }
         }
+        // Esc closes the find bar when nothing else wants it
+        let free = self.switcher.is_none()
+            && self.conflict.is_none()
+            && self.comments.is_none()
+            && !self.problems_open
+            && self.focus.as_ref().is_none_or(|f| f.menu.is_none())
+            && !ctx.egui_wants_keyboard_input();
+        if self.find.is_some() && free && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.find = None;
+        }
         out
     }
 
-    fn run_shortcut(&mut self, c: Command) {
+    fn run_shortcut(&mut self, c: Command, ctx: &egui::Context) {
         match c {
+            Command::Back | Command::Forward | Command::Parent | Command::Find | Command::CopyLink
+                if self.switcher.is_some() || self.conflict.is_some() => {}
+            Command::Back => self.go_history(true),
+            Command::Forward => self.go_history(false),
+            Command::Parent => self.open_parent(),
+            Command::Find if self.current.is_some() => {
+                self.find.get_or_insert_with(Find::default).focus = true;
+            }
+            Command::CopyLink => {
+                let page = self.current.as_deref().and_then(|id| self.store.get_page(id).ok().flatten());
+                if let Some(p) = page.filter(|p| !p.url.is_empty()) {
+                    ctx.copy_text(p.url);
+                    self.info = Some("link copied".into());
+                }
+            }
             Command::NextTab => self.cycle_tab(1),
             Command::PrevTab => self.cycle_tab(-1),
             Command::ForcePull => self.pull(true),
@@ -1090,6 +1223,27 @@ impl App {
                     .inner,
             );
         }
+        if self.current.is_some() && self.find.is_some() {
+            let bar = Frame::new().fill(c.bg).inner_margin(Margin::symmetric(12, 4));
+            let out = egui::Panel::top("find")
+                .frame(bar)
+                .show(ui, |ui| self.find.as_mut().and_then(|f| view::find_bar(ui, c, f)))
+                .inner;
+            if let Some(o) = out {
+                self.find_out(o);
+            }
+        }
+        if self.current.is_some() && self.heads.len() >= 2 && ctx.content_rect().width() >= 1000.0 {
+            acts.extend(
+                egui::Panel::right("outline")
+                    .frame(Frame::new())
+                    .exact_size(28.0)
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .show(ui, |ui| view::outline(ui, c, &self.heads))
+                    .inner,
+            );
+        }
         let page = egui::CentralPanel::default()
             .show(ui, |ui| {
                 if self.current.is_some() {
@@ -1112,6 +1266,11 @@ impl App {
         acts.extend(self.conflict_ui(&ctx, c));
         if let Some(mut sw) = self.switcher.take() {
             let items = sw.items(&self.tree, &self.recent);
+            // read when the selection changes, never per frame
+            let want = items.get(sw.sel.min(items.len().saturating_sub(1))).map(|i| i.id.as_str());
+            if want != sw.preview.as_ref().map(|p| p.0.as_str()) {
+                sw.preview = want.map(|id| (id.to_string(), self.preview_lines(id)));
+            }
             let out = view::switcher::show(&ctx, c, &mut sw, &items);
             if let Some(q) = sw.due_search(now) {
                 self.send(Cmd::Search(q));
@@ -1131,7 +1290,7 @@ impl App {
         }
         if !shortcuts.is_empty() {
             for s in shortcuts {
-                self.run_shortcut(s);
+                self.run_shortcut(s, &ctx);
             }
             ctx.request_repaint(); // the panels above were drawn before it
         }
@@ -2389,5 +2548,302 @@ mod tests {
         w.app.sent.push_back(Cmd::Pull { id: "remote".into(), force: false });
         w.answer(Event::Error("404".into()));
         assert_eq!(w.app.pending_open, None);
+    }
+
+    // -------------------------------------------------------- navigation
+
+    fn nav_win() -> Win {
+        let store = Store::open_in_memory().unwrap();
+        add_page(&store, "a", None, &["x"]);
+        add_page(&store, "b", Some("a"), &["x"]);
+        add_page(&store, "c", None, &["x"]);
+        add_page(&store, "d", None, &["x"]);
+        add_page(&store, "e", Some("ghost"), &["x"]);
+        Win::new(store)
+    }
+
+    fn open(w: &mut Win, id: &str) {
+        w.app.apply(Action::Open(id.into()));
+        w.frames(vec![]);
+    }
+
+    fn cur(w: &Win) -> &str {
+        w.app.current.as_deref().unwrap_or("-")
+    }
+
+    #[test]
+    fn back_and_forward_by_every_key_and_the_mouse() {
+        let mut w = nav_win();
+        for id in ["a", "b", "c"] {
+            open(&mut w, id);
+        }
+        w.press(Key::OpenBracket, Modifiers::CTRL);
+        assert_eq!(cur(&w), "b");
+        w.press(Key::ArrowLeft, Modifiers::ALT);
+        assert_eq!(cur(&w), "a");
+        w.press(Key::ArrowLeft, Modifiers::ALT);
+        assert_eq!(cur(&w), "a", "first entry: nothing");
+        w.press(Key::ArrowRight, Modifiers::ALT);
+        assert_eq!(cur(&w), "b");
+        w.press(Key::CloseBracket, Modifiers::CTRL);
+        assert_eq!(cur(&w), "c");
+        w.press(Key::CloseBracket, Modifiers::CTRL);
+        assert_eq!(cur(&w), "c", "last entry: nothing");
+        let click = |button| Ev::PointerButton {
+            pos: egui::Pos2::ZERO,
+            button,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        };
+        w.send(click(egui::PointerButton::Extra1));
+        assert_eq!(cur(&w), "b");
+        w.send(click(egui::PointerButton::Extra2));
+        assert_eq!(cur(&w), "c");
+        // going back is no step: a new page drops the forward branch
+        w.press(Key::OpenBracket, Modifiers::CTRL);
+        open(&mut w, "d");
+        w.press(Key::CloseBracket, Modifiers::CTRL);
+        assert_eq!(cur(&w), "d");
+        w.press(Key::OpenBracket, Modifiers::CTRL);
+        assert_eq!(cur(&w), "b");
+    }
+
+    #[test]
+    fn the_switcher_and_sidebar_push_history_and_each_tab_has_its_own() {
+        let mut w = nav_win();
+        open(&mut w, "a");
+        w.app.pick("b", false);
+        w.frames(vec![]);
+        // a new tab: its history starts empty
+        w.press(Key::T, Modifiers::CTRL);
+        w.press(Key::Escape, Modifiers::NONE);
+        open(&mut w, "c");
+        w.press(Key::OpenBracket, Modifiers::CTRL);
+        assert_eq!(cur(&w), "c", "tab 2 has nothing behind c");
+        w.press(Key::Tab, Modifiers::CTRL);
+        assert_eq!(cur(&w), "b");
+        w.press(Key::OpenBracket, Modifiers::CTRL);
+        assert_eq!(cur(&w), "a", "tab 1 went back");
+        // closing tab 1 takes its history along; tab 2 is clean
+        w.press(Key::W, Modifiers::CTRL);
+        assert_eq!(cur(&w), "c");
+        w.press(Key::OpenBracket, Modifiers::CTRL);
+        assert_eq!(cur(&w), "c");
+    }
+
+    #[test]
+    fn a_back_that_never_arrives_leaves_the_history_alone() {
+        let mut w = nav_win();
+        w.app.hist().go(None, "remote");
+        open(&mut w, "c");
+        assert_eq!(w.app.hist().pages(), ["remote", "c"]);
+        w.cmds();
+        w.press(Key::OpenBracket, Modifiers::CTRL);
+        assert_eq!(w.app.pending_open.as_deref(), Some("remote"));
+        assert!(w.cmds().contains(&Cmd::Pull { id: "remote".into(), force: false }));
+        w.answer(Event::Error("404".into()));
+        assert_eq!((w.app.pending_open.clone(), cur(&w)), (None, "c"));
+        open(&mut w, "d");
+        assert_eq!(w.app.hist().pages(), ["remote", "c", "d"]);
+    }
+
+    #[test]
+    fn ctrl_alt_bracket_is_not_back() {
+        let mut w = nav_win();
+        open(&mut w, "a");
+        open(&mut w, "b");
+        w.press(Key::OpenBracket, Modifiers::CTRL | Modifiers::ALT);
+        assert_eq!(cur(&w), "b");
+    }
+
+    #[test]
+    fn ctrl_shift_u_opens_the_cached_parent() {
+        let mut w = nav_win();
+        open(&mut w, "b");
+        w.press(Key::U, Modifiers::CTRL | Modifiers::SHIFT);
+        assert_eq!(cur(&w), "a");
+        // the parent is in history, too
+        w.press(Key::OpenBracket, Modifiers::CTRL);
+        assert_eq!(cur(&w), "b");
+        // top level: nothing; an uncached parent: nothing, and no pull
+        w.press(Key::U, Modifiers::CTRL | Modifiers::SHIFT);
+        w.press(Key::U, Modifiers::CTRL | Modifiers::SHIFT);
+        assert_eq!(cur(&w), "a");
+        open(&mut w, "e");
+        w.cmds();
+        w.press(Key::U, Modifiers::CTRL | Modifiers::SHIFT);
+        assert_eq!(cur(&w), "e");
+        assert_eq!(w.app.pending_open, None);
+        assert!(w.cmds().iter().all(|c| !matches!(c, Cmd::Pull { .. })));
+    }
+
+    #[test]
+    fn ctrl_l_copies_the_page_url() {
+        let mut w = nav_win();
+        w.press(Key::L, Modifiers::CTRL);
+        assert!(w.copied.is_empty(), "no page, no link");
+        open(&mut w, "a");
+        w.press(Key::L, Modifiers::CTRL);
+        assert_eq!(w.copied, ["https://notion.so/x"]);
+        assert_eq!(w.app.info.as_deref(), Some("link copied"));
+    }
+
+    fn find_win() -> Win {
+        let mut texts: Vec<String> = (0..80).map(|i| format!("line {i}")).collect();
+        texts[2] = "Grüße".into();
+        texts[40] = "gruesse hier".into();
+        texts[75] = "GRÜSSE".into();
+        let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut w = Win::with_texts(&texts);
+        w.press(Key::F, Modifiers::CTRL);
+        w.frames(vec![]);
+        w
+    }
+
+    #[test]
+    fn ctrl_f_counts_steps_wraps_scrolls_and_esc_closes() {
+        let mut w = find_win();
+        assert!(w.app.find.is_some());
+        let cur = |w: &Win| w.app.find.as_ref().unwrap().cur;
+        w.type_text("gruesse");
+        assert_eq!(w.app.find.as_ref().unwrap().hits, [2, 40, 75], "case and umlauts folded");
+        assert!(w.shown.contains("1/3"), "{}", w.shown);
+        w.send(key(Key::Enter));
+        assert_eq!(cur(&w), 1);
+        assert!(w.shown.contains("2/3"));
+        assert!(w.app.scroll > 100.0, "scrolled to row 40: {}", w.app.scroll);
+        w.send(key(Key::Enter));
+        w.send(key(Key::Enter));
+        assert_eq!(cur(&w), 0, "wraps");
+        w.press(Key::Enter, Modifiers::SHIFT);
+        assert_eq!(cur(&w), 2, "wraps back");
+        // the typed text did not go anywhere else
+        assert_eq!(w.queued(), 0);
+        w.send(key(Key::Escape));
+        assert!(w.app.find.is_none());
+    }
+
+    #[test]
+    fn esc_in_the_find_bar_leaves_the_editor_alone() {
+        let mut w = Win::with_texts(&["alpha", "beta"]);
+        w.edit(1);
+        w.press(Key::F, Modifiers::CTRL);
+        w.frames(vec![]);
+        w.type_text("alp");
+        assert_eq!(w.app.find.as_ref().unwrap().hits, [0]);
+        w.send(key(Key::Escape));
+        assert!(w.app.find.is_none());
+        assert_eq!((w.queued(), w.row_text("p-1").as_str()), (0, "beta"));
+    }
+
+    #[test]
+    fn esc_closes_the_find_bar_without_the_box_having_focus() {
+        let mut w = find_win();
+        w.type_text("line");
+        w.ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique("find-box")));
+        w.frames(vec![]);
+        w.send(key(Key::Escape));
+        assert!(w.app.find.is_none());
+    }
+
+    #[test]
+    fn ctrl_f_while_editing_keeps_the_edit_and_esc_closes_the_bar() {
+        let mut w = Win::with_texts(&["alpha", "beta"]);
+        w.edit(1);
+        w.type_text("X");
+        w.press(Key::F, Modifiers::CTRL);
+        w.frames(vec![]);
+        w.type_text("alp");
+        w.send(key(Key::Escape));
+        assert!(w.app.find.is_none());
+        let kept = match &w.app.focus {
+            Some(f) => f.text.clone(),
+            None => w.row_text("p-1"),
+        };
+        assert_eq!(kept, "betaX", "kept in the editor or committed");
+        assert_eq!(w.row_text("p-0"), "alpha");
+    }
+
+    #[test]
+    fn a_match_in_a_collapsed_toggle_opens_it() {
+        let store = Store::open_in_memory().unwrap();
+        add_page(&store, "p", None, &["x"]);
+        let t = crate::outline::tests::blk("tg", "p", "toggle", serde_json::json!({ "rich_text": crate::outline::tests::rt("T") }));
+        let k = crate::outline::tests::blk("kid", "tg", "paragraph", serde_json::json!({ "rich_text": crate::outline::tests::rt("needle") }));
+        store.replace_children("p", "p", &[t]).unwrap();
+        store.replace_children("tg", "tg", &[k]).unwrap();
+        let mut w = Win::new(store);
+        open(&mut w, "p");
+        assert!(!w.app.open.contains("tg"));
+        w.press(Key::F, Modifiers::CTRL);
+        w.frames(vec![]);
+        w.type_text("needle");
+        assert!(w.app.open.contains("tg"));
+        assert!(w.shown.contains("needle"));
+    }
+
+    fn headed_win() -> Win {
+        use crate::outline::tests::{blk, rt};
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_page(&crate::testkit::page_in("p", None)).unwrap();
+        let mut kids = vec![blk("h1", "p", "heading_1", serde_json::json!({ "rich_text": rt("One") }))];
+        kids.extend((0..60).map(|i| blk(&format!("t{i}"), "p", "paragraph", serde_json::json!({ "rich_text": rt("t") }))));
+        kids.push(blk("h2", "p", "heading_2", serde_json::json!({ "rich_text": rt("Two") })));
+        store.replace_children("p", "p", &kids).unwrap();
+        let mut w = Win::new(store);
+        open(&mut w, "p");
+        w
+    }
+
+    #[test]
+    fn the_outline_lists_headings_once_and_a_click_scrolls() {
+        let mut w = headed_win();
+        assert_eq!(w.app.heads, [(0, 1, "One".to_string()), (61, 2, "Two".to_string())]);
+        w.app.apply(Action::Goto(61));
+        w.frames(vec![]);
+        w.frames(vec![]);
+        assert!(w.app.scroll > 100.0, "{}", w.app.scroll);
+        assert_eq!(w.app.goto, None);
+        // fewer than two headings: no outline data worth drawing
+        let mut w = Win::with_texts(&["x"]);
+        assert!(w.app.heads.is_empty());
+        w.frames(vec![]);
+    }
+
+    #[test]
+    fn the_switcher_groups_recent_pages_and_previews_the_selection_once() {
+        let mut w = switcher_win();
+        for (id, t) in [("a", ["one", "two"]), ("b", ["three", "four"])] {
+            let kids: Vec<_> = t
+                .iter()
+                .enumerate()
+                .map(|(i, s)| crate::outline::tests::blk(&format!("{id}-{i}"), id, "paragraph", serde_json::json!({ "rich_text": crate::outline::tests::rt(s) })))
+                .collect();
+            w.app.store.replace_children(id, id, &kids).unwrap();
+        }
+        w.app.recent = vec!["a".into(), "b".into()];
+        w.app.visited.insert("a".into(), crate::comments::now_secs());
+        w.press(Key::K, Modifiers::CTRL);
+        w.frames(vec![]);
+        w.frames(vec![]);
+        for header in ["Heute", "Älter"] {
+            assert!(w.shown.contains(header), "{header}: {}", w.shown);
+        }
+        assert!(!w.shown.contains("Gestern"));
+        let pv = |w: &Win| w.app.switcher.as_ref().unwrap().preview.clone().unwrap();
+        assert_eq!(pv(&w), ("a".to_string(), vec!["one".to_string(), "two".to_string()]));
+        // frames do not re-read the page
+        w.app.store.replace_children("a", "a", &[]).unwrap();
+        w.frames(vec![]);
+        assert_eq!(pv(&w).1, ["one", "two"]);
+        // ↓ lands on the next page, not on a header
+        w.send(key(Key::ArrowDown));
+        assert_eq!(pv(&w), ("b".to_string(), vec!["three".to_string(), "four".to_string()]));
+        w.send(key(Key::Enter));
+        assert_eq!(cur(&w), "b");
+        // a search is a flat list
+        w.press(Key::K, Modifiers::CTRL);
+        w.type_text("al");
+        assert!(!w.shown.contains("Heute"));
     }
 }

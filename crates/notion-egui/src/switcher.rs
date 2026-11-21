@@ -1,8 +1,9 @@
 //! The Ctrl+K switcher's state and keys (drawing is in `view::switcher`).
-//! Empty query: the recent pages. Otherwise: the cached pages whose title
+//! Empty query: the recent pages, grouped by day. Otherwise: the cached pages whose title
 //! contains the query, plus Notion's title search (sent ~300 ms after the
 //! last keystroke) merged in.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{Context, Key, Modifiers};
@@ -18,6 +19,21 @@ pub struct Item {
     pub id: String,
     pub icon: String,
     pub title: String,
+    /// The pages above it, root first: "A › B" (empty at top level).
+    pub path: String,
+    /// The day header to draw above it (the recent list only).
+    pub group: Option<&'static str>,
+}
+
+/// The header for a page of local day `day` seen on day `today` (day
+/// numbers: consecutive days differ by 1).
+pub fn group(today: i64, day: i64) -> &'static str {
+    match today - day {
+        ..=0 => "Heute",
+        1 => "Gestern",
+        2..=7 => "Vergangene Woche",
+        _ => "Älter",
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -34,6 +50,14 @@ pub struct Switcher {
     pub results: Vec<(String, String)>,
     /// The selection moved by key: the list scrolls to it once.
     pub moved: bool,
+    /// Today and the local day each recent page counts for, set at open.
+    pub today: i64,
+    pub days: HashMap<String, i64>,
+    /// Page id to path, see [`paths`].
+    pub paths: HashMap<String, String>,
+    /// The selected page's first rows (id, lines), loaded when the selection
+    /// changes.
+    pub preview: Option<(String, Vec<String>)>,
     typed_at: Instant,
     searched: String,
 }
@@ -45,17 +69,37 @@ impl Default for Switcher {
             sel: 0,
             results: Vec::new(),
             moved: false,
+            today: 0,
+            days: HashMap::new(),
+            paths: HashMap::new(),
+            preview: None,
             typed_at: Instant::now(),
             searched: String::new(),
         }
     }
 }
 
-fn item(e: &PageEntry) -> Item {
+/// Each page's path ("A › B": the pages above it, root first), built once
+/// when the switcher opens.
+pub fn paths(tree: &[PageEntry]) -> HashMap<String, String> {
+    tree.iter()
+        .map(|e| {
+            let up: Vec<&str> = crate::sidebar::trail(tree, &e.id)
+                .into_iter()
+                .map(|a| crate::view::untitled(&a.title))
+                .collect();
+            (e.id.clone(), up.join(" › "))
+        })
+        .collect()
+}
+
+fn item(paths: &HashMap<String, String>, e: &PageEntry) -> Item {
     Item {
         id: e.id.clone(),
         icon: e.icon.clone().unwrap_or_else(|| "📄".into()),
         title: e.title.clone(),
+        path: paths.get(&e.id).cloned().unwrap_or_default(),
+        group: None,
     }
 }
 
@@ -64,10 +108,16 @@ impl Switcher {
     pub fn items(&self, tree: &[PageEntry], recent: &[String]) -> Vec<Item> {
         let q = self.query.trim().to_lowercase();
         if q.is_empty() {
+            // the recent order stays; a page can't be newer than the one before
+            // it (a page's edit day stands in for pages not opened this session)
+            let mut day = self.today;
             return recent
                 .iter()
                 .filter_map(|id| tree.iter().find(|e| e.id == *id))
-                .map(item)
+                .map(|e| {
+                    day = day.min(self.days.get(&e.id).copied().unwrap_or(day));
+                    Item { group: Some(group(self.today, day)), ..item(&self.paths, e) }
+                })
                 .collect();
         }
         let mut local: Vec<(bool, String, &PageEntry)> = tree
@@ -82,19 +132,19 @@ impl Switcher {
         let mut out: Vec<Item> = local
             .into_iter()
             .take(MAX_LOCAL)
-            .map(|(_, _, e)| item(e))
+            .map(|(_, _, e)| item(&self.paths, e))
             .collect();
         for (id, title) in &self.results {
             if !out.iter().any(|i| i.id == *id) {
-                let icon = tree
-                    .iter()
-                    .find(|e| e.id == *id)
-                    .and_then(|e| e.icon.clone())
-                    .unwrap_or_else(|| "📄".into());
+                let known = tree.iter().find(|e| e.id == *id);
                 out.push(Item {
                     id: id.clone(),
-                    icon,
+                    icon: known
+                        .and_then(|e| e.icon.clone())
+                        .unwrap_or_else(|| "📄".into()),
                     title: title.clone(),
+                    path: self.paths.get(id).cloned().unwrap_or_default(),
+                    group: None,
                 });
             }
         }
@@ -191,6 +241,73 @@ mod tests {
         let items = sw.items(&tree(), &recent);
         assert_eq!(ids(&items), ["c", "a"], "uncached ids are skipped");
         assert_eq!(items[1].icon, "📄");
+    }
+
+    #[test]
+    fn recency_groups() {
+        let g = |d| group(100, d);
+        assert_eq!(
+            [101, 100, 99, 98, 93, 92, 0].map(g),
+            ["Heute", "Heute", "Gestern", "Vergangene Woche", "Vergangene Woche", "Älter", "Älter"]
+        );
+    }
+
+    #[test]
+    fn empty_query_groups_by_day_in_recent_order_with_paths() {
+        let mut t = tree();
+        t.push(PageEntry { parent: Some("a".into()), ..e("d", "Delta") });
+        t.push(PageEntry { parent: Some("d".into()), ..e("f", "Foxtrot") });
+        let mut sw = Switcher { today: 100, paths: paths(&t), ..Default::default() };
+        sw.days = [("a", 50), ("c", 100), ("d", 99), ("f", 97)]
+            .map(|(k, v)| (k.to_string(), v))
+            .into();
+        let recent: Vec<String> = ["c", "d", "f", "a"].map(String::from).into();
+        let items = sw.items(&t, &recent);
+        assert_eq!(ids(&items), ["c", "d", "f", "a"]);
+        let g: Vec<_> = items.iter().map(|i| i.group).collect();
+        assert_eq!(
+            g,
+            [Some("Heute"), Some("Gestern"), Some("Vergangene Woche"), Some("Älter")]
+        );
+        assert_eq!(items[2].path, "Alpha › Delta");
+        assert_eq!(items[0].path, "");
+        // a day never gets newer down the list
+        let late: Vec<String> = ["a", "c"].map(String::from).into();
+        let g: Vec<_> = sw.items(&t, &late).iter().map(|i| i.group).collect();
+        assert_eq!(g, [Some("Älter"), Some("Älter")]);
+        // a search is not grouped
+        sw.query = "o".into();
+        assert!(sw.items(&t, &recent).iter().all(|i| i.group.is_none()));
+    }
+
+    #[test]
+    fn arrows_walk_the_pages_never_the_headers() {
+        let ctx = Context::default();
+        let mut sw = Switcher { today: 100, ..Default::default() };
+        sw.days = [("a", 100), ("b", 99), ("c", 50)].map(|(k, v)| (k.to_string(), v)).into();
+        let recent: Vec<String> = ["a", "b", "c"].map(String::from).into();
+        let items = sw.items(&tree(), &recent);
+        let press = |sw: &mut Switcher, k| {
+            let ev = eframe::egui::Event::Key {
+                key: k,
+                physical_key: Some(k),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            };
+            let raw = eframe::egui::RawInput { events: vec![ev], ..Default::default() };
+            let mut out = Out::None;
+            ctx.run_ui(raw, |ui| out = sw.keys(ui.ctx(), &items))
+                .drop_without_applying_deltas();
+            out
+        };
+        for want in [1, 2, 0, 1] {
+            press(&mut sw, Key::ArrowDown);
+            assert_eq!(sw.sel, want, "one page per press, 3 headers in between");
+        }
+        press(&mut sw, Key::ArrowUp);
+        assert_eq!(sw.sel, 0);
+        assert_eq!(press(&mut sw, Key::Enter), Out::Pick { id: "a".into(), new_tab: false });
     }
 
     #[test]

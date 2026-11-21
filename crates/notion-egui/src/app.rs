@@ -23,6 +23,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::edit::EditKey;
 use crate::keys::Keymap;
 use crate::links::{self, Link};
+use crate::nav::{Find, History};
 use crate::menu::{self, menu_step, Kind, Menu, Outcome, Pick, Sources};
 use crate::outline::{self, Marker, Row};
 use crate::problems::Problem;
@@ -139,6 +140,8 @@ pub(crate) enum Action {
     ToggleTree(String),
     Switch(usize),
     CloseTab(usize),
+    /// An outline tick: scroll to this row.
+    Goto(usize),
     NewTab,
     /// Opens the Ctrl+K switcher.
     Search,
@@ -222,8 +225,18 @@ pub struct App {
     /// live state.
     pub(crate) tabs: Vec<Tab>,
     pub(crate) active: usize,
+    /// One page history per tab (grown on demand; see [`App::hist`]).
+    pub(crate) hists: Vec<History>,
+    /// Ctrl+F, while the bar is open.
+    pub(crate) find: Option<Find>,
+    /// A row to scroll into view on the next frame, once.
+    pub(crate) goto: Option<usize>,
+    /// The open page's headings (row, level, text), for the outline.
+    pub(crate) heads: Vec<(usize, u8, String)>,
     /// Recently opened pages, most recent first.
     pub(crate) recent: Vec<String>,
+    /// When each page was last opened this session (unix seconds).
+    pub(crate) visited: HashMap<String, i64>,
     pub(crate) window: (f32, f32),
     /// Where session-egui.json is written on exit; None (tests) writes nothing.
     pub(crate) session_dir: Option<PathBuf>,
@@ -400,7 +413,12 @@ impl App {
             pending_scroll: None,
             tabs: vec![Tab::default()],
             active: 0,
+            hists: Vec::new(),
+            find: None,
+            goto: None,
+            heads: Vec::new(),
             recent: Vec::new(),
+            visited: HashMap::new(),
             window: session::Session::default().window,
             session_dir: None,
             sent: VecDeque::new(),
@@ -605,6 +623,8 @@ impl App {
             }
             Action::Switch(i) => self.switch_tab(i),
             Action::CloseTab(i) => self.close_tab(i),
+            Action::Goto(i) if i < self.rows.len() => self.show_row(i),
+            Action::Goto(_) => {}
             Action::NewTab => self.new_tab_with_switcher(),
             Action::Search => self.open_switcher(),
             Action::ToggleProblems => {
@@ -662,16 +682,25 @@ impl App {
                     for idx in 0..self.rows.len() {
                         if self.shown[idx] {
                             // painted behind the row once its height is known
-                            let tint = self.flash.contains_key(&self.rows[idx].block_id);
-                            let bg = tint.then(|| ui.painter().add(egui::Shape::Noop));
+                            let tint = if self.flash.contains_key(&self.rows[idx].block_id) {
+                                Some(0.18)
+                            } else {
+                                self.find.as_ref().and_then(|f| f.tint(idx))
+                            };
+                            let bg = tint.map(|t| (ui.painter().add(egui::Shape::Noop), t));
                             let top = ui.cursor().top();
                             acts.extend(self.row_ui(ui, idx));
-                            if let Some(bg) = bg {
-                                let r = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
-                                ui.painter().set(bg, egui::Shape::rect_filled(r, 3.0, c.accent.gamma_multiply(0.18)));
+                            let r = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
+                            if let Some((bg, t)) = bg {
+                                ui.painter().set(bg, egui::Shape::rect_filled(r, 3.0, c.accent.gamma_multiply(t)));
+                            }
+                            if self.goto == Some(idx) {
+                                self.goto = None;
+                                ui.scroll_to_rect_animation(r, Some(egui::Align::Center), egui::style::ScrollAnimation::none());
                             }
                         }
                     }
+                    self.goto = None;
                     ui.add_space(200.0);
                 });
             });

@@ -84,6 +84,8 @@ pub struct Win {
     down: Vec<(Key, Modifiers)>,
     /// The text the last frame drew, one line per label.
     pub shown: String,
+    /// Texts the app put on the clipboard (all frames so far).
+    pub copied: Vec<String>,
 }
 
 impl Win {
@@ -112,6 +114,7 @@ impl Win {
             opened,
             down: Vec::new(),
             shown: String::new(),
+            copied: Vec::new(),
         };
         w.frames(vec![]);
         w
@@ -168,6 +171,10 @@ impl Win {
             .get(&ViewportId::ROOT)
             .map(|v| v.commands.clone())
             .unwrap_or_default();
+        self.copied.extend(out.platform_output.commands.iter().filter_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        }));
         self.shown = out
             .shapes
             .iter()

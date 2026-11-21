@@ -210,6 +210,14 @@ pub fn local_date_iso(offset_days: i64) -> String {
         .to_string()
 }
 
+/// The local calendar day of unix time `secs`, as a day number (consecutive days differ by 1).
+pub fn local_day(secs: i64) -> i64 {
+    use chrono::Datelike;
+    chrono::DateTime::from_timestamp(secs, 0).map_or(0, |t| {
+        i64::from(t.with_timezone(&chrono::Local).date_naive().num_days_from_ce())
+    })
+}
+
 /// The API's mention JSON for a `kind:target`.
 fn mention_from_target(t: &str) -> Option<Value> {
     let (kind, rest) = t.split_once(':')?;

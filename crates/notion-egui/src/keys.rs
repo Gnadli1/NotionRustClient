@@ -215,6 +215,15 @@ pub enum Command {
     Comments,
     /// Ctrl+/: the "Turn into" menu for the edited row.
     TurnInto,
+    /// Back / forward in the tab's page history.
+    Back,
+    Forward,
+    /// Ctrl+Shift+U: the parent page.
+    Parent,
+    /// Ctrl+F: find in page.
+    Find,
+    /// Ctrl+L: copy the page's Notion URL.
+    CopyLink,
 }
 
 impl Command {
@@ -234,6 +243,11 @@ impl Command {
                 | Command::Undo
                 | Command::Redo
                 | Command::Comments
+                | Command::Back
+                | Command::Forward
+                | Command::Parent
+                | Command::Find
+                | Command::CopyLink
         )
     }
 }
@@ -275,6 +289,11 @@ const NAMES: &[(&str, Command)] = &[
     ("redo", Command::Redo),
     ("comments", Command::Comments),
     ("turn_into", Command::TurnInto),
+    ("back", Command::Back),
+    ("forward", Command::Forward),
+    ("parent", Command::Parent),
+    ("find", Command::Find),
+    ("copy_link", Command::CopyLink),
 ];
 
 /// Notion's Linux keys (Ctrl+Shift+0-9 for block types; 9, "page", has no
@@ -318,6 +337,14 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("ctrl+/", "turn_into"),
     // Ctrl+/ is Ctrl+Shift+7 on those layouts; Ctrl+. works anywhere
     ("ctrl+.", "turn_into"),
+    // Ctrl+[ / Ctrl+] are AltGr chords on German/Austrian layouts: Alt+arrows too
+    ("ctrl+[", "back"),
+    ("ctrl+]", "forward"),
+    ("alt+left", "back"),
+    ("alt+right", "forward"),
+    ("ctrl+shift+u", "parent"),
+    ("ctrl+f", "find"),
+    ("ctrl+l", "copy_link"),
 ];
 
 fn command(name: &str) -> Option<Command> {
@@ -551,6 +578,19 @@ pub fn take_commands(
     out
 }
 
+/// Mouse buttons 4 and 5 (back, forward) pressed in `events`.
+pub fn mouse_nav(events: &[Event]) -> Vec<Command> {
+    use eframe::egui::PointerButton::{Extra1, Extra2};
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::PointerButton { button: Extra1, pressed: true, .. } => Some(Command::Back),
+            Event::PointerButton { button: Extra2, pressed: true, .. } => Some(Command::Forward),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Removes the key presses of `key` with exactly `mods` from `events`:
 /// (fresh presses, repeats). egui's own `consume_key` ignores extra Shift and
 /// Alt, so Shift+Enter would go with Enter.
@@ -771,6 +811,53 @@ mod tests {
         assert_eq!(k.get(&ch("ctrl+z")), Some(Command::Undo));
         assert_eq!(k.get(&ch("ctrl+shift+z")), Some(Command::Redo));
         assert_eq!(k.get(&ch("ctrl+x")), None);
+        for (chord, cmd) in [
+            ("ctrl+[", Command::Back),
+            ("alt+left", Command::Back),
+            ("ctrl+]", Command::Forward),
+            ("alt+right", Command::Forward),
+            ("ctrl+shift+u", Command::Parent),
+            ("ctrl+f", Command::Find),
+            ("ctrl+l", Command::CopyLink),
+        ] {
+            assert_eq!(k.get(&ch(chord)), Some(cmd), "{chord}");
+            assert!(cmd.is_global());
+        }
+    }
+
+    #[test]
+    fn navigation_keys_are_taken_from_the_editor_and_rebindable() {
+        let alt = Modifiers { alt: true, ..Modifiers::NONE };
+        let mut ev = vec![press(Key::ArrowLeft, None, alt), press(Key::F, None, Modifiers::CTRL)];
+        let got = take_commands(&mut ev, false, &Keymap::default(), Command::is_global);
+        assert_eq!(got, [Command::Back, Command::Find]);
+        assert!(ev.is_empty(), "the text edit never sees them");
+        let (k, bad) = Keymap::merge(entries(&[("alt+left", "parent"), ("ctrl+f", "none")]));
+        assert!(bad.is_empty());
+        assert_eq!(k.get(&ch("alt+left")), Some(Command::Parent));
+        assert_eq!(k.get(&ch("ctrl+f")), None);
+    }
+
+    #[test]
+    fn altgr_brackets_and_typed_brackets_are_not_back() {
+        let ctrl_alt = Modifiers { ctrl: true, alt: true, ..Modifiers::NONE };
+        let mut ev = vec![press(Key::OpenBracket, None, ctrl_alt), Event::Text("[".into())];
+        let got = take_commands(&mut ev, true, &Keymap::default(), Command::is_global);
+        assert!(got.is_empty());
+        assert_eq!(ev.len(), 2, "both pass through to the text edit");
+    }
+
+    #[test]
+    fn mouse_buttons_4_and_5_navigate() {
+        use eframe::egui::{PointerButton as B, Pos2};
+        let ev = |button, pressed| Event::PointerButton {
+            pos: Pos2::ZERO,
+            button,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let evs = [ev(B::Extra1, true), ev(B::Extra1, false), ev(B::Extra2, true), ev(B::Primary, true)];
+        assert_eq!(mouse_nav(&evs), [Command::Back, Command::Forward]);
     }
 
     fn entries(v: &[(&str, &str)]) -> Vec<(String, Value)> {
