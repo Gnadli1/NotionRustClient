@@ -10,7 +10,7 @@ use eframe::egui;
 use notion_core::api::Client;
 use notion_core::model::SearchResult;
 use notion_core::store::Store;
-use notion_core::sync::{self, PullReport, PushReport, Skip};
+use notion_core::sync::{self, PullReport, PushReport, Skip, SyncAllReport};
 use notion_core::Error;
 use tokio::sync::mpsc as tmpsc;
 
@@ -33,6 +33,9 @@ pub enum Cmd {
     /// against Notion's version (`sync::resolve_mine`), if its text is still
     /// `seen`, the Notion text the panel showed.
     Resolve { op: i64, merged: Option<String>, seen: Option<String> },
+    /// Pulls every shared page and data source (`sync::pull_all`); answered by
+    /// one `SyncedAll` or `Error`, after any number of `Progress`.
+    SyncAll,
 }
 
 #[derive(Debug, PartialEq)]
@@ -51,6 +54,10 @@ pub enum Event {
     UsersDenied,
     Fetched { op: i64, what: sync::Fetched },
     Resolved(i64),
+    SyncedAll(SyncAllReport),
+    /// (done, total) of a running `SyncAll`. Not an answer: the app must not
+    /// pop `sent` for it.
+    Progress { done: usize, total: usize },
     Error(String),
 }
 
@@ -91,6 +98,11 @@ pub async fn run(
                 sync::resolve_mine(client, store, op, merged.as_deref(), seen.as_deref())
                     .await
                     .map(|_| Event::Resolved(op))
+            }
+            Cmd::SyncAll => {
+                sync::pull_all(client, store, |done, total, _| emit(Event::Progress { done, total }))
+                    .await
+                    .map(Event::SyncedAll)
             }
             Cmd::Search(q) => client.search(&q).await.map(|rs| {
                 Event::SearchResults(
@@ -251,6 +263,48 @@ mod tests {
         assert!(matches!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Event::Error(m) if m.starts_with("offline")));
         drop(tx);
         handle.join().unwrap();
+    }
+
+    /// SyncAll is answered by exactly one event besides its Progress ones, whatever Notion says.
+    #[test]
+    fn sync_all_is_answered_by_exactly_one_event_besides_progress() {
+        use notion_core::api::ClientConfig;
+        let page = r#"{"object":"page","id":"p","parent":{"type":"workspace","workspace":true},"created_time":"2025-01-01T00:00:00.000Z","last_edited_time":"2025-01-01T00:00:00.000Z","in_trash":false,"url":"u","properties":{}}"#;
+        let list = |r: &str| -> &'static str {
+            Box::leak(format!(r#"{{"object":"list","results":[{r}],"has_more":false,"next_cursor":null}}"#).into_boxed_str())
+        };
+        let err = |s: &str| -> &'static str {
+            Box::leak(format!(r#"{{"object":"error","status":{s},"code":"x","message":"m"}}"#).into_boxed_str())
+        };
+        // (status, body, Progress events expected)
+        for (status, body, progress) in [(200, list(""), 0), (200, list(page), 1), (401, err("401"), 0), (500, err("500"), 0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let url = serve(status, body);
+            let (tx, rx, handle) = spawn_with(dir.path().join("cache.db"), egui::Context::default(), move || {
+                Some(Client::new("t".into(), ClientConfig { base_url: url, max_retries: 0, ..Default::default() }))
+            });
+            tx.send(Cmd::SyncAll).unwrap();
+            tx.send(Cmd::Me).unwrap(); // its answer is the next non-progress event
+            drop(tx);
+            handle.join().unwrap();
+            let evs: Vec<Event> = rx.try_iter().collect();
+            let (prog, answers): (Vec<_>, Vec<_>) = evs.iter().partition(|e| matches!(e, Event::Progress { .. }));
+            assert_eq!(prog.len(), progress, "{evs:?}");
+            assert_eq!(answers.len(), 2, "{evs:?}");
+            match (status, answers[0]) {
+                (200, Event::SyncedAll(r)) => assert_eq!(r.errors.len(), progress),
+                (401 | 500, Event::Error(m)) => assert!(m.contains(&status.to_string()), "{m}"),
+                (_, e) => panic!("{e:?}"),
+            }
+        }
+        // no client: the offline error, and nothing else
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx, handle) = spawn_with(dir.path().join("cache.db"), egui::Context::default(), || None);
+        tx.send(Cmd::SyncAll).unwrap();
+        drop(tx);
+        handle.join().unwrap();
+        let evs: Vec<Event> = rx.try_iter().collect();
+        assert!(matches!(&evs[..], [Event::Error(m)] if m.starts_with("offline")), "{evs:?}");
     }
 
     /// Fetch and Resolve are each answered by exactly one event, whatever

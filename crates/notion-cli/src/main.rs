@@ -31,6 +31,8 @@ enum Cmd {
         #[arg(long)]
         full: bool,
     },
+    /// Fetch every page and data source shared with the integration
+    SyncAll,
     /// Print a cached page (offline)
     Cat { page_id: String },
     /// Queue a text edit for a block (offline)
@@ -164,6 +166,27 @@ async fn main() -> anyhow::Result<()> {
                 println!("unchanged (skipped)");
             } else {
                 println!("fetched {}, updated {}", r.fetched, r.updated);
+            }
+        }
+        Cmd::SyncAll => {
+            let client = Client::from_env()?;
+            let store = open_store(cli.db)?;
+            let r = sync::pull_all(&client, &store, |done, total, title| {
+                println!("[{done}/{total}] {title}")
+            })
+            .await?;
+            println!(
+                "{} pages, {} data sources, {} up to date, {} errors",
+                r.pages,
+                r.data_sources,
+                r.skipped,
+                r.errors.len()
+            );
+            for e in &r.errors {
+                eprintln!("error: {e}");
+            }
+            if !r.errors.is_empty() {
+                std::process::exit(1);
             }
         }
         Cmd::Cat { page_id } => {

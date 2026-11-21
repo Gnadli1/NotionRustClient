@@ -122,6 +122,7 @@ impl Switcher {
         }
         let mut local: Vec<(bool, String, &PageEntry)> = tree
             .iter()
+            .filter(|e| !e.database)
             .filter_map(|e| {
                 let t = e.title.to_lowercase();
                 t.contains(&q).then(|| (!t.starts_with(&q), t, e))
@@ -223,6 +224,7 @@ mod tests {
             title: title.into(),
             parent: None,
             icon: (id == "b").then(|| "🚀".into()),
+            database: id == "db",
         }
     }
 
@@ -241,6 +243,14 @@ mod tests {
         let items = sw.items(&tree(), &recent);
         assert_eq!(ids(&items), ["c", "a"], "uncached ids are skipped");
         assert_eq!(items[1].icon, "📄");
+    }
+
+    #[test]
+    fn databases_are_not_listed_as_pages() {
+        let mut t = tree();
+        t.push(e("db", "Kit grades"));
+        let sw = Switcher { query: "kit".into(), ..Default::default() };
+        assert!(!ids(&sw.items(&t, &[])).contains(&"db"));
     }
 
     #[test]

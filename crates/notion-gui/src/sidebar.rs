@@ -125,6 +125,7 @@ mod tests {
             title: title.into(),
             parent: parent.map(Into::into),
             icon: None,
+            database: false,
         }
     }
 
@@ -174,6 +175,24 @@ mod tests {
         assert_eq!(shown(&es, &["a", "a1"])[2], row("a11", 2, false, false));
         assert_eq!(ancestors(&es, "a11"), ["a1", "a"]);
         assert!(ancestors(&es, "a").is_empty());
+    }
+
+    #[test]
+    fn rows_nest_under_their_database() {
+        let db = PageEntry { database: true, ..e("db", "Grades", None) };
+        let es = [e("r2", "b row", Some("db")), db, e("r1", "A row", Some("db")), e("p", "Page", None)];
+        // collapsed: the database is a top-level entry with rows hidden
+        assert_eq!(shown(&es, &[]), [row("db", 0, true, false), row("p", 0, false, false)]);
+        assert_eq!(
+            shown(&es, &["db"]),
+            [
+                row("db", 0, true, true),
+                row("r1", 1, false, false),
+                row("r2", 1, false, false),
+                row("p", 0, false, false)
+            ]
+        );
+        assert!(rows(&es, &Default::default())[0].entry.database);
     }
 
     #[test]

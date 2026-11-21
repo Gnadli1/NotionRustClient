@@ -936,6 +936,10 @@ pub fn update(s: &mut State, msg: Message) -> Task<Message> {
         Message::CloseTab(_) => {}
         Message::SwitchTab(i) => return s.switch_tab(i),
         Message::SidebarOpen(id) => {
+            if s.tree.iter().any(|e| e.database && e.id == id) {
+                s.last_error = Some("databases not supported yet".into());
+                return Task::none();
+            }
             let cached = matches!(s.store.get_page(&id), Ok(Some(_)));
             return update(
                 s,
@@ -3107,6 +3111,13 @@ mod tests {
         assert_eq!(s.current.as_deref(), Some("kid"));
         assert!(rx.try_recv().is_err(), "cached: no network");
         assert_eq!(visible(&s), ["par", "kid"], "ancestors only");
+
+        // a database entry: an error, no pull
+        let db = notion_core::store::PageEntry { id: "db".into(), database: true, ..s.tree[0].clone() };
+        s.tree.push(db);
+        up(&mut s, Message::SidebarOpen("db".into()));
+        assert_eq!(s.last_error.as_deref(), Some("databases not supported yet"));
+        assert!(rx.try_recv().is_err());
 
         up(&mut s, Message::SidebarOpen("unc".into()));
         assert_eq!(

@@ -11,7 +11,7 @@ use crate::api::{BlockNode, Client};
 use crate::markdown::{from_markdown, is_markdown_editable, split_runs, to_markdown};
 use crate::model::{
     plain_text, users_in, Block, BlockKind, Comment, Page, Parent, PropertyValue, RichText,
-    TargetKind, TextBlock, User,
+    SearchResult, TargetKind, TextBlock, User,
 };
 use crate::ops::{CommentTarget, Op, OpKind, OpStatus};
 use crate::store::{ts, Store};
@@ -70,6 +70,15 @@ pub fn poll_settle() -> Skip {
     Skip::IfUnchangedAndOlder(chrono::Duration::minutes(2))
 }
 
+/// The cache holds `page` at this edit time, with blocks. (A row cached by
+/// `pull_data_source` has none yet: its blocks still need fetching.)
+fn is_current(store: &Store, page: &Page) -> Result<bool> {
+    Ok(match store.get_page(&page.id)? {
+        Some(c) => c.last_edited_time == page.last_edited_time && !store.children(&page.id)?.is_empty(),
+        None => false,
+    })
+}
+
 pub async fn pull_page(
     client: &Client,
     store: &Store,
@@ -87,23 +96,26 @@ pub async fn pull_page_skip(
     skip: Skip,
 ) -> Result<PullReport> {
     let page = client.get_page(page_id).await?;
+    pull_loaded(client, store, page, skip).await
+}
+
+/// [`pull_page_skip`] for a page already fetched, e.g. by a search.
+pub async fn pull_loaded(
+    client: &Client,
+    store: &Store,
+    page: Page,
+    skip: Skip,
+) -> Result<PullReport> {
     let settled = match skip {
         Skip::Never => false,
         Skip::IfUnchanged => true,
         Skip::IfUnchangedAndOlder(age) => Utc::now() - page.last_edited_time >= age,
     };
-    if settled {
-        if let Some(cached) = store.get_page(&page.id)? {
-            // a row cached by pull_data_source has no blocks yet: fetch them
-            if cached.last_edited_time == page.last_edited_time
-                && !store.children(&page.id)?.is_empty()
-            {
-                return Ok(PullReport {
-                    skipped: true,
-                    ..Default::default()
-                });
-            }
-        }
+    if settled && is_current(store, &page)? {
+        return Ok(PullReport {
+            skipped: true,
+            ..Default::default()
+        });
     }
     let tree = client.block_tree(&page.id).await?;
 
@@ -295,11 +307,63 @@ pub async fn pull_data_source(client: &Client, store: &Store, ds_id: &str) -> Re
     store.put_users(&dedupe_users(found))?;
     for mut row in rows {
         let cached = store.get_page(&row.id)?;
-        if cached.map(|c| c.last_edited_time) != Some(row.last_edited_time) {
+        if cached.as_ref().map(|c| c.last_edited_time) != Some(row.last_edited_time) {
             keep_queued_props(store, &mut row)?;
+            // cached blocks are stale now: keep the old time, so the next page
+            // pull refetches them instead of skipping the row as unchanged
+            if let Some(c) = cached.filter(|_| !store.children(&row.id).is_ok_and(|b| b.is_empty())) {
+                row.last_edited_time = c.last_edited_time;
+            }
             store.upsert_page(&row)?;
             report.updated += 1;
         }
+    }
+    Ok(report)
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct SyncAllReport {
+    /// Pages fetched (new or changed).
+    pub pages: usize,
+    pub data_sources: usize,
+    /// Pages already up to date (edit time unchanged and at least 2 minutes old).
+    pub skipped: usize,
+    /// One "title: message" per page or data source that failed.
+    pub errors: Vec<String>,
+}
+
+/// Pulls every page and data source shared with the integration (`search("")`).
+/// `progress(done, total, title)` runs after each item. A failing item is
+/// recorded and skipped; a bad token or no connection aborts with the error.
+pub async fn pull_all(
+    client: &Client,
+    store: &Store,
+    mut progress: impl FnMut(usize, usize, &str),
+) -> Result<SyncAllReport> {
+    let mut found = client.search("").await?;
+    // data sources last: a row cached by `pull_data_source` first would hide its changes
+    found.sort_by_key(|r| matches!(r, SearchResult::DataSource(_)));
+    let total = found.len();
+    let mut report = SyncAllReport::default();
+    for (i, item) in found.into_iter().enumerate() {
+        let (title, res) = match item {
+            SearchResult::Page(p) => {
+                let title = p.title();
+                (title, pull_loaded(client, store, p, poll_settle()).await.map(|r| (r.skipped, false)))
+            }
+            SearchResult::DataSource(d) => {
+                (d.title.clone(), pull_data_source(client, store, &d.id).await.map(|_| (false, true)))
+            }
+        };
+        match res {
+            Ok((true, _)) => report.skipped += 1,
+            Ok((false, false)) => report.pages += 1,
+            Ok((false, true)) => report.data_sources += 1,
+            Err(e @ Error::Api { status: 401, .. }) => return Err(e),
+            Err(Error::Http(e)) if e.is_connect() || e.is_timeout() => return Err(Error::Http(e)),
+            Err(e) => report.errors.push(format!("{title}: {e}")),
+        }
+        progress(i + 1, total, &title);
     }
     Ok(report)
 }
@@ -3002,6 +3066,140 @@ mod tests {
                 skipped: false
             }
         );
+    }
+
+    /// Mounts a workspace of pages p1, p2 and data source ds (rows r1, r2);
+    /// `p2_status` is what p2's blocks answer.
+    async fn workspace(s: &MockServer, p2_status: u16) {
+        let ds = json!({ "object": "data_source", "id": "ds", "title": [], "last_edited_time": T,
+            "parent": { "type": "database_id", "database_id": "db" }, "properties": {} });
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .respond_with(list(vec![titled("p1", T, "One"), titled("p2", T, "Two"), ds.clone()]))
+            .mount(s)
+            .await;
+        get(s, "/v1/data_sources/ds", ok(ds)).await;
+        let row = |id: &str| {
+            page(id, json!({ "type": "data_source_id", "data_source_id": "ds", "database_id": "db" }), T)
+        };
+        Mock::given(method("POST"))
+            .and(path("/v1/data_sources/ds/query"))
+            .respond_with(list(vec![row("r1"), row("r2")]))
+            .mount(s)
+            .await;
+        for id in ["p1", "p2"] {
+            get(s, &format!("/v1/pages/{id}"), ok(titled(id, T, id))).await;
+            let r = if id == "p2" && p2_status != 200 {
+                ResponseTemplate::new(p2_status).set_body_json(json!({ "object": "error", "status": p2_status, "code": "x", "message": "boom" }))
+            } else {
+                list(vec![blk(&format!("{id}b"), pp(id), "x", T, false)])
+            };
+            get(s, &format!("/v1/blocks/{id}/children"), r).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_all_counts_skips_and_survives_an_error() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let c = client(&s);
+        workspace(&s, 500).await;
+        let mut seen = Vec::new();
+        let r = pull_all(&c, &store, |d, t, title| seen.push((d, t, title.to_string()))).await.unwrap();
+        assert_eq!((r.pages, r.data_sources, r.skipped, r.errors.len()), (1, 1, 0, 1), "{r:?}");
+        assert!(r.errors[0].starts_with("Two: ") && r.errors[0].contains("boom"));
+        assert_eq!(seen.iter().map(|(d, t, _)| (*d, *t)).collect::<Vec<_>>(), [(1, 3), (2, 3), (3, 3)]);
+        assert_eq!(seen[0].2, "One");
+        assert_eq!(store.rows("ds").unwrap().len(), 2);
+        assert!(store.page_tree().unwrap().iter().any(|e| e.id == "ds" && e.database));
+
+        // p2 heals; p1 is skipped without a request (its blocks are gone)
+        s.reset().await;
+        Mock::given(method("POST")).and(path("/v1/search"))
+            .respond_with(list(vec![titled("p1", T, "One"), titled("p2", T, "Two")]))
+            .mount(&s).await;
+        get(&s, "/v1/blocks/p2/children", list(vec![blk("p2b", pp("p2"), "x", T, false)])).await;
+        let r = pull_all(&c, &store, |_, _, _| {}).await.unwrap();
+        assert_eq!(r, SyncAllReport { pages: 1, skipped: 1, ..Default::default() });
+        // and a third run touches nothing but the search
+        s.reset().await;
+        Mock::given(method("POST")).and(path("/v1/search"))
+            .respond_with(list(vec![titled("p1", T, "One"), titled("p2", T, "Two")]))
+            .mount(&s).await;
+        let r = pull_all(&c, &store, |_, _, _| {}).await.unwrap();
+        assert_eq!(r, SyncAllReport { skipped: 2, ..Default::default() });
+    }
+
+    /// Notion's times have minute precision: an unchanged but recent time may hide an edit.
+    #[tokio::test]
+    async fn pull_all_refetches_pages_edited_in_the_last_minutes() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let recent = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        Mock::given(method("POST")).and(path("/v1/search"))
+            .respond_with(list(vec![titled("p1", &recent, "One")]))
+            .mount(&s).await;
+        get(&s, "/v1/blocks/p1/children", list(vec![blk("a", pp("p1"), "old", &recent, false)])).await;
+        let c = client(&s);
+        let r = pull_all(&c, &store, |_, _, _| {}).await.unwrap();
+        assert_eq!((r.pages, r.skipped), (1, 0));
+        s.reset().await;
+        Mock::given(method("POST")).and(path("/v1/search"))
+            .respond_with(list(vec![titled("p1", &recent, "One")]))
+            .mount(&s).await;
+        get(&s, "/v1/blocks/p1/children", list(vec![blk("a", pp("p1"), "new", &recent, false)])).await;
+        let r = pull_all(&c, &store, |_, _, _| {}).await.unwrap();
+        assert_eq!((r.pages, r.skipped), (1, 0), "same recent time: pulled again");
+        assert_eq!(text(&store, "a"), "new");
+    }
+
+    /// A data source listed before its row, and the row changed since it was cached.
+    #[tokio::test]
+    async fn pull_all_updates_the_blocks_of_a_changed_row() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let c = client(&s);
+        let dsp = json!({ "type": "data_source_id", "data_source_id": "ds", "database_id": "db" });
+        let ds = json!({ "object": "data_source", "id": "ds", "title": [], "last_edited_time": T,
+            "parent": { "type": "database_id", "database_id": "db" }, "properties": {} });
+        // the row, cached at T with an old body
+        get(&s, "/v1/pages/r", ok(page("r", dsp.clone(), T))).await;
+        get(&s, "/v1/blocks/r/children", list(vec![blk("rb", pp("r"), "old", T, false)])).await;
+        pull_page(&c, &store, "r", true).await.unwrap();
+        s.reset().await;
+        // now changed: the data source comes first in the search
+        let row = page("r", dsp, T2);
+        Mock::given(method("POST")).and(path("/v1/search"))
+            .respond_with(list(vec![ds.clone(), row.clone()])).mount(&s).await;
+        get(&s, "/v1/data_sources/ds", ok(ds)).await;
+        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query"))
+            .respond_with(list(vec![row])).mount(&s).await;
+        get(&s, "/v1/blocks/r/children", list(vec![blk("rb", pp("r"), "new", T2, false)])).await;
+        let r = pull_all(&c, &store, |_, _, _| {}).await.unwrap();
+        assert_eq!((r.pages, r.data_sources, r.errors.len()), (1, 1, 0), "{r:?}");
+        assert_eq!(text(&store, "rb"), "new");
+        // and a row only the data source reports keeps its old time until its blocks are pulled
+        s.reset().await;
+        let row3 = page("r", json!({ "type": "data_source_id", "data_source_id": "ds", "database_id": "db" }), "2025-01-03T00:00:00.000Z");
+        get(&s, "/v1/data_sources/ds", ok(json!({ "object": "data_source", "id": "ds", "title": [], "last_edited_time": T,
+            "parent": { "type": "database_id", "database_id": "db" }, "properties": {} }))).await;
+        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query"))
+            .respond_with(list(vec![row3])).mount(&s).await;
+        pull_data_source(&c, &store, "ds").await.unwrap();
+        assert_eq!(store.get_page("r").unwrap().unwrap().last_edited_time.to_rfc3339(), "2025-01-02T00:00:00+00:00");
+    }
+
+    #[tokio::test]
+    async fn pull_all_aborts_on_a_bad_token() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        // mounted first, so it wins over the workspace's p1
+        get(&s, "/v1/blocks/p1/children", ResponseTemplate::new(401).set_body_json(
+            json!({ "object": "error", "status": 401, "code": "unauthorized", "message": "bad token" }))).await;
+        workspace(&s, 200).await;
+        let e = pull_all(&client(&s), &store, |_, _, _| {}).await.unwrap_err();
+        assert!(matches!(e, Error::Api { status: 401, .. }), "{e:?}");
+        assert!(store.get_page("p2").unwrap().is_none(), "stopped at p1");
     }
 
     #[tokio::test]

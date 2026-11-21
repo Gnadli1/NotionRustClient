@@ -186,6 +186,7 @@ fn page_entries(q: &str, src: Sources) -> Vec<Entry> {
     let mut hits: Vec<(u8, usize, String, &PageEntry)> = src
         .tree
         .iter()
+        .filter(|e| !e.database)
         .filter_map(|e| {
             let recent = src.recent.iter().position(|r| *r == e.id).unwrap_or(usize::MAX);
             Some((rank(&fq, &e.title)?, recent, slash::fold(&e.title), e))
@@ -325,6 +326,7 @@ mod tests {
             title: title.into(),
             parent: None,
             icon: None,
+            database: false,
         }
     }
 

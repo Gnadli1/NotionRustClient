@@ -55,6 +55,8 @@ pub struct PageEntry {
     pub parent: Option<String>,
     /// The emoji icon, if the page has one.
     pub icon: Option<String>,
+    /// A cached data source (a database), whose rows are its children; not a page.
+    pub database: bool,
 }
 
 /// Rows of `id` and every block below it (recursive on parent_id).
@@ -117,18 +119,28 @@ impl Store {
         self.get("SELECT raw FROM pages WHERE id = ?1", id)
     }
 
-    /// Every non-trashed cached page except database rows, plus the pages only known from a cached
-    /// `child_page` block, with their parent page resolved (unordered).
+    /// Every non-trashed cached page, the cached data sources (`database`; under
+    /// their parent page, or the page of their parent block), and the pages only known from a cached
+    /// `child_page` block, with their parent page resolved (unordered). A row's
+    /// parent is its data source; rows of an uncached one are left out.
     pub fn page_tree(&self) -> Result<Vec<PageEntry>> {
         let mut st = self.conn.prepare(
             "SELECT p.id, p.title,
-               CASE p.parent_type WHEN 'page_id' THEN p.parent_id WHEN 'block_id' THEN b.page_id END,
+               CASE p.parent_type WHEN 'page_id' THEN p.parent_id WHEN 'data_source_id' THEN p.parent_id
+                 WHEN 'block_id' THEN b.page_id END,
                CASE WHEN json_extract(p.raw, '$.icon.type') = 'emoji'
-                 THEN json_extract(p.raw, '$.icon.emoji') END
+                 THEN json_extract(p.raw, '$.icon.emoji') END, 0
              FROM pages p LEFT JOIN blocks b ON p.parent_type = 'block_id' AND b.id = p.parent_id
-             WHERE p.in_trash = 0 AND p.parent_type <> 'data_source_id'
+             WHERE p.in_trash = 0
+               AND (p.parent_type <> 'data_source_id' OR p.parent_id IN (SELECT id FROM data_sources))
              UNION ALL
-             SELECT id, COALESCE(json_extract(raw, '$.child_page.title'), ''), page_id, NULL
+             SELECT d.id, d.title,
+               CASE json_extract(d.raw, '$.database_parent.type')
+                 WHEN 'page_id' THEN json_extract(d.raw, '$.database_parent.page_id')
+                 WHEN 'block_id' THEN b.page_id END, NULL, 1
+             FROM data_sources d LEFT JOIN blocks b ON b.id = json_extract(d.raw, '$.database_parent.block_id')
+             UNION ALL
+             SELECT id, COALESCE(json_extract(raw, '$.child_page.title'), ''), page_id, NULL, 0
              FROM blocks WHERE type = 'child_page' AND id NOT IN (SELECT id FROM pages)",
         )?;
         let rows = st.query_map([], |r| {
@@ -137,6 +149,7 @@ impl Store {
                 title: r.get(1)?,
                 parent: r.get(2)?,
                 icon: r.get(3)?,
+                database: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -886,8 +899,24 @@ mod tests {
         let mut gone = page("gone", pp("top"), "Gone");
         gone.in_trash = true;
         s.upsert_page(&gone).unwrap();
-        let ds = json!({ "type": "data_source_id", "data_source_id": "ds", "database_id": "db" });
-        s.upsert_page(&page("row", ds, "Row")).unwrap();
+        // a row of an uncached data source stays hidden; one of a cached source nests under it
+        let ds = |id: &str| json!({ "type": "data_source_id", "data_source_id": id, "database_id": "db" });
+        s.upsert_page(&page("row", ds("ds0"), "Row")).unwrap();
+        s.upsert_page(&page("row2", ds("ds"), "Row 2")).unwrap();
+        let src: crate::model::DataSource = serde_json::from_value(json!({
+            "object": "data_source", "id": "ds", "title": [{ "type": "text", "text": { "content": "Grades" },
+                "plain_text": "Grades", "annotations": {} }],
+            "parent": { "type": "database_id", "database_id": "db" },
+            "database_parent": pp("top"), "last_edited_time": T, "properties": {},
+        }))
+        .unwrap();
+        s.upsert_data_source(&src).unwrap();
+        // a database inside the column block of "top": nests under "top" like "incol"
+        let mut in_col = src.clone();
+        in_col.id = "ds2".into();
+        in_col.raw["id"] = json!("ds2");
+        in_col.raw["database_parent"] = bp("col");
+        s.upsert_data_source(&in_col).unwrap();
         // child_page blocks: one uncached, one for the cached "sub", one for trashed "gone"
         let cp = |id: &str, title: &str| -> Block {
             serde_json::from_value(json!({
@@ -916,13 +945,17 @@ mod tests {
             title: title.into(),
             parent: parent.map(Into::into),
             icon: icon.map(Into::into),
+            database: id.starts_with("ds") && id != "ds0",
         };
         assert_eq!(
             got,
             [
+                e("ds", "Grades", Some("top"), None),
+                e("ds2", "Grades", Some("top"), None),
                 e("ext", "Ext", None, None),
                 e("incol", "In column", Some("top"), None),
                 e("lost", "Lost", None, None),
+                e("row2", "Row 2", Some("ds"), None),
                 e("sub", "Sub", Some("top"), None),
                 e("top", "Top", None, Some("🚀")),
                 e("unc", "Uncached", Some("top"), None),

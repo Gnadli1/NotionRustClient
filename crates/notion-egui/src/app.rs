@@ -145,6 +145,8 @@ pub(crate) enum Action {
     NewTab,
     /// Opens the Ctrl+K switcher.
     Search,
+    /// The sidebar's "Sync everything".
+    SyncAll,
     ToggleProblems,
     OpenProblem(i64),
     /// Keep theirs: the old Discard.
@@ -243,6 +245,8 @@ pub struct App {
     /// One entry per command sent and not yet answered (the worker answers
     /// each with one event, in order).
     pub(crate) sent: VecDeque<Cmd>,
+    /// (done, total) of the sync-all in flight; total 0 until the first report.
+    pub(crate) progress: Option<(usize, usize)>,
     /// Page waiting for its pull, to be opened when it arrives.
     pub(crate) pending_open: Option<String>,
     pub(crate) last_error: Option<String>,
@@ -422,6 +426,7 @@ impl App {
             window: session::Session::default().window,
             session_dir: None,
             sent: VecDeque::new(),
+            progress: None,
             pending_open: None,
             last_error: None,
             info: None,
@@ -627,6 +632,7 @@ impl App {
             Action::Goto(_) => {}
             Action::NewTab => self.new_tab_with_switcher(),
             Action::Search => self.open_switcher(),
+            Action::SyncAll => self.sync_all(),
             Action::ToggleProblems => {
                 self.problems_open = !self.problems_open && !self.problems.is_empty();
                 self.problem_sel = 0;

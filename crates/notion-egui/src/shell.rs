@@ -372,6 +372,27 @@ impl App {
         }
     }
 
+    /// Pulls every shared page and data source. The editor's text is written
+    /// first (a pull keeps blocks with queued edits); you can read meanwhile.
+    pub(crate) fn sync_all(&mut self) {
+        if self.sent.contains(&Cmd::SyncAll) {
+            return;
+        }
+        self.flush();
+        self.progress = Some((0, 0));
+        self.send(Cmd::SyncAll);
+    }
+
+    /// The status bar's "pushing…" / "syncing 12/164…" while a command is in flight.
+    pub(crate) fn busy_label(&self) -> Option<String> {
+        match (self.pushing(), self.sent.is_empty(), self.progress) {
+            (true, ..) => Some("pushing…".into()),
+            (false, false, Some((done, total @ 1..))) => Some(format!("syncing {done}/{total}…")),
+            (false, false, _) => Some("syncing…".into()),
+            (false, true, _) => None,
+        }
+    }
+
     fn drain_events(&mut self) {
         loop {
             match self.events.try_recv() {
@@ -381,6 +402,7 @@ impl App {
                     if !self.worker_gone {
                         self.worker_gone = true;
                         self.sent.clear();
+                        self.progress = None;
                         self.last_error.get_or_insert("sync worker stopped".into());
                     }
                     break;
@@ -391,6 +413,11 @@ impl App {
 
     /// The worker answers each command with one event, in order.
     pub(crate) fn on_event(&mut self, ev: Event) {
+        // not an answer: `sent` keeps its command
+        if let Event::Progress { done, total } = ev {
+            self.progress = Some((done, total));
+            return;
+        }
         // pushed ops can't be undone, nor edits a pull rewrote under them; a
         // poll clears only what it changed (see `on_poll`)
         let pulled = matches!(&ev, Event::Pulled { report, .. } if !report.skipped);
@@ -444,6 +471,21 @@ impl App {
                 }
             }
             Event::CommentsPulled | Event::UsersPulled => self.refresh(),
+            Event::SyncedAll(r) => {
+                self.progress = None;
+                // pages were rewritten under the undo steps
+                if r.pages + r.data_sources > 0 {
+                    self.undo.clear();
+                    self.redo.clear();
+                }
+                self.last_error = r.errors.first().map(|e| format!("{} failed, first: {e}", r.errors.len()));
+                self.info = Some(format!(
+                    "synced: {} pages, {} databases, {} up to date",
+                    r.pages, r.data_sources, r.skipped
+                ));
+                self.refresh();
+            }
+            Event::Progress { .. } => {}
             Event::Me(id) => self.me = Some(id),
             Event::UsersDenied => {
                 // said once: users_stop keeps every later trigger quiet
@@ -481,8 +523,11 @@ impl App {
                 }
             }
             Event::Error(e) => {
+                if answered == Some(Cmd::SyncAll) {
+                    self.progress = None;
+                }
                 // a failed comment fetch says nothing about the page being opened
-                if !matches!(answered, Some(Cmd::PullComments { .. } | Cmd::Me | Cmd::Fetch { .. } | Cmd::Resolve { .. })) {
+                if !matches!(answered, Some(Cmd::PullComments { .. } | Cmd::Me | Cmd::Fetch { .. } | Cmd::Resolve { .. } | Cmd::SyncAll)) {
                     self.pending_open = None;
                 }
                 match (&answered, &mut self.conflict) {
@@ -646,6 +691,10 @@ impl App {
     /// Shows a cached page, or pulls an uncached one and opens it on arrival.
     pub(crate) fn open_or_pull(&mut self, id: &str) {
         if !self.commit() {
+            return;
+        }
+        if self.tree.iter().any(|e| e.database && e.id == id) {
+            self.info = Some("databases open in F4".into());
             return;
         }
         if self.cached(id) {
@@ -1022,6 +1071,7 @@ impl App {
             Command::ForcePull => self.pull(true),
             Command::Pull => self.pull(false),
             Command::Push => self.push(),
+            Command::SyncAll => self.sync_all(),
             Command::Search if self.switcher.is_some() => self.switcher = None,
             Command::Search => self.open_switcher(),
             Command::NewTab => self.new_tab_with_switcher(),
@@ -1179,11 +1229,7 @@ impl App {
         );
         let status = view::status::Status {
             counts: self.counts,
-            busy: match (self.pushing(), self.sent.is_empty()) {
-                (true, _) => Some("pushing…"),
-                (false, false) => Some("syncing…"),
-                (false, true) => None,
-            },
+            busy: self.busy_label(),
             error: self.last_error.as_deref().or(self.users_note.as_deref()),
             info: self.info.as_deref(),
             problems_open: self.problems_open,
@@ -2467,6 +2513,55 @@ mod tests {
         assert!(w.app.users_at.is_some());
         w.frames(vec![]);
         assert!(w.cmds().is_empty());
+    }
+
+    #[test]
+    fn sync_all_is_one_command_with_progress_and_refreshes_the_sidebar_when_done() {
+        let mut w = Win::with_texts(&["a"]);
+        assert_eq!(w.app.busy_label(), None);
+        w.press(Key::Y, Modifiers::CTRL | Modifiers::SHIFT);
+        assert_eq!(w.cmds(), [Cmd::SyncAll]);
+        assert_eq!(w.app.busy_label().as_deref(), Some("syncing…"));
+        w.app.apply(Action::SyncAll);
+        assert!(w.cmds().is_empty(), "one at a time");
+        // progress is not an answer
+        w.answer(Event::Progress { done: 12, total: 164 });
+        assert_eq!(w.app.sent.len(), 1);
+        assert_eq!(w.app.busy_label().as_deref(), Some("syncing 12/164…"));
+        // polls wait behind it, but pages stay readable
+        w.app.apply(Action::Open("p".into()));
+        assert_eq!(w.app.current.as_deref(), Some("p"));
+        w.frames(vec![]);
+        assert!(w.cmds().is_empty());
+        // the worker cached a page and a database with a row
+        crate::testkit::add_page(&w.app.store, "q", None, &[]);
+        let ds: notion_core::model::DataSource = serde_json::from_value(serde_json::json!({
+            "object": "data_source", "id": "ds", "title": [], "parent": { "type": "database_id", "database_id": "db" },
+            "last_edited_time": "2025-01-01T00:00:00.000Z", "properties": {},
+        }))
+        .unwrap();
+        w.app.store.upsert_data_source(&ds).unwrap();
+        let row = crate::testkit::page("r", serde_json::json!({ "type": "data_source_id", "data_source_id": "ds", "database_id": "db" }));
+        w.app.store.upsert_page(&row).unwrap();
+        assert!(w.app.tree.iter().all(|e| e.id != "q"));
+        w.answer(Event::SyncedAll(Default::default()));
+        assert!(w.app.sent.is_empty() && w.app.progress.is_none());
+        assert_eq!(w.app.busy_label(), None);
+        assert!(w.app.info.as_deref().unwrap().starts_with("synced"));
+        let at = |id: &str| w.app.tree.iter().find(|e| e.id == id).cloned();
+        assert!(at("q").is_some());
+        assert!(at("ds").unwrap().database);
+        assert_eq!(at("r").unwrap().parent.as_deref(), Some("ds"));
+        // a failed run clears the progress too, and says why
+        w.press(Key::Y, Modifiers::CTRL | Modifiers::SHIFT);
+        w.answer(Event::Progress { done: 1, total: 5 });
+        w.answer(Event::Error("notion 401 unauthorized: bad".into()));
+        assert!(w.app.sent.is_empty() && w.app.progress.is_none());
+        assert!(w.app.last_error.as_deref().unwrap().contains("401"));
+        // a database has no view yet
+        w.app.apply(Action::Open("ds".into()));
+        assert_eq!(w.app.current.as_deref(), Some("p"));
+        assert!(w.cmds().iter().all(|c| *c != Cmd::Pull { id: "ds".into(), force: false }));
     }
 
     #[test]

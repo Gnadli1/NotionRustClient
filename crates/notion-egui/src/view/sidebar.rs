@@ -32,6 +32,13 @@ pub fn show(
     if search.clicked() {
         act = Some(Action::Search);
     }
+    let sync = super::item(ui, c, false, 30.0, |ui| {
+        ui.label("⟳");
+        ui.label("Sync everything");
+    });
+    if sync.clicked() {
+        act = Some(Action::SyncAll);
+    }
     ui.add_space(6.0);
     ui.label(RichText::new("  Pages").small().color(c.secondary));
     let list = rows(tree, open);
@@ -76,7 +83,7 @@ fn tree_row(ui: &mut Ui, c: &Colors, r: &TreeRow, current: Option<&str>) -> Opti
             act = Some(Action::ToggleTree(r.entry.id.clone()));
         }
     }
-    let icon = r.entry.icon.as_deref().unwrap_or("📄");
+    let icon = r.entry.icon.as_deref().unwrap_or(if r.entry.database { "🗄" } else { "📄" });
     let title = super::untitled(&r.entry.title).replace('\n', " ");
     let clip = Rect::from_min_max(rect.min, egui::pos2(rect.right() - 4.0, rect.max.y));
     ui.painter().with_clip_rect(clip).text(
@@ -87,7 +94,12 @@ fn tree_row(ui: &mut Ui, c: &Colors, r: &TreeRow, current: Option<&str>) -> Opti
         c.text,
     );
     if act.is_none() && resp.clicked() {
-        act = Some(Action::Open(r.entry.id.clone()));
+        // a database has no view until F4: the click expands it instead
+        act = Some(if r.entry.database {
+            Action::ToggleTree(r.entry.id.clone())
+        } else {
+            Action::Open(r.entry.id.clone())
+        });
     }
     act
 }

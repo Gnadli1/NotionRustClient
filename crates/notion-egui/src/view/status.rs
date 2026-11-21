@@ -13,7 +13,7 @@ pub struct Status<'a> {
     /// queued, conflict, failed
     pub counts: [usize; 3],
     /// "pushing…" / "syncing…" while a command is in flight.
-    pub busy: Option<&'static str>,
+    pub busy: Option<String>,
     pub error: Option<&'a str>,
     pub info: Option<&'a str>,
     pub problems_open: bool,
@@ -37,7 +37,7 @@ pub fn show(ui: &mut Ui, c: &Colors, s: &Status) -> Option<Action> {
         } else {
             ui.label(RichText::new(counts).size(12.0).color(c.secondary));
         }
-        if let Some(b) = s.busy {
+        if let Some(b) = &s.busy {
             ui.add(egui::Spinner::new().size(12.0));
             ui.label(RichText::new(b).size(12.0).color(c.secondary));
         }

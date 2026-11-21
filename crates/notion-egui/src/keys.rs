@@ -199,6 +199,8 @@ pub enum Command {
     Push,
     Pull,
     ForcePull,
+    /// Pulls every shared page and data source.
+    SyncAll,
     Search,
     ToggleSidebar,
     Indent,
@@ -234,6 +236,7 @@ impl Command {
             Command::Push
                 | Command::Pull
                 | Command::ForcePull
+                | Command::SyncAll
                 | Command::Search
                 | Command::ToggleSidebar
                 | Command::NewTab
@@ -275,6 +278,7 @@ const NAMES: &[(&str, Command)] = &[
     ("push", Command::Push),
     ("pull", Command::Pull),
     ("force_pull", Command::ForcePull),
+    ("sync_all", Command::SyncAll),
     ("search", Command::Search),
     ("toggle_sidebar", Command::ToggleSidebar),
     ("indent", Command::Indent),
@@ -318,6 +322,7 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("ctrl+s", "push"),
     ("ctrl+r", "pull"),
     ("ctrl+shift+r", "force_pull"),
+    ("ctrl+shift+y", "sync_all"),
     ("ctrl+k", "search"),
     ("ctrl+\\", "toggle_sidebar"),
     // Ctrl+\ on German/Austrian layouts (the unshifted key is ß)
