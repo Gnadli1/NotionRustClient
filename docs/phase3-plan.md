@@ -127,3 +127,10 @@ I pulled all 164 pages shared with the integration into the cache. One failed wi
 3. **Find** searches block text only, not table cells, link cards or child-page titles.
 4. **Find and outline jumps open collapsed toggles** and they stay open.
 5. **Untested on screen:** Ctrl+[ / Ctrl+] on the Austrian layout (Alt+←/→ is the safe default), mouse buttons 4/5, the look of the outline ticks and preview.
+
+## Known gaps after F8 (reviewed, deferred)
+1. **No cancel.** A sync-all runs to the end; pushes, uncached opens and live-update polls wait behind it (first run ~2 min for ~164 pages, repeat ~28 requests).
+2. **Databases don't open yet** (F4). Clicking one expands its rows in the sidebar.
+3. **Empty pages and pages with a queued title edit** are re-fetched on every sync-all (cost only).
+4. **The iced app** shows database entries but refuses to open them.
+5. **Not yet run against live Notion.** Try `notion-cli sync-all` or Ctrl+Shift+Y.
