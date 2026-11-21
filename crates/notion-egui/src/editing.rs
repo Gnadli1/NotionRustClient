@@ -704,7 +704,7 @@ mod tests {
         w.edit(0);
         w.type_text("1");
         w.press(Key::Escape, Modifiers::NONE);
-        w.app.sent.push_back(false);
+        w.app.sent.push_back(Cmd::Search(String::new()));
         w.press(Key::Z, Modifiers::CTRL);
         assert_eq!(w.row_text("p-0"), "a1", "a command is in flight");
         w.app.sent.clear();

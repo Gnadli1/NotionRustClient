@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Instant};
 
-use crate::model::{Block, BlockKind, DataSource, Page, SearchResult};
+use crate::model::{Block, BlockKind, Comment, DataSource, Page, SearchResult};
 use crate::{Error, Result};
 
 pub const NOTION_VERSION: &str = "2025-09-03";
@@ -196,6 +196,48 @@ impl Client {
         };
         self.paginate(&format!("/v1/data_sources/{id}/query"), Some(body))
             .await
+    }
+
+    /// Unresolved comments on a page or block, all pages. Needs the
+    /// integration's "read comments" capability (403 otherwise).
+    pub async fn list_comments(&self, block_or_page_id: &str) -> Result<Vec<Comment>> {
+        self.paginate(&format!("/v1/comments?block_id={block_or_page_id}"), None)
+            .await
+    }
+
+    pub async fn get_comment(&self, id: &str) -> Result<Comment> {
+        self.call(Method::GET, &format!("/v1/comments/{id}"), None)
+            .await
+    }
+
+    /// `body` holds exactly one target (`parent` or `discussion_id`) and `rich_text`.
+    /// Returns the raw response: with insert-only capability Notion sends just
+    /// `{object, id}`, which isn't a full [`Comment`].
+    pub async fn create_comment(&self, body: &Value) -> Result<Value> {
+        self.send(Method::POST, "/v1/comments", &[], Some(body)).await
+    }
+
+    /// Only comments created by this integration can be edited (else 404).
+    pub async fn update_comment(&self, id: &str, rich_text: &Value) -> Result<Value> {
+        let body = json!({ "rich_text": rich_text });
+        self.send(Method::PATCH, &format!("/v1/comments/{id}"), &[], Some(&body))
+            .await
+    }
+
+    /// Only comments created by this integration can be deleted (else 404).
+    pub async fn delete_comment(&self, id: &str) -> Result<()> {
+        self.send(Method::DELETE, &format!("/v1/comments/{id}"), &[], None)
+            .await
+            .map(drop)
+    }
+
+    /// The integration's own (bot) user id: `created_by` of comments made here.
+    pub async fn me(&self) -> Result<String> {
+        let v = self.send(Method::GET, "/v1/users/me", &[], None).await?;
+        v["id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| Error::Invalid("users/me has no id".into()))
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
@@ -486,6 +528,106 @@ mod tests {
             e => panic!("{e:?}"),
         }
         assert_eq!(s.received_requests().await.unwrap().len(), 1);
+    }
+
+    fn comment(id: &str, disc: &str, parent: Value, text: &str) -> Value {
+        json!({
+            "object": "comment", "id": id, "discussion_id": disc, "parent": parent,
+            "created_time": T, "last_edited_time": T,
+            "created_by": {"object": "user", "id": "bot"},
+            "rich_text": [{"type": "text", "text": {"content": text, "link": null},
+                "annotations": {}, "plain_text": text, "href": null}],
+        })
+    }
+
+    #[tokio::test]
+    async fn list_comments_paginates() {
+        let s = MockServer::start().await;
+        let pg = json!({"type": "page_id", "page_id": "p"});
+        Mock::given(method("GET"))
+            .and(path("/v1/comments"))
+            .and(query_param("block_id", "p"))
+            .and(query_param_is_missing("start_cursor"))
+            .respond_with(list(vec![comment("c1", "d1", pg.clone(), "a")], Some("n")))
+            .mount(&s)
+            .await;
+        Mock::given(path("/v1/comments"))
+            .and(query_param("block_id", "p"))
+            .and(query_param("start_cursor", "n"))
+            .respond_with(list(vec![comment("c2", "d1", pg, "b")], None))
+            .mount(&s)
+            .await;
+        let cs = client(&s, 0).list_comments("p").await.unwrap();
+        assert_eq!(
+            cs.iter().map(|c| (c.id.as_str(), c.created_by.as_str())).collect::<Vec<_>>(),
+            [("c1", "bot"), ("c2", "bot")]
+        );
+        assert_eq!(cs[0].discussion_id, "d1");
+        assert_eq!(crate::model::plain_text(&cs[1].rich_text), "b");
+    }
+
+    #[tokio::test]
+    async fn create_comment_on_page_block_and_reply() {
+        let s = MockServer::start().await;
+        let rt = json!([{"type": "text", "text": {"content": "hi"}}]);
+        let bodies = [
+            json!({"parent": {"type": "page_id", "page_id": "p"}, "rich_text": rt}),
+            json!({"parent": {"type": "block_id", "block_id": "b"}, "rich_text": rt}),
+            json!({"discussion_id": "d9", "rich_text": rt}),
+        ];
+        for b in &bodies {
+            Mock::given(method("POST"))
+                .and(path("/v1/comments"))
+                .and(header("Notion-Version", NOTION_VERSION))
+                .and(body_json(b))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    comment("new", "d", json!({"type": "page_id", "page_id": "p"}), "hi"),
+                ))
+                .expect(1)
+                .mount(&s)
+                .await;
+        }
+        let c = client(&s, 0);
+        for b in &bodies {
+            assert_eq!(c.create_comment(b).await.unwrap()["id"], "new");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_update_delete_comment_and_me() {
+        let s = MockServer::start().await;
+        let pg = json!({"type": "block_id", "block_id": "b"});
+        Mock::given(method("GET"))
+            .and(path("/v1/comments/c1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(comment("c1", "d", pg.clone(), "x")))
+            .mount(&s)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/comments/c1"))
+            .and(body_json(json!({"rich_text": [{"type": "text", "text": {"content": "y"}}]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(comment("c1", "d", pg, "y")))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/comments/c1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"object": "comment", "id": "c1"})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(path("/v1/users/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"object": "user", "id": "bot-1"})))
+            .mount(&s)
+            .await;
+        let c = client(&s, 0);
+        assert!(matches!(c.get_comment("c1").await.unwrap().parent, crate::model::Parent::Block(b) if b == "b"));
+        let r = c
+            .update_comment("c1", &json!([{"type": "text", "text": {"content": "y"}}]))
+            .await
+            .unwrap();
+        assert_eq!(r["rich_text"][0]["plain_text"], "y");
+        c.delete_comment("c1").await.unwrap();
+        assert_eq!(c.me().await.unwrap(), "bot-1");
     }
 
     #[tokio::test]

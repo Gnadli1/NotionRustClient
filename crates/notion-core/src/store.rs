@@ -7,7 +7,7 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::model::{Block, DataSource, Page, Parent};
+use crate::model::{Block, Comment, DataSource, Page, Parent};
 use crate::{Error, Result};
 
 const SCHEMA: &str = "
@@ -25,6 +25,16 @@ CREATE TABLE ops (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, targ
   status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','conflict','failed')), error TEXT, created_at TEXT NOT NULL);
 CREATE TABLE id_map (local_id TEXT PRIMARY KEY, remote_id TEXT NOT NULL);
 PRAGMA user_version = 1;
+";
+
+/// Schema v2: cached comments. Applied to fresh stores and to existing ones
+/// (IF NOT EXISTS: two processes may race to migrate).
+const MIGRATE_2: &str = "
+CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, parent_id TEXT NOT NULL, discussion_id TEXT NOT NULL,
+  created_time TEXT NOT NULL, last_edited_time TEXT NOT NULL, created_by TEXT NOT NULL DEFAULT '', raw TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS comments_parent ON comments(parent_id, created_time);
+CREATE INDEX IF NOT EXISTS comments_discussion ON comments(discussion_id);
+PRAGMA user_version = 2;
 ";
 
 /// One sidebar entry: a page, cached or known only from a `child_page` block.
@@ -68,6 +78,9 @@ impl Store {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version == 0 {
             conn.execute_batch(&format!("BEGIN; {SCHEMA} COMMIT;"))?;
+        }
+        if version < 2 {
+            conn.execute_batch(&format!("BEGIN; {MIGRATE_2} COMMIT;"))?;
         }
         Ok(Store { conn })
     }
@@ -339,7 +352,114 @@ impl Store {
              WHERE parent_id = ?1",
                 params![old_id, new_id],
             )?;
+            tx.execute(
+                "UPDATE comments SET parent_id = ?2, raw = json_set(raw, '$.parent.block_id', ?2)
+                 WHERE parent_id = ?1",
+                params![old_id, new_id],
+            )?;
             Ok(())
+        })
+    }
+
+    pub fn put_comment(&self, c: &Comment) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO comments
+             (id, parent_id, discussion_id, created_time, last_edited_time, created_by, raw)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                c.id,
+                c.parent.id().unwrap_or_default(),
+                c.discussion_id,
+                ts(&c.created_time),
+                ts(&c.last_edited_time),
+                c.created_by,
+                serde_json::to_string(c)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_comment(&self, id: &str) -> Result<Option<Comment>> {
+        self.get("SELECT raw FROM comments WHERE id = ?1", id)
+    }
+
+    /// Comments on a page or block, oldest first (threads interleave; group by `discussion_id`).
+    pub fn comments_for(&self, parent_id: &str) -> Result<Vec<Comment>> {
+        self.list(
+            "SELECT raw FROM comments WHERE parent_id = ?1 ORDER BY created_time, id",
+            parent_id,
+        )
+    }
+
+    /// Cached comment count per parent, for the given parents' page: every
+    /// block of `page_id` plus the page itself.
+    pub fn comment_counts(&self, page_id: &str) -> Result<std::collections::HashMap<String, usize>> {
+        let mut st = self.conn.prepare(
+            "SELECT parent_id, COUNT(*) FROM comments
+             WHERE parent_id = ?1 OR parent_id IN (SELECT id FROM blocks WHERE page_id = ?1)
+             GROUP BY parent_id",
+        )?;
+        let rows = st.query_map([page_id], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as usize)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The page or block a cached thread hangs off.
+    pub fn discussion_parent(&self, discussion_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT parent_id FROM comments WHERE discussion_id = ?1 LIMIT 1",
+                [discussion_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Whether the block or anything below it has a cached comment.
+    pub fn subtree_has_comments(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            &format!("{SUBTREE} SELECT EXISTS(SELECT 1 FROM comments WHERE parent_id IN (SELECT id FROM sub))"),
+            [id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn delete_comment(&self, id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM comments WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Re-keys a comment (`local-*` → real id).
+    pub fn rename_comment(&self, old_id: &str, new_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE comments SET id = ?2, raw = json_set(raw, '$.id', ?2) WHERE id = ?1",
+            params![old_id, new_id],
+        )?;
+        Ok(())
+    }
+
+    /// Re-keys a thread (`local-disc-*` → the real discussion id).
+    pub fn rename_discussion(&self, old: &str, new: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE comments SET discussion_id = ?2, raw = json_set(raw, '$.discussion_id', ?2)
+             WHERE discussion_id = ?1",
+            params![old, new],
+        )?;
+        Ok(())
+    }
+
+    /// Makes `list` the cached comments of `parent_id`. Unpushed `local-*`
+    /// comments stay; other cached comments not in `list` (resolved or
+    /// deleted remotely) go. Callers pass `list` with queued edits applied.
+    pub fn replace_comments(&self, parent_id: &str, list: &[Comment]) -> Result<()> {
+        self.atomic(|| {
+            let keep = serde_json::to_string(&list.iter().map(|c| &c.id).collect::<Vec<_>>())?;
+            self.conn.execute(
+                "DELETE FROM comments WHERE parent_id = ?1 AND id NOT LIKE 'local-%'
+                   AND id NOT IN (SELECT value FROM json_each(?2))",
+                params![parent_id, keep],
+            )?;
+            list.iter().try_for_each(|c| self.put_comment(c))
         })
     }
 
@@ -430,6 +550,10 @@ impl Store {
     }
 
     fn delete_subtree(conn: &Connection, id: &str) -> Result<()> {
+        conn.execute(
+            &format!("{SUBTREE} DELETE FROM comments WHERE parent_id IN (SELECT id FROM sub)"),
+            [id],
+        )?;
         conn.execute(
             &format!("{SUBTREE} DELETE FROM blocks WHERE id IN (SELECT id FROM sub)"),
             [id],
@@ -818,5 +942,44 @@ mod tests {
             .unwrap();
         let s = Store::open(&path).unwrap();
         assert!(s.get_page("p1").unwrap().is_some());
+    }
+
+    fn tables(s: &Store) -> Vec<String> {
+        let mut st = s
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name LIKE 'comments%' ORDER BY name")
+            .unwrap();
+        st.query_map([], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect()
+    }
+
+    fn version(s: &Store) -> i64 {
+        s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn fresh_store_has_the_comments_table_and_indexes() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(version(&s), 2);
+        assert_eq!(tables(&s), ["comments", "comments_discussion", "comments_parent"]);
+    }
+
+    #[test]
+    fn existing_v1_store_is_migrated_and_keeps_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        {
+            // a cache.db as the previous release left it
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(&format!("BEGIN; {SCHEMA} COMMIT;")).unwrap();
+            c.execute("INSERT INTO id_map VALUES ('l', 'r')", []).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(version(&s), 2);
+        assert_eq!(s.resolve_id("l").unwrap(), "r");
+        assert_eq!(tables(&s).len(), 3);
+        drop(s);
+        // reopening is a no-op
+        let s = Store::open(&path).unwrap();
+        assert_eq!((version(&s), tables(&s).len()), (2, 3));
     }
 }

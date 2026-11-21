@@ -18,6 +18,10 @@ pub enum Cmd {
     Pull { id: String, force: bool },
     Push,
     Search(String),
+    /// Fetches the threads of a page or block (`sync::pull_comments`).
+    PullComments { id: String },
+    /// Asks for the integration's own user id (to tell its comments apart).
+    Me,
 }
 
 #[derive(Debug, PartialEq)]
@@ -29,6 +33,8 @@ pub enum Event {
     Pushed(PushReport),
     /// (page id, title); data sources are left out.
     SearchResults(Vec<(String, String)>),
+    CommentsPulled,
+    Me(String),
     Error(String),
 }
 
@@ -50,6 +56,10 @@ pub async fn run(
                 .await
                 .map(|report| Event::Pulled { id, report }),
             Cmd::Push => sync::push(client, store).await.map(Event::Pushed),
+            Cmd::PullComments { id } => sync::pull_comments(client, store, &id)
+                .await
+                .map(|_| Event::CommentsPulled),
+            Cmd::Me => client.me().await.map(Event::Me),
             Cmd::Search(q) => client.search(&q).await.map(|rs| {
                 Event::SearchResults(
                     rs.into_iter()

@@ -10,9 +10,9 @@ use serde_json::{json, Value};
 use crate::api::{BlockNode, Client};
 use crate::markdown::split_runs;
 use crate::model::{
-    Block, BlockKind, Page, Parent, PropertyValue, RichText, TargetKind, TextBlock,
+    Block, BlockKind, Comment, Page, Parent, PropertyValue, RichText, TargetKind, TextBlock,
 };
-use crate::ops::{Op, OpKind, OpStatus};
+use crate::ops::{CommentTarget, Op, OpKind, OpStatus};
 use crate::store::{ts, Store};
 use crate::{Error, Result};
 use rusqlite::OptionalExtension;
@@ -162,7 +162,53 @@ pub async fn pull_page(
     let mut page = page;
     keep_queued_props(store, &mut page)?;
     store.upsert_page(&page)?;
+    // ponytail: comment fetch strategy. Notion has no "all comments under this
+    // page" endpoint and a block object carries no "has comments" flag, so a
+    // pull fetches only the page's own threads (one request, +1 on a pull of
+    // any size, however many blocks). Block threads are fetched lazily with
+    // `pull_comments(block_id)` when the comments panel opens for that block;
+    // a row's 💬 badge counts what is cached. Upgrade path if per-row badges
+    // must be eager: fetch the blocks of a visible window, rate-limited.
+    // Comment trouble (a 403 when the integration lacks the read-comments
+    // capability, say) never fails the page pull.
+    if let Err(e) = pull_comments(client, store, &page.id).await {
+        tracing::warn!("comments of {} not pulled: {e}", page.id);
+    }
     Ok(report)
+}
+
+/// Caches the unresolved comments of a page or block (the endpoint lists
+/// only those; a thread resolved remotely drops out of the cache). Cached
+/// comments with queued ops survive: unpushed `local-*` creates stay, a
+/// comment with a queued edit keeps its cached text, one with a queued
+/// delete stays gone.
+pub async fn pull_comments(client: &Client, store: &Store, parent_id: &str) -> Result<usize> {
+    let remote = client.list_comments(parent_id).await?;
+    let mut edited = HashSet::new();
+    let mut deleted = HashSet::new();
+    for op in store.queued_ops()? {
+        match &op.kind {
+            OpKind::UpdateComment { comment_id, .. } => {
+                edited.insert(store.resolve_id(comment_id)?);
+            }
+            OpKind::DeleteComment { comment_id } => {
+                deleted.insert(store.resolve_id(comment_id)?);
+            }
+            _ => {}
+        }
+    }
+    let mut list = Vec::new();
+    for c in remote {
+        if deleted.contains(&c.id) {
+            continue;
+        }
+        match store.get_comment(&c.id)?.filter(|_| edited.contains(&c.id)) {
+            Some(cached) => list.push(cached),
+            None => list.push(c),
+        }
+    }
+    store.replace_comments(parent_id, &list)?;
+    Ok(list.len())
 }
 
 pub async fn pull_data_source(client: &Client, store: &Store, ds_id: &str) -> Result<PullReport> {
@@ -292,6 +338,24 @@ async fn check_block(
     Ok((remote, c))
 }
 
+fn record_comment(own: &mut Own, c: &Comment) -> Result<()> {
+    own.insert(c.id.clone(), (c.last_edited_time, serde_json::to_value(c)?));
+    Ok(())
+}
+
+/// `Some(reason)` if the remote comment was edited since the op's base.
+async fn check_comment(
+    client: &Client,
+    op: &Op,
+    id: &str,
+    own: &Own,
+) -> Result<Option<String>> {
+    let remote = client.get_comment(id).await?;
+    conflict(op, id, remote.last_edited_time, own, |raw| {
+        Ok(serde_json::from_value::<Comment>(raw.clone())?.rich_text == remote.rich_text)
+    })
+}
+
 /// Raw-backed kinds hold the whole block, which a single GET pads with fields
 /// a listed copy lacks (`request_id`): compare only their type payload.
 fn same_content(a: &BlockKind, b: &BlockKind) -> bool {
@@ -410,6 +474,94 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
             store.map_id(&local.id, &new.id)?;
             record_block(own, &new)?;
         }
+        OpKind::CreateComment {
+            parent,
+            rich_text,
+            local_id,
+            local_discussion,
+        } => {
+            let target = store.resolve_id(parent.id())?;
+            if target.starts_with("local-") {
+                return Ok(Outcome::Failed("its target was never created".into()));
+            }
+            let mut body = match parent {
+                CommentTarget::Page(_) => {
+                    json!({ "parent": { "type": "page_id", "page_id": target } })
+                }
+                CommentTarget::Block(_) => {
+                    json!({ "parent": { "type": "block_id", "block_id": target } })
+                }
+                CommentTarget::Discussion(_) => json!({ "discussion_id": target }),
+            };
+            body["rich_text"] = rich_text.clone();
+            let resp = match client.create_comment(&body).await {
+                // Never reached Notion (or it said no): safe to retry or fail as usual.
+                Err(e @ (Error::Api { .. } | Error::RetriesExhausted)) => return Err(e),
+                Err(Error::Http(e)) if e.is_connect() => return Err(Error::Http(e)),
+                // The POST may have landed: a retry could post it twice.
+                Err(_) => {
+                    return Ok(Outcome::Failed(
+                        "may have been posted; check Notion before retrying".into(),
+                    ))
+                }
+                Ok(resp) => resp,
+            };
+            // From here the comment exists remotely: nothing may fail the op
+            // (a retry would post it twice), so cache trouble is only logged.
+            // A partial response (insert-only capability) just re-keys the row;
+            // the next pull fills it in.
+            let cached = store.atomic(|| {
+                match Comment::from_value_lenient(resp.clone()) {
+                    Some(new) => {
+                        store.delete_comment(local_id)?;
+                        store.put_comment(&new)?;
+                        if *local_discussion != new.discussion_id {
+                            store.rename_discussion(local_discussion, &new.discussion_id)?;
+                            store.map_id(local_discussion, &new.discussion_id)?;
+                        }
+                        store.map_id(local_id, &new.id)?;
+                        record_comment(own, &new)?;
+                    }
+                    None => {
+                        let new_id = resp["id"].as_str().unwrap_or_default();
+                        store.rename_comment(local_id, new_id)?;
+                        store.map_id(local_id, new_id)?;
+                    }
+                }
+                Ok(())
+            });
+            if let Err(e) = cached {
+                tracing::warn!("posted comment {local_id} not cached: {e}");
+            }
+        }
+        OpKind::UpdateComment {
+            comment_id,
+            rich_text,
+        } => {
+            let id = store.resolve_id(comment_id)?;
+            if id.starts_with("local-") {
+                return Ok(Outcome::Failed("its comment was never created".into()));
+            }
+            if let Some(c) = check_comment(client, op, &id, own).await? {
+                return Ok(Outcome::Conflict(c));
+            }
+            let resp = client.update_comment(&id, rich_text).await?;
+            if let Some(c) = Comment::from_value_lenient(resp) {
+                store.put_comment(&c)?;
+                record_comment(own, &c)?;
+            }
+        }
+        OpKind::DeleteComment { comment_id } => {
+            let id = store.resolve_id(comment_id)?;
+            if id.starts_with("local-") {
+                return Ok(Outcome::Failed("its comment was never created".into()));
+            }
+            if let Some(c) = check_comment(client, op, &id, own).await? {
+                return Ok(Outcome::Conflict(c));
+            }
+            client.delete_comment(&id).await?;
+            store.delete_comment(&id)?;
+        }
         OpKind::MoveBlock {
             block_id,
             new_parent_id,
@@ -482,6 +634,17 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
 }
 
 // ---------------------------------------------------------------- local edits
+
+/// Moving (copy, then delete) or converting a block gives it a new id, which
+/// would silently drop its comments, remotely and in the cache.
+fn refuse_if_commented(store: &Store, block_id: &str, what: &str) -> Result<()> {
+    if store.subtree_has_comments(block_id)? {
+        return Err(Error::Invalid(format!(
+            "this block has comments; {what} it would lose them"
+        )));
+    }
+    Ok(())
+}
 
 fn cached(store: &Store, block_id: &str) -> Result<Block> {
     store
@@ -744,7 +907,14 @@ pub fn op_block(k: &OpKind) -> Option<&str> {
         OpKind::UpdateBlock { block_id, .. }
         | OpKind::DeleteBlock { block_id }
         | OpKind::MoveBlock { block_id, .. } => Some(block_id),
-        OpKind::UpdatePageProperties { .. } => None,
+        OpKind::CreateComment {
+            parent: CommentTarget::Block(b),
+            ..
+        } => Some(b),
+        OpKind::UpdatePageProperties { .. }
+        | OpKind::CreateComment { .. }
+        | OpKind::UpdateComment { .. }
+        | OpKind::DeleteComment { .. } => None,
     }
 }
 
@@ -761,13 +931,23 @@ pub fn local_delete_block(store: &Store, block_id: &str) -> Result<Option<i64>> 
         let block = cached(store, block_id)?;
         let subtree: HashSet<String> = store.subtree_ids(block_id)?.into_iter().collect();
         let ops = store.queued_ops()?;
-        let mut drop = Vec::new();
+        // the block each op is about; a reply's is its thread's parent
+        let mut targets = Vec::new();
         for op in &ops {
-            let t = op_block(&op.kind)
-                .map(|t| store.resolve_id(t))
-                .transpose()?;
-            drop.push(t.is_some_and(|t| subtree.contains(&t)));
+            targets.push(match &op.kind {
+                OpKind::CreateComment {
+                    parent: CommentTarget::Discussion(d),
+                    ..
+                } => store.discussion_parent(d)?,
+                k => op_block(k).map(str::to_string),
+            }
+            .map(|t| store.resolve_id(&t))
+            .transpose()?);
         }
+        let mut drop: Vec<bool> = targets
+            .iter()
+            .map(|t| t.as_ref().is_some_and(|t| subtree.contains(t)))
+            .collect();
         loop {
             let mut used = HashSet::new();
             for (op, _) in ops.iter().zip(&drop).filter(|(_, d)| !**d) {
@@ -795,9 +975,9 @@ pub fn local_delete_block(store: &Store, block_id: &str) -> Result<Option<i64>> 
         let mut bases = HashMap::new();
         let mut moved_in = Vec::new();
         let mut root_create_kept = false;
-        for (op, d) in ops.iter().zip(&drop) {
-            let t = match op_block(&op.kind) {
-                Some(t) => store.resolve_id(t)?,
+        for ((op, d), t) in ops.iter().zip(&drop).zip(targets) {
+            let t = match t {
+                Some(t) => t,
                 None => continue,
             };
             if !d {
@@ -862,6 +1042,7 @@ pub fn local_move_block(
 ) -> Result<Option<i64>> {
     store.atomic(|| {
         let base = cached(store, block_id)?;
+        refuse_if_commented(store, block_id, "moving")?;
         store.move_block_local(block_id, new_parent, after)?;
         let create = store.queued_create_for(block_id)?;
         if let Some(c) = &create {
@@ -965,8 +1146,8 @@ pub enum ChangeOutcome {
 /// it, Code keeps it as plain text).
 ///
 /// Notion can't change a block's type, so an existing block is replaced: a new
-/// block is created right after it and the old one deleted (new id, comments
-/// and backlinks are lost). An unpushed `local-*` block has its queued create
+/// block is created right after it and the old one deleted (new id, so
+/// backlinks are lost; a block with comments is refused). An unpushed `local-*` block has its queued create
 /// rewritten instead. Blocks with children are refused.
 pub fn local_change_type(
     store: &Store,
@@ -989,6 +1170,7 @@ pub fn local_change_type(
                 "cannot convert a block that has children".into(),
             ));
         }
+        refuse_if_commented(store, block_id, "converting")?;
         let text = match &block.kind {
             // the expression becomes plain text
             BlockKind::Equation { expression } if !expression.is_empty() => TextBlock {
@@ -1048,14 +1230,210 @@ pub fn local_change_type(
     })
 }
 
+// ---------------------------------------------------------------- local comments
+
+fn local_stamp(prefix: &str) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{prefix}-{}-{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Caches a new comment under a `local-*` id and queues its creation.
+/// A new thread (page or block target) gets a `local-disc-*` thread id that
+/// replies can already target; the push maps it to Notion's. Returns
+/// (op id, local comment id).
+pub fn local_add_comment(
+    store: &Store,
+    target: CommentTarget,
+    rich: Vec<RichText>,
+) -> Result<(i64, String)> {
+    let rich = split_runs(rich);
+    let (parent, discussion) = match &target {
+        CommentTarget::Page(id) => (Parent::Page(id.clone()), local_stamp("local-disc")),
+        CommentTarget::Block(id) => (Parent::Block(id.clone()), local_stamp("local-disc")),
+        CommentTarget::Discussion(d) => {
+            // replies hang off the thread's parent
+            let p = store
+                .conn
+                .query_row(
+                    "SELECT raw FROM comments WHERE discussion_id = ?1 LIMIT 1",
+                    [d],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .map(|raw| serde_json::from_str::<Comment>(&raw))
+                .transpose()?
+                .ok_or_else(|| Error::Invalid(format!("thread {d} not cached")))?;
+            (p.parent, d.clone())
+        }
+    };
+    let now = ts(&Utc::now());
+    let id = local_stamp("local");
+    let comment: Comment = serde_json::from_value(json!({
+        "object": "comment", "id": id, "discussion_id": discussion,
+        "parent": serde_json::to_value(&parent)?,
+        "created_time": now, "last_edited_time": now,
+        "created_by": { "object": "user", "id": "local" },
+        "rich_text": rich,
+    }))?;
+    store.atomic(|| {
+        store.put_comment(&comment)?;
+        let op = store.enqueue(
+            OpKind::CreateComment {
+                parent: target,
+                rich_text: json!(rich),
+                local_id: id.clone(),
+                local_discussion: discussion,
+            },
+            None,
+            None,
+        )?;
+        Ok((op, id))
+    })
+}
+
+fn queued_comment_op(store: &Store, comment_id: &str) -> Result<Option<Op>> {
+    for op in store.queued_ops()? {
+        let hit = match &op.kind {
+            OpKind::CreateComment { local_id, .. } => local_id == comment_id,
+            OpKind::UpdateComment { comment_id: c, .. } => store.resolve_id(c)? == comment_id,
+            _ => false,
+        };
+        if hit {
+            return Ok(Some(op));
+        }
+    }
+    Ok(None)
+}
+
+/// Replaces a cached comment's text and queues the edit (an unpushed
+/// create, or an earlier queued edit of it, is rewritten instead). Only the
+/// integration's own comments can be edited remotely; Notion answers 404 for
+/// others and the op then fails. Returns the op id.
+pub fn local_edit_comment(store: &Store, comment_id: &str, rich: Vec<RichText>) -> Result<i64> {
+    let base = store
+        .get_comment(comment_id)?
+        .ok_or_else(|| Error::Invalid(format!("comment {comment_id} not cached")))?;
+    let mut c = base.clone();
+    c.rich_text = split_runs(rich);
+    let rich_json = json!(c.rich_text);
+    store.atomic(|| {
+        store.put_comment(&c)?;
+        match queued_comment_op(store, comment_id)? {
+            Some(Op {
+                id,
+                kind:
+                    OpKind::CreateComment {
+                        parent,
+                        local_id,
+                        local_discussion,
+                        ..
+                    },
+                ..
+            }) => {
+                let kind = OpKind::CreateComment {
+                    parent,
+                    rich_text: rich_json,
+                    local_id,
+                    local_discussion,
+                };
+                store.update_op_kind(id, &kind)?;
+                Ok(id)
+            }
+            Some(Op {
+                id,
+                kind: OpKind::UpdateComment { comment_id, .. },
+                ..
+            }) => {
+                let kind = OpKind::UpdateComment {
+                    comment_id,
+                    rich_text: rich_json,
+                };
+                store.update_op_kind(id, &kind)?;
+                Ok(id)
+            }
+            _ => store.enqueue(
+                OpKind::UpdateComment {
+                    comment_id: comment_id.to_string(),
+                    rich_text: rich_json,
+                },
+                Some(base.last_edited_time),
+                Some(serde_json::to_value(&base)?),
+            ),
+        }
+    })
+}
+
+/// Removes a cached comment and queues the delete. An unpushed `local-*`
+/// comment is just dropped with its queued ops (and, if it started a
+/// thread, the thread's unpushed replies); returns None then.
+pub fn local_delete_comment(store: &Store, comment_id: &str) -> Result<Option<i64>> {
+    store.atomic(|| {
+        let base = store
+            .get_comment(comment_id)?
+            .ok_or_else(|| Error::Invalid(format!("comment {comment_id} not cached")))?;
+        if comment_id.starts_with("local-") {
+            // the comment itself, plus every local comment in a local thread it started
+            let mut gone = vec![comment_id.to_string()];
+            let starts_thread = matches!(
+                queued_comment_op(store, comment_id)?,
+                Some(Op { kind: OpKind::CreateComment { parent, .. }, .. })
+                    if !matches!(parent, CommentTarget::Discussion(_))
+            );
+            if starts_thread {
+                gone = store
+                    .conn
+                    .prepare("SELECT id FROM comments WHERE discussion_id = ?1 AND id LIKE 'local-%'")?
+                    .query_map([&base.discussion_id], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+            }
+            for op in store.queued_ops()? {
+                let hit = match &op.kind {
+                    OpKind::CreateComment { local_id, .. } => gone.contains(local_id),
+                    OpKind::UpdateComment { comment_id: c, .. } => gone.contains(c),
+                    _ => false,
+                };
+                if hit {
+                    store.complete_op(op.id)?;
+                }
+            }
+            for id in &gone {
+                store.delete_comment(id)?;
+            }
+            return Ok(None);
+        }
+        // a queued edit of it is moot; keep the first base
+        let (time, raw) = match queued_comment_op(store, comment_id)? {
+            Some(op) => {
+                store.complete_op(op.id)?;
+                (op.base_last_edited_time, op.base_raw)
+            }
+            None => (None, None),
+        };
+        store.delete_comment(comment_id)?;
+        store
+            .enqueue(
+                OpKind::DeleteComment {
+                    comment_id: comment_id.to_string(),
+                },
+                time.or(Some(base.last_edited_time)),
+                raw.or(Some(serde_json::to_value(&base)?)),
+            )
+            .map(Some)
+    })
+}
+
 // ---------------------------------------------------------------- undo
 
-/// All columns of a `pages`, `blocks` or `ops` row, in table order.
+/// All columns of a `pages`, `blocks`, `comments` or `ops` row, in table order.
 type SqlRow = Vec<rusqlite::types::Value>;
 /// (table, id as text) → row.
 type Rows = HashMap<(&'static str, String), SqlRow>;
 
-/// The cached rows of some pages (the page row and its blocks) plus the whole
+/// The cached rows of some pages (the page row, its blocks and their comments) plus the whole
 /// op table, taken before a local edit. [`Checkpoint::changes`] keeps only the
 /// rows the edit touched.
 pub struct Checkpoint {
@@ -1096,6 +1474,12 @@ fn snapshot(store: &Store, pages: &[String]) -> Result<Rows> {
         (
             "blocks",
             "SELECT * FROM blocks WHERE page_id IN (SELECT value FROM json_each(?1))",
+            true,
+        ),
+        (
+            "comments",
+            "SELECT * FROM comments WHERE parent_id IN (SELECT value FROM json_each(?1))
+               OR parent_id IN (SELECT id FROM blocks WHERE page_id IN (SELECT value FROM json_each(?1)))",
             true,
         ),
         ("ops", "SELECT * FROM ops", false),
@@ -3408,5 +3792,414 @@ mod tests {
             assert!(!restore(&store, &c).unwrap(), "{leave}");
             assert_eq!(snap(&store), now, "{leave}: nothing written");
         }
+    }
+
+    // ------------------------------------------------------------ comments
+
+    fn cm(id: &str, disc: &str, parent: Value, text: &str, time: &str) -> Value {
+        json!({
+            "object": "comment", "id": id, "discussion_id": disc, "parent": parent,
+            "created_time": T, "last_edited_time": time,
+            "created_by": { "object": "user", "id": "bot" },
+            "rich_text": [{ "type": "text", "text": { "content": text },
+                "plain_text": text, "annotations": {} }],
+        })
+    }
+
+    fn rt(t: &str) -> Vec<RichText> {
+        vec![RichText::plain(t)]
+    }
+
+    fn comment_text(store: &Store, id: &str) -> String {
+        plain_text(&store.get_comment(id).unwrap().unwrap().rich_text)
+    }
+
+    async fn post_comment(s: &MockServer, partial_body: Value, resp: Value) {
+        Mock::given(method("POST"))
+            .and(path("/v1/comments"))
+            .and(body_partial_json(partial_body))
+            .respond_with(ok(resp))
+            .expect(1)
+            .mount(s)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn offline_comment_is_pushed_and_mapped() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        let (op, local) = local_add_comment(&store, CommentTarget::Page("p".into()), rt("hi")).unwrap();
+        assert!(local.starts_with("local-"));
+        assert_eq!(comment_text(&store, &local), "hi");
+        assert_eq!(store.comments_for("p").unwrap().len(), 1);
+        // a reply to the still-local thread, queued behind it
+        let disc = store.get_comment(&local).unwrap().unwrap().discussion_id;
+        let (_, reply) = local_add_comment(&store, CommentTarget::Discussion(disc), rt("re")).unwrap();
+        assert_eq!(store.queued_ops().unwrap()[0].id, op);
+
+        post_comment(
+            &s,
+            json!({ "parent": { "type": "page_id", "page_id": "p" },
+                    "rich_text": [{ "text": { "content": "hi" } }] }),
+            cm("c1", "d1", pp("p"), "hi", T2),
+        )
+        .await;
+        post_comment(
+            &s,
+            json!({ "discussion_id": "d1", "rich_text": [{ "text": { "content": "re" } }] }),
+            cm("c2", "d1", pp("p"), "re", T2),
+        )
+        .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!((r.applied, r.failed), (2, 0), "{r:?}");
+        assert_eq!(store.resolve_id(&local).unwrap(), "c1");
+        assert_eq!(store.resolve_id(&reply).unwrap(), "c2");
+        assert!(store.get_comment(&local).unwrap().is_none());
+        let cs = store.comments_for("p").unwrap();
+        assert_eq!(
+            cs.iter().map(|c| (c.id.as_str(), c.discussion_id.as_str())).collect::<Vec<_>>(),
+            [("c1", "d1"), ("c2", "d1")]
+        );
+        assert!(store.queued_ops().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn comment_on_local_block_waits_for_its_create() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        let l = local_create_block(&store, "p", Some("a"), BlockKind::Divider).unwrap();
+        local_add_comment(&store, CommentTarget::Block(l.clone()), rt("on new")).unwrap();
+        assert_eq!(store.comments_for(&l).unwrap().len(), 1);
+
+        let mut made = blk("real", pp("p"), "", T2, false);
+        made["type"] = json!("divider");
+        made["divider"] = json!({});
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/p/children"))
+            .respond_with(list(vec![made]))
+            .expect(1)
+            .mount(&s)
+            .await;
+        post_comment(
+            &s,
+            json!({ "parent": { "type": "block_id", "block_id": "real" } }),
+            cm("c1", "d1", bp("real"), "on new", T2),
+        )
+        .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!((r.applied, r.failed), (2, 0), "{r:?}");
+        assert!(store.comments_for(&l).unwrap().is_empty());
+        assert_eq!(store.comments_for("real").unwrap()[0].id, "c1");
+    }
+
+    #[tokio::test]
+    async fn comment_on_a_block_whose_create_failed_fails_without_a_request() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        let l = local_create_block(&store, "p", Some("a"), BlockKind::Divider).unwrap();
+        local_add_comment(&store, CommentTarget::Block(l), rt("x")).unwrap();
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/p/children"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"code": "validation_error", "message": "no"})))
+            .mount(&s)
+            .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!((r.applied, r.failed), (0, 2), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn push_edit_and_delete_comment_with_conflict_check() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        store
+            .put_comment(&serde_json::from_value(cm("c1", "d1", bp("a"), "old", T)).unwrap())
+            .unwrap();
+        store
+            .put_comment(&serde_json::from_value(cm("c2", "d2", bp("a"), "gone", T)).unwrap())
+            .unwrap();
+        local_edit_comment(&store, "c1", rt("new")).unwrap();
+        local_edit_comment(&store, "c1", rt("newer")).unwrap(); // merged into the queued op
+        local_delete_comment(&store, "c2").unwrap().unwrap();
+        assert_eq!(store.queued_ops().unwrap().len(), 2);
+        assert_eq!(comment_text(&store, "c1"), "newer");
+        assert!(store.get_comment("c2").unwrap().is_none());
+
+        get(&s, "/v1/comments/c1", ok(cm("c1", "d1", bp("a"), "old", T))).await;
+        get(&s, "/v1/comments/c2", ok(cm("c2", "d2", bp("a"), "gone", T))).await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/comments/c1"))
+            .and(body_partial_json(json!({ "rich_text": [{ "text": { "content": "newer" } }] })))
+            .respond_with(ok(cm("c1", "d1", bp("a"), "newer", T2)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/comments/c2"))
+            .respond_with(ok(json!({ "object": "comment", "id": "c2" })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!((r.applied, r.conflicts, r.failed), (2, 0, 0), "{r:?}");
+        assert_eq!(comment_text(&store, "c1"), "newer");
+    }
+
+    #[tokio::test]
+    async fn comment_edit_conflicts_when_remote_was_edited() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        store
+            .put_comment(&serde_json::from_value(cm("c1", "d1", bp("a"), "old", T)).unwrap())
+            .unwrap();
+        local_edit_comment(&store, "c1", rt("mine")).unwrap();
+        get(&s, "/v1/comments/c1", ok(cm("c1", "d1", bp("a"), "theirs", T2))).await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!((r.applied, r.conflicts), (0, 1), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn pull_fetches_page_comments_and_keeps_those_with_queued_ops() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        let put = |id: &str, t: &str| {
+            store
+                .put_comment(&serde_json::from_value(cm(id, "d", pp("p"), t, T)).unwrap())
+                .unwrap()
+        };
+        put("e", "mine-edited");
+        put("x", "doomed");
+        put("r", "resolved remotely");
+        local_edit_comment(&store, "e", rt("mine-edited")).unwrap();
+        local_delete_comment(&store, "x").unwrap();
+        local_add_comment(&store, CommentTarget::Page("p".into()), rt("unpushed")).unwrap();
+
+        get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
+        get(&s, "/v1/blocks/p/children", list(vec![blk("a", pp("p"), "a", T, false)])).await;
+        get(
+            &s,
+            "/v1/comments",
+            list(vec![
+                cm("e", "d", pp("p"), "remote text", T2),
+                cm("x", "d", pp("p"), "doomed", T2),
+                cm("n", "d", pp("p"), "new remote", T2),
+            ]),
+        )
+        .await;
+        pull_page(&client(&s), &store, "p", true).await.unwrap();
+        let cs = store.comments_for("p").unwrap();
+        let got: Vec<_> = cs.iter().map(|c| (c.id.as_str(), plain_text(&c.rich_text))).collect();
+        assert!(got.contains(&("e", "mine-edited".to_string())), "{got:?}");
+        assert!(got.contains(&("n", "new remote".to_string())), "{got:?}");
+        assert!(got.iter().any(|(id, t)| id.starts_with("local-") && t == "unpushed"), "{got:?}");
+        assert!(!got.iter().any(|(id, _)| *id == "x" || *id == "r"), "{got:?}");
+        assert_eq!(got.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn pull_comments_of_a_block_is_one_request_and_a_failure_does_not_fail_pull_page() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/comments"))
+            .and(wiremock::matchers::query_param("block_id", "a"))
+            .respond_with(list(vec![cm("c1", "d1", bp("a"), "x", T)]))
+            .expect(1)
+            .mount(&s)
+            .await;
+        assert_eq!(pull_comments(&client(&s), &store, "a").await.unwrap(), 1);
+        assert_eq!(store.comment_counts("p").unwrap()["a"], 1);
+
+        // 403 (no read-comments capability): the page pull still succeeds
+        s.reset().await;
+        get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
+        get(&s, "/v1/blocks/p/children", list(vec![blk("a", pp("p"), "a", T, false)])).await;
+        Mock::given(path("/v1/comments"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({"code": "restricted_resource", "message": "no"})))
+            .mount(&s)
+            .await;
+        pull_page(&client(&s), &store, "p", true).await.unwrap();
+    }
+
+    #[test]
+    fn deleting_a_local_comment_drops_its_ops_and_thread() {
+        let store = Store::open_in_memory().unwrap();
+        let (_, a) = local_add_comment(&store, CommentTarget::Page("p".into()), rt("a")).unwrap();
+        let disc = store.get_comment(&a).unwrap().unwrap().discussion_id;
+        let (_, b) = local_add_comment(&store, CommentTarget::Discussion(disc.clone()), rt("b")).unwrap();
+        // deleting only the reply keeps the thread
+        assert_eq!(local_delete_comment(&store, &b).unwrap(), None);
+        assert_eq!(store.queued_ops().unwrap().len(), 1);
+        let (_, b) = local_add_comment(&store, CommentTarget::Discussion(disc), rt("b")).unwrap();
+        local_edit_comment(&store, &a, rt("a2")).unwrap();
+        assert_eq!(comment_text(&store, &a), "a2");
+        // deleting the root takes the thread's unpushed replies with it
+        assert_eq!(local_delete_comment(&store, &a).unwrap(), None);
+        assert!(store.get_comment(&b).unwrap().is_none());
+        assert!(store.queued_ops().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_block_drops_its_comments_and_comment_ops() {
+        let store = undo_store();
+        local_add_comment(&store, CommentTarget::Block("b".into()), rt("x")).unwrap();
+        local_add_comment(&store, CommentTarget::Page("p".into()), rt("keep")).unwrap();
+        local_delete_block(&store, "b").unwrap();
+        assert!(store.comments_for("b").unwrap().is_empty());
+        let kinds: Vec<_> = store.queued_ops().unwrap().into_iter().map(|o| o.kind).collect();
+        assert_eq!(kinds.len(), 2, "{kinds:?}"); // page comment create + delete block
+        assert!(kinds.iter().any(|k| matches!(k, OpKind::CreateComment { parent: CommentTarget::Page(_), .. })));
+    }
+
+    #[test]
+    fn comment_ops_undo_and_redo() {
+        let store = undo_store();
+        let before = snap(&store);
+        let c = record(&store, |s| {
+            local_add_comment(s, CommentTarget::Block("b".into()), rt("x")).unwrap();
+        });
+        assert_eq!(store.comments_for("b").unwrap().len(), 1);
+        let after = snap(&store);
+        assert!(restore(&store, &c).unwrap());
+        assert_eq!(snap(&store), before);
+        assert!(store.comments_for("b").unwrap().is_empty());
+        assert!(store.queued_ops().unwrap().is_empty());
+        assert!(restore(&store, &c.inverse()).unwrap());
+        assert_eq!(snap(&store), after);
+    }
+
+    #[test]
+    fn renaming_a_block_moves_its_comments() {
+        let store = undo_store();
+        let l = local_create_block(&store, "p", None, BlockKind::Divider).unwrap();
+        local_add_comment(&store, CommentTarget::Block(l.clone()), rt("x")).unwrap();
+        store.rename_block(&l, "real").unwrap();
+        assert_eq!(store.comments_for("real").unwrap().len(), 1);
+        assert!(store.comments_for(&l).unwrap().is_empty());
+    }
+
+    /// Caches a pulled comment (a real thread) on `parent`.
+    fn real_thread(store: &Store, id: &str, disc: &str, parent: Value) {
+        let c: Comment = serde_json::from_value(cm(id, disc, parent, "t", T)).unwrap();
+        store.put_comment(&c).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_subtree_drops_comments_of_all_descendants() {
+        let store = undo_store();
+        let b = |id: &str, parent: Value| -> Block {
+            serde_json::from_value(blk(id, parent, id, T, false)).unwrap()
+        };
+        store.replace_children("p", "a1", &[b("a11", bp("a1"))]).unwrap();
+        for (id, blk) in [("c-a", "a"), ("c-a1", "a1"), ("c-a11", "a11")] {
+            real_thread(&store, id, &format!("d-{blk}"), bp(blk));
+        }
+        real_thread(&store, "c-b", "d-b", bp("b"));
+        local_delete_block(&store, "a").unwrap();
+        for blk in ["a", "a1", "a11"] {
+            assert!(store.comments_for(blk).unwrap().is_empty(), "{blk}");
+        }
+        assert_eq!(store.comments_for("b").unwrap().len(), 1, "others stay");
+    }
+
+    #[test]
+    fn deleting_a_block_drops_queued_replies_to_its_threads() {
+        let store = undo_store();
+        real_thread(&store, "c1", "d1", bp("b"));
+        local_add_comment(&store, CommentTarget::Discussion("d1".into()), rt("reply")).unwrap();
+        let (_, l) = local_add_comment(&store, CommentTarget::Block("b".into()), rt("new")).unwrap();
+        let d = store.get_comment(&l).unwrap().unwrap().discussion_id;
+        local_add_comment(&store, CommentTarget::Discussion(d), rt("reply2")).unwrap();
+        // survives: a reply on another block's thread
+        real_thread(&store, "c2", "d2", bp("c"));
+        local_add_comment(&store, CommentTarget::Discussion("d2".into()), rt("other")).unwrap();
+        local_delete_block(&store, "b").unwrap();
+        let kinds: Vec<_> = store.queued_ops().unwrap().into_iter().map(|o| o.kind).collect();
+        assert_eq!(kinds.len(), 2, "{kinds:?}");
+        assert!(matches!(&kinds[0], OpKind::CreateComment { parent: CommentTarget::Discussion(d), .. } if d == "d2"));
+        assert!(matches!(&kinds[1], OpKind::DeleteBlock { .. }));
+    }
+
+    #[test]
+    fn blocks_with_comments_cannot_be_moved_or_converted() {
+        let store = undo_store();
+        local_add_comment(&store, CommentTarget::Block("b".into()), rt("x")).unwrap();
+        real_thread(&store, "c1", "d1", bp("a1"));
+        for id in ["b", "a"] {
+            // a's comment sits on its child: the copy would lose it too
+            let e = local_move_block(&store, id, "c", None).unwrap_err().to_string();
+            assert!(e.contains("has comments") && e.contains("moving"), "{e}");
+        }
+        let e = local_change_type(&store, "b", TargetKind::Heading1).unwrap_err().to_string();
+        assert!(e.contains("has comments") && e.contains("converting"), "{e}");
+        assert_eq!(store.comments_for("b").unwrap().len(), 1);
+        assert_eq!(store.queued_ops().unwrap().len(), 1, "only the comment create");
+        // a commentless block still moves
+        local_move_block(&store, "c", "b", None).unwrap();
+    }
+
+    #[tokio::test]
+    async fn comment_post_with_an_unreadable_reply_is_failed_not_retried() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        let (_, local) = local_add_comment(&store, CommentTarget::Page("p".into()), rt("hi")).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/v1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!((r.applied, r.failed), (0, 1), "{r:?}");
+        assert!(store.queued_ops().unwrap().is_empty());
+        let failed = store.ops_by_status(OpStatus::Failed).unwrap();
+        assert!(failed[0].error.as_deref().unwrap().contains("may have been posted"));
+        assert!(store.get_comment(&local).unwrap().is_some(), "kept until the user decides");
+        // a second push must not POST again (expect(1) above)
+        push(&client(&s), &store).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn comment_post_that_never_connected_stays_queued() {
+        let store = Store::open_in_memory().unwrap();
+        local_add_comment(&store, CommentTarget::Page("p".into()), rt("hi")).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let c = Client::new(
+            "t".into(),
+            ClientConfig {
+                base_url: format!("http://127.0.0.1:{port}"),
+                requests_per_sec: 1000.0,
+                burst: 1000,
+                max_retries: 0,
+                max_backoff: Duration::from_secs(1),
+            },
+        );
+        assert!(push(&c, &store).await.is_err());
+        assert_eq!(store.queued_ops().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cache_failure_after_a_comment_post_does_not_fail_the_op() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a"]).await;
+        local_add_comment(&store, CommentTarget::Page("p".into()), rt("hi")).unwrap();
+        store.conn.execute_batch("DROP TABLE comments").unwrap();
+        post_comment(
+            &s,
+            json!({ "parent": { "type": "page_id", "page_id": "p" } }),
+            cm("c1", "d1", pp("p"), "hi", T2),
+        )
+        .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!((r.applied, r.failed), (1, 0), "{r:?}");
+        assert!(store.queued_ops().unwrap().is_empty());
     }
 }

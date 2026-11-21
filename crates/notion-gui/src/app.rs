@@ -543,6 +543,9 @@ fn problem(store: &Store, op: &Op) -> notion_core::Result<Problem> {
         OpKind::DeleteBlock { .. } => ("delete", None),
         OpKind::MoveBlock { .. } => ("move", None),
         OpKind::UpdatePageProperties { .. } => ("title", None),
+        OpKind::CreateComment { .. } => ("comment", None),
+        OpKind::UpdateComment { .. } => ("edit comment", None),
+        OpKind::DeleteComment { .. } => ("delete comment", None),
     };
     let shown = match &local {
         Some(l) if store.get_block(l)?.is_some() => l.clone(),

@@ -33,6 +33,39 @@ pub enum OpKind {
         page_id: String,
         properties: Value,
     },
+    /// `local_id`/`local_discussion` are the cached row's temporary ids; the
+    /// push maps them to the real ones (see `id_map`).
+    CreateComment {
+        parent: CommentTarget,
+        rich_text: Value,
+        local_id: String,
+        local_discussion: String,
+    },
+    UpdateComment {
+        comment_id: String,
+        rich_text: Value,
+    },
+    DeleteComment {
+        comment_id: String,
+    },
+}
+
+/// Where a new comment goes. Notion can't start a thread on a text range,
+/// only on a whole page or block, or reply into a thread.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "id", rename_all = "snake_case")]
+pub enum CommentTarget {
+    Page(String),
+    Block(String),
+    Discussion(String),
+}
+
+impl CommentTarget {
+    pub fn id(&self) -> &str {
+        match self {
+            CommentTarget::Page(i) | CommentTarget::Block(i) | CommentTarget::Discussion(i) => i,
+        }
+    }
 }
 
 impl OpKind {
@@ -43,6 +76,9 @@ impl OpKind {
             | OpKind::DeleteBlock { block_id }
             | OpKind::MoveBlock { block_id, .. } => block_id,
             OpKind::UpdatePageProperties { page_id, .. } => page_id,
+            OpKind::CreateComment { parent, .. } => parent.id(),
+            OpKind::UpdateComment { comment_id, .. }
+            | OpKind::DeleteComment { comment_id } => comment_id,
         }
     }
 }

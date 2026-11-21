@@ -15,6 +15,7 @@ use eframe::egui::{
 };
 use notion_core::markdown::{from_markdown, to_markdown};
 use notion_core::model::{plain_text, BlockKind, TargetKind, TextBlock};
+use notion_core::ops::CommentTarget;
 use notion_core::sync::{self, ChangeOutcome};
 use notion_core::store::{PageEntry, Store};
 use tokio::sync::mpsc::UnboundedSender;
@@ -144,6 +145,16 @@ pub(crate) enum Action {
     ToggleProblems,
     OpenProblem(i64),
     Discard(i64),
+    /// A row's 💬 count: the comments panel on that row.
+    OpenComments(String),
+    CloseComments,
+    /// A comment box's Ctrl+Enter: (where it goes, Markdown text).
+    CommentSend(CommentTarget, String),
+    /// (comment id, Markdown text).
+    CommentSave(String, String),
+    CommentDelete(String),
+    /// Esc in a comment box.
+    CommentsBack,
     /// A slash pick or Markdown shortcut on the edited row: `text` is the
     /// editor's text without the trigger, `typed` as it was before, `at` the
     /// cursor (a char index into `text`).
@@ -205,8 +216,8 @@ pub struct App {
     /// Where session-egui.json is written on exit; None (tests) writes nothing.
     pub(crate) session_dir: Option<PathBuf>,
     /// One entry per command sent and not yet answered (the worker answers
-    /// each with one event, in order); true = Push.
-    pub(crate) sent: VecDeque<bool>,
+    /// each with one event, in order).
+    pub(crate) sent: VecDeque<Cmd>,
     /// Page waiting for its pull, to be opened when it arrives.
     pub(crate) pending_open: Option<String>,
     pub(crate) last_error: Option<String>,
@@ -218,6 +229,14 @@ pub struct App {
     pub(crate) problem_ids: HashSet<String>,
     pub(crate) problems: Vec<Problem>,
     pub(crate) problems_open: bool,
+    /// The comments panel, while open.
+    pub(crate) comments: Option<crate::comments::Panel>,
+    /// Cached comments per page or block of the open page (the 💬 counts).
+    pub(crate) comment_counts: HashMap<String, usize>,
+    /// The integration's bot user id, once known: its comments are the
+    /// editable ones.
+    pub(crate) me: Option<String>,
+    pub(crate) me_asked: bool,
     pub(crate) switcher: Option<Switcher>,
     pub(crate) last_auto: Option<Instant>,
     /// The command in flight is an auto-pull.
@@ -354,6 +373,10 @@ impl App {
             problem_ids: HashSet::new(),
             problems: Vec::new(),
             problems_open: false,
+            comments: None,
+            comment_counts: HashMap::new(),
+            me: None,
+            me_asked: false,
             switcher: None,
             last_auto: None,
             auto_pulling: false,
@@ -540,6 +563,12 @@ impl App {
             }
             Action::OpenProblem(op) => self.open_problem(op),
             Action::Discard(op) => self.discard(op),
+            Action::OpenComments(block) => self.open_comments(Some(block)),
+            Action::CloseComments => self.close_comments(false),
+            Action::CommentSend(target, text) => self.send_comment(target, text),
+            Action::CommentSave(id, text) => self.save_comment(id, text),
+            Action::CommentDelete(id) => self.delete_comment(id),
+            Action::CommentsBack => self.comments_back(),
         }
     }
 
@@ -602,7 +631,13 @@ impl App {
             None
         };
         let mut act = None;
-        ui.horizontal_top(|ui| {
+        let comments = self.comment_counts.get(&self.rows[idx].block_id).copied().unwrap_or(0);
+        // room for the 💬 count at the right
+        let full = ui.available_width();
+        let row = ui.horizontal_top(|ui| {
+            if comments > 0 {
+                ui.set_max_width(full - 52.0);
+            }
             let (gutter, _) = ui.allocate_exact_size(egui::vec2(12.0, 20.0), Sense::hover());
             if let Some(col) = dot {
                 ui.painter().circle_filled(gutter.center(), 3.0, col);
@@ -733,6 +768,14 @@ impl App {
                 _ => body(self, ui),
             }
         });
+        if comments > 0 {
+            let mut r = row.response.rect;
+            r.set_right(ui.max_rect().right());
+            let id = Id::unique(("comments-badge", self.rows[idx].block_id.as_str()));
+            if crate::comments::badge(ui, c, r, id, comments) {
+                act = Some(Action::OpenComments(self.rows[idx].block_id.clone()));
+            }
+        }
         act.into_iter().collect()
     }
 

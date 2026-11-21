@@ -19,10 +19,65 @@ pub struct Problem {
     pub error: String,
     /// A create's unpushed `local-*` block.
     local: Option<String>,
+    /// A comment create's unpushed `local-*` comment.
+    local_comment: Option<String>,
+}
+
+/// A comment op's entry: its comment's text, shown on the commented block
+/// or page (the comment's parent, also for an edit or delete).
+fn comment_problem(store: &Store, op: &Op) -> notion_core::Result<Option<Problem>> {
+    let (kind, comment) = match &op.kind {
+        OpKind::CreateComment { local_id, .. } => ("comment", store.get_comment(local_id)?),
+        OpKind::UpdateComment { comment_id, .. } => {
+            ("edit comment", store.get_comment(&store.resolve_id(comment_id)?)?)
+        }
+        OpKind::DeleteComment { comment_id } => (
+            "delete comment",
+            // gone from the cache: its base snapshot remains
+            op.base_raw
+                .clone()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .or(store.get_comment(&store.resolve_id(comment_id)?)?),
+        ),
+        _ => return Ok(None),
+    };
+    // a create's target stands in for a comment that is gone from the cache
+    let parent = match (&comment, &op.kind) {
+        (Some(c), _) => c.parent.id().map(str::to_string),
+        (None, OpKind::CreateComment { parent, .. }) => Some(parent.id().to_string()),
+        _ => None,
+    };
+    let Some(parent) = parent else { return Ok(None) };
+    let parent = store.resolve_id(&parent)?;
+    let page = if store.get_page(&parent)?.is_some() {
+        Some(parent.clone())
+    } else {
+        store.block_page(&parent)?
+    };
+    let label = comment
+        .map(|c| plain_text(&c.rich_text))
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| parent.clone());
+    Ok(Some(Problem {
+        op: op.id,
+        kind,
+        block: parent,
+        page,
+        label: label.chars().take(60).collect(),
+        error: op.error.clone().unwrap_or_default(),
+        local: None,
+        local_comment: match &op.kind {
+            OpKind::CreateComment { local_id, .. } => Some(local_id.clone()),
+            _ => None,
+        },
+    }))
 }
 
 /// A conflict/failed op's list entry: what it is, where, and why.
 pub fn problem(store: &Store, op: &Op) -> notion_core::Result<Problem> {
+    if let Some(p) = comment_problem(store, op)? {
+        return Ok(p);
+    }
     let target = store.resolve_id(op.kind.target_id())?;
     let (kind, local) = match &op.kind {
         OpKind::CreateBlock { block, .. } => {
@@ -32,6 +87,10 @@ pub fn problem(store: &Store, op: &Op) -> notion_core::Result<Problem> {
         OpKind::DeleteBlock { .. } => ("delete", None),
         OpKind::MoveBlock { .. } => ("move", None),
         OpKind::UpdatePageProperties { .. } => ("title", None),
+        // only reached when the comment's parent is unknown (comment_problem)
+        OpKind::CreateComment { .. } => ("comment", None),
+        OpKind::UpdateComment { .. } => ("edit comment", None),
+        OpKind::DeleteComment { .. } => ("delete comment", None),
     };
     let shown = match &local {
         Some(l) if store.get_block(l)?.is_some() => l.clone(),
@@ -73,6 +132,7 @@ pub fn problem(store: &Store, op: &Op) -> notion_core::Result<Problem> {
         label: text.chars().take(60).collect(),
         error: op.error.clone().unwrap_or_default(),
         local,
+        local_comment: None,
     })
 }
 
@@ -80,6 +140,10 @@ pub fn problem(store: &Store, op: &Op) -> notion_core::Result<Problem> {
 /// on it. The caller re-pulls the page: the remote version wins.
 pub fn discard(store: &Store, p: &Problem) -> notion_core::Result<()> {
     store.complete_op(p.op)?;
+    // a never-created comment must not linger in the cache (pulls keep `local-*` ones)
+    if let Some(c) = &p.local_comment {
+        store.delete_comment(c)?;
+    }
     let Some(l) = p.local.as_deref().filter(|l| l.starts_with("local-")) else {
         return Ok(());
     };

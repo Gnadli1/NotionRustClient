@@ -6,6 +6,7 @@
 //! key/text/IME events to stderr.
 
 mod app;
+mod comments;
 #[allow(dead_code)]
 mod edit;
 mod editing;

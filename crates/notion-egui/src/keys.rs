@@ -211,6 +211,8 @@ pub enum Command {
     PrevTab,
     Undo,
     Redo,
+    /// Ctrl+Shift+M: the comments panel.
+    Comments,
     /// Ctrl+/: the "Turn into" menu for the edited row.
     TurnInto,
 }
@@ -231,6 +233,7 @@ impl Command {
                 | Command::PrevTab
                 | Command::Undo
                 | Command::Redo
+                | Command::Comments
         )
     }
 }
@@ -270,6 +273,7 @@ const NAMES: &[(&str, Command)] = &[
     ("prev_tab", Command::PrevTab),
     ("undo", Command::Undo),
     ("redo", Command::Redo),
+    ("comments", Command::Comments),
     ("turn_into", Command::TurnInto),
 ];
 
@@ -308,6 +312,7 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("ctrl+shift+tab", "prev_tab"),
     ("ctrl+z", "undo"),
     ("ctrl+shift+z", "redo"),
+    ("ctrl+shift+m", "comments"),
     // On German/Austrian layouts `/` is Shift+7, i.e. Ctrl+Shift+7 = toggle:
     // rebind turn_into there
     ("ctrl+/", "turn_into"),

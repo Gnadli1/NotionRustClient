@@ -33,6 +33,7 @@ serde_via_value!(
     Block,
     Parent,
     Page,
+    Comment,
     PropertyValue,
     DataSource,
     SearchResult
@@ -613,6 +614,66 @@ impl Block {
             }
         };
         write_common(&mut out, self.in_trash, self.last_edited_time);
+        out
+    }
+}
+
+// ---------------------------------------------------------------- comments
+
+/// A comment (one message of a discussion thread). `parent` is the page or
+/// block the thread hangs off; replies share their thread's parent.
+///
+/// Serialize emits `raw` with `rich_text` and `last_edited_time` written back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comment {
+    pub id: String,
+    pub discussion_id: String,
+    pub parent: Parent,
+    pub created_time: DateTime<Utc>,
+    pub last_edited_time: DateTime<Utc>,
+    /// User id of the author (the integration's bot user for comments made here).
+    pub created_by: String,
+    pub rich_text: Vec<RichText>,
+    pub raw: Value,
+}
+
+impl Comment {
+    fn from_value(v: Value) -> Result<Self> {
+        let parent = Parent::from_value(v.get("parent").cloned().unwrap_or(Value::Null))?;
+        if !matches!(parent, Parent::Page(_) | Parent::Block(_)) {
+            return Err(Error::Invalid("comment parent is not a page or block".into()));
+        }
+        // lenient: a rich text item of an unknown type is skipped, not fatal
+        let rich_text = v["rich_text"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|r| RichText::from_value(r.clone()).ok()).collect())
+            .unwrap_or_default();
+        Ok(Comment {
+            id: str_field(&v, "id")?,
+            discussion_id: str_field(&v, "discussion_id")?,
+            parent,
+            created_time: time_field(&v, "created_time")?,
+            last_edited_time: time_field(&v, "last_edited_time")?,
+            created_by: v["created_by"]["id"].as_str().unwrap_or_default().to_string(),
+            rich_text,
+            raw: v,
+        })
+    }
+
+    /// The comment if `v` is a full comment object; None for the partial
+    /// `{object, id}` Notion returns to an integration without read access.
+    pub fn from_value_lenient(v: Value) -> Option<Self> {
+        Self::from_value(v).ok()
+    }
+
+    fn to_json(&self) -> Value {
+        let mut out = self.raw.clone();
+        if !out.is_object() {
+            out = json!({});
+        }
+        out["rich_text"] = json!(self.rich_text);
+        out["last_edited_time"] =
+            json!(self.last_edited_time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
         out
     }
 }

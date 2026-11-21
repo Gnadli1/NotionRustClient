@@ -48,6 +48,7 @@ impl App {
         if let Err(e) = self.load_page().and_then(|()| self.load_ops()) {
             self.last_error = Some(e.to_string());
         }
+        self.load_comments();
         // a push may have renamed the edited local-* block
         if let Some(f) = &mut self.focus {
             match self.store.resolve_id(&f.block_id) {
@@ -256,16 +257,15 @@ impl App {
     // ------------------------------------------------------------- sync
 
     pub(crate) fn send(&mut self, cmd: Cmd) {
-        let push = cmd == Cmd::Push;
-        match self.cmds.as_ref().map(|c| c.send(cmd)) {
-            Some(Ok(())) => self.sent.push_back(push),
+        match self.cmds.as_ref().map(|c| c.send(cmd.clone())) {
+            Some(Ok(())) => self.sent.push_back(cmd),
             _ => self.last_error = Some("sync worker stopped".into()),
         }
     }
 
     /// A push is queued or running: editing is paused.
     pub(crate) fn pushing(&self) -> bool {
-        self.sent.contains(&true)
+        self.sent.contains(&Cmd::Push)
     }
 
     /// Nothing is being edited, searched or sent, and a page is open.
@@ -316,7 +316,8 @@ impl App {
     pub(crate) fn on_event(&mut self, ev: Event) {
         // pushed ops can't be undone, nor edits a pull rewrote under them
         let pulled = matches!(&ev, Event::Pulled { report, .. } if !report.skipped);
-        if self.sent.pop_front() == Some(true) || pulled {
+        let answered = self.sent.pop_front();
+        if answered == Some(Cmd::Push) || pulled {
             self.undo.clear();
             self.redo.clear();
         }
@@ -360,13 +361,18 @@ impl App {
                     self.send(Cmd::Pull { id, force: true });
                 }
             }
+            Event::CommentsPulled => self.refresh(),
+            Event::Me(id) => self.me = Some(id),
             Event::SearchResults(r) => {
                 if let Some(sw) = &mut self.switcher {
                     sw.results = r;
                 }
             }
             Event::Error(e) => {
-                self.pending_open = None;
+                // a failed comment fetch says nothing about the page being opened
+                if !matches!(answered, Some(Cmd::PullComments { .. } | Cmd::Me)) {
+                    self.pending_open = None;
+                }
                 // a push can fail after applying some ops
                 self.refresh();
                 self.info = None;
@@ -685,6 +691,7 @@ impl App {
             Command::CloseTab => self.close_tab(self.active),
             Command::Undo => self.undo_redo(true),
             Command::Redo => self.undo_redo(false),
+            Command::Comments => self.toggle_comments(),
             _ => {}
         }
     }
@@ -791,6 +798,18 @@ impl App {
                     .show(ui, |ui| {
                         view::sidebar::show(ui, c, &self.tree, &self.tree_open, self.current.as_deref())
                     })
+                    .inner,
+            );
+        }
+        self.comments_follow_focus();
+        if self.comments.is_some() {
+            let side = Frame::new().fill(c.sidebar).inner_margin(Margin::same(8));
+            acts.extend(
+                egui::Panel::right("comments")
+                    .frame(side)
+                    .size_range(260.0..=520.0)
+                    .default_size(340.0)
+                    .show(ui, |ui| self.comments_ui(ui, c))
                     .inner,
             );
         }
@@ -926,7 +945,7 @@ mod tests {
         w.app.auto_pull_at(later, true);
         assert!(w.cmds().is_empty(), "editing");
         w.app.commit();
-        w.app.sent.push_back(false);
+        w.app.sent.push_back(Cmd::Search(String::new()));
         w.app.auto_pull_at(later, true);
         assert!(w.cmds().is_empty(), "in flight");
         w.app.sent.clear();
@@ -1010,7 +1029,7 @@ mod tests {
         let mut all = vec![old[0].clone(), new];
         all.push(old[1].clone());
         store.replace_children("p", "p", &all).unwrap();
-        w.app.sent.push_back(false);
+        w.app.sent.push_back(Cmd::Search(String::new()));
         w.answer(Event::Pulled {
             id: "p".into(),
             report: PullReport::default(),
@@ -1023,7 +1042,7 @@ mod tests {
         assert_eq!(w.text(), "b!?");
         // a pull that drops the block ends the edit with a message
         store_drop(&mut w, "p-1");
-        w.app.sent.push_back(false);
+        w.app.sent.push_back(Cmd::Search(String::new()));
         w.answer(Event::Pulled {
             id: "p".into(),
             report: PullReport::default(),
@@ -1087,7 +1106,7 @@ mod tests {
     #[test]
     fn editing_is_paused_while_a_push_runs() {
         let mut w = Win::with_texts(&["a"]);
-        w.app.sent.push_back(true);
+        w.app.sent.push_back(Cmd::Push);
         w.app.apply(Action::Edit(0, Grab::End));
         assert!(w.app.focus.is_none());
     }
@@ -1152,7 +1171,7 @@ mod tests {
         let bad = sync::local_edit_text(&w.app.store, "p-1", "q").unwrap();
         w.app.store.mark_op(bad, OpStatus::Failed, Some("400")).unwrap();
         w.app.refresh();
-        w.app.sent.push_back(true);
+        w.app.sent.push_back(Cmd::Push);
         w.app.apply(Action::Discard(bad));
         assert_eq!(w.app.problems.len(), 1);
     }
@@ -1624,7 +1643,7 @@ mod tests {
         w.app.store.replace_children("p", "p", &[todo]).unwrap();
         w.app.refresh();
         assert_eq!(w.app.rows[0].marker, crate::outline::Marker::Todo(false));
-        w.app.sent.push_back(true);
+        w.app.sent.push_back(Cmd::Push);
         w.app.apply(Action::Check(0));
         assert_eq!(w.queued(), 0, "not while a push runs");
         w.app.sent.clear();
@@ -1663,5 +1682,21 @@ mod tests {
         join_within(h, Duration::from_millis(100));
         assert!(t.elapsed() < Duration::from_secs(2));
         drop(tx);
+    }
+
+    #[test]
+    fn failed_comment_fetch_keeps_the_pending_page_open() {
+        let mut w = Win::with_texts(&["a"]);
+        w.app.pending_open = Some("remote".into());
+        for cmd in [Cmd::PullComments { id: "p".into() }, Cmd::Me] {
+            w.app.sent.push_back(cmd);
+            w.answer(Event::Error("403".into()));
+            assert_eq!(w.app.pending_open.as_deref(), Some("remote"));
+        }
+        assert_eq!(w.app.last_error.as_deref(), Some("403"), "still shown");
+        // the page's own pull failing cancels the open
+        w.app.sent.push_back(Cmd::Pull { id: "remote".into(), force: false });
+        w.answer(Event::Error("404".into()));
+        assert_eq!(w.app.pending_open, None);
     }
 }
