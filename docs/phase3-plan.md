@@ -104,3 +104,11 @@ I pulled all 164 pages shared with the integration into the cache. One failed wi
 3. **People properties** in databases arrive with F4.
 4. **"Edited by" is Notion's last value.** It doesn't change after your local edits until the next pull.
 5. **No `@` menu in the comment box.** Mentions in comments are plain text for now.
+
+## Known gaps after C3 (reviewed, deferred)
+1. **One op per poll flush.** While typing, each 15 s poll writes the edit as its own queued UpdateBlock, so a push sends a few PATCHes for one block. Undo stays one step.
+2. **Typing during a poll's round trip.** If you start typing in a block while a poll is in flight and that same block was edited in Notion, your push can overwrite it. The status bar warns ("this block was edited in Notion meanwhile").
+3. **Same-minute edits.** On a recently edited page, a remote edit in the same minute can take up to ~60 s to show (one full pull per minute per page).
+4. **Undo tail.** Ctrl+Z after a poll flush first undoes the typing since that flush, then the earlier part.
+5. **Highlight** ignores remote deletions and reordering; the tint colour is untuned.
+6. **Pushes wait behind a running poll** (the worker is serial).
