@@ -26,6 +26,10 @@ use crate::{sidebar, theme};
 const AUTO_PULL_GAP: Duration = Duration::from_secs(30);
 /// The auto-pull timer.
 pub const AUTO_PULL_EVERY: Duration = Duration::from_secs(300);
+/// The workspace's users are pulled again this often (they rarely change).
+pub const USERS_EVERY: Duration = Duration::from_secs(3600);
+/// The least time between on-demand user pulls (`@` menu, switcher).
+const USERS_MIN: Duration = Duration::from_secs(60);
 /// Next to notion-gui's `session.json`, which it must not clobber.
 /// How long closing waits for the worker (a stalled request has no timeout).
 const WORKER_JOIN: Duration = Duration::from_secs(10);
@@ -49,6 +53,7 @@ impl App {
             self.last_error = Some(e.to_string());
         }
         self.load_comments();
+        self.load_users();
         // a push may have renamed the edited local-* block
         if let Some(f) = &mut self.focus {
             match self.store.resolve_id(&f.block_id) {
@@ -100,10 +105,18 @@ impl App {
             // an empty tab
             self.title.clear();
             self.title_editable = false;
+            self.page_edit = None;
+            self.page_head = None;
+            self.block_edits.clear();
             self.rows.clear();
             return Ok(());
         };
         let page = self.store.get_page(id)?;
+        self.page_edit = page
+            .as_ref()
+            .map(|p| (p.last_edited_by().map(str::to_string), p.last_edited_time.timestamp()));
+        self.page_head = None;
+        self.block_edits = self.store.block_edits(id)?;
         self.title = page
             .as_ref()
             .map_or_else(|| "(not cached)".into(), |p| p.title());
@@ -268,6 +281,49 @@ impl App {
         self.sent.contains(&Cmd::Push)
     }
 
+    /// Reloads the cached workspace users (names, mentions, avatars).
+    pub(crate) fn load_users(&mut self) {
+        match self.store.users() {
+            Ok(u) => {
+                self.users = u;
+                self.page_head = None;
+            }
+            Err(e) => self.last_error = Some(e.to_string()),
+        }
+    }
+
+    /// Asks the worker for the workspace's users and starts the hour.
+    pub(crate) fn request_users(&mut self) {
+        self.users_at = Some(Instant::now());
+        self.send(Cmd::PullUsers);
+    }
+
+    /// The `@` menu and the switcher need names: pulls them when no user with
+    /// a name is cached (inline id-only ones don't count) and the last pull
+    /// is a minute old, unless one is already out or users are off (403, no
+    /// token).
+    pub(crate) fn ensure_users(&mut self) {
+        let settled = self.users_at.is_none_or(|t| t.elapsed() >= USERS_MIN);
+        if !self.users.iter().any(|u| !u.name.is_empty())
+            && settled
+            && !self.users_stop
+            && !self.worker_gone
+            && !self.sent.contains(&Cmd::PullUsers)
+        {
+            self.request_users();
+        }
+    }
+
+    /// The startup pull (`users_at` is None) and the hourly refresh, only
+    /// when nothing else is in flight: never ahead of the restore page pull.
+    pub(crate) fn users_tick(&mut self, now: Instant) {
+        let due = self.users_at.is_none_or(|t| now.saturating_duration_since(t) >= USERS_EVERY);
+        if due && !self.users_stop && !self.worker_gone && self.sent.is_empty() {
+            self.users_at = Some(now);
+            self.send(Cmd::PullUsers);
+        }
+    }
+
     /// Nothing is being edited, searched or sent, and a page is open.
     pub(crate) fn idle(&self) -> bool {
         self.current.is_some()
@@ -361,8 +417,24 @@ impl App {
                     self.send(Cmd::Pull { id, force: true });
                 }
             }
-            Event::CommentsPulled => self.refresh(),
+            Event::CommentsPulled | Event::UsersPulled => self.refresh(),
             Event::Me(id) => self.me = Some(id),
+            Event::UsersDenied => {
+                // said once: users_stop keeps every later trigger quiet
+                self.users_stop = true;
+                self.users_note = Some(
+                    "Can't read workspace users (403): turn on \"Read user information\" for the integration. Names show as ids."
+                        .into(),
+                );
+            }
+            // no token: nothing to say (the first real command will); else retry in an hour
+            Event::Error(e) if answered == Some(Cmd::PullUsers) => {
+                if e.starts_with("offline") {
+                    self.users_stop = true;
+                } else {
+                    self.last_error = Some(format!("users not loaded: {e}"));
+                }
+            }
             Event::SearchResults(r) => {
                 if let Some(sw) = &mut self.switcher {
                     sw.results = r;
@@ -423,6 +495,7 @@ impl App {
     pub(crate) fn open_switcher(&mut self) {
         if self.commit() {
             self.switcher = Some(Switcher::default());
+            self.ensure_users();
         }
     }
 
@@ -748,6 +821,7 @@ impl App {
         self.was_focused = focused;
         let now = Instant::now();
         self.auto_pull_at(now, gained);
+        self.users_tick(now);
         ctx.request_repaint_after(self.next_tick.saturating_duration_since(now));
         let title = self.window_title();
         if title != self.shown_title {
@@ -774,7 +848,7 @@ impl App {
                 (false, false) => Some("syncing…"),
                 (false, true) => None,
             },
-            error: self.last_error.as_deref(),
+            error: self.last_error.as_deref().or(self.users_note.as_deref()),
             info: self.info.as_deref(),
             problems_open: self.problems_open,
             has_problems: !self.problems.is_empty(),
@@ -1378,7 +1452,7 @@ mod tests {
         assert_eq!(w.app.current.as_deref(), Some("b"));
         assert_eq!(w.app.tabs.len(), 1);
         assert_eq!(w.app.recent[0], "b");
-        assert!(w.cmds().is_empty(), "cached: no pull");
+        assert_eq!(w.cmds(), [Cmd::PullUsers], "cached: no page pull; the empty user cache is asked once");
         // the search went out after the debounce
         // (a fresh switcher: type, wait, see the command)
         w.press(Key::K, Modifiers::CTRL);
@@ -1682,6 +1756,118 @@ mod tests {
         join_within(h, Duration::from_millis(100));
         assert!(t.elapsed() < Duration::from_secs(2));
         drop(tx);
+    }
+
+    // ------------------------------------------------------------ users
+
+    #[test]
+    fn users_are_pulled_once_at_startup_then_at_most_hourly() {
+        let mut w = Win::with_texts(&["a"]);
+        w.app.users_at = None;
+        w.app.users_tick(Instant::now());
+        assert_eq!(w.cmds(), [Cmd::PullUsers], "the startup pull comes from the tick");
+        let asked = w.app.users_at.unwrap();
+        w.answer(Event::UsersPulled);
+        w.app.users_tick(asked + USERS_EVERY - Duration::from_secs(1));
+        assert!(w.cmds().is_empty(), "not within the hour");
+        w.app.sent.push_back(Cmd::Push);
+        w.app.users_tick(asked + USERS_EVERY);
+        assert!(w.cmds().is_empty(), "not while something else is in flight");
+        w.app.sent.clear();
+        w.app.users_tick(asked + USERS_EVERY);
+        assert_eq!(w.cmds(), [Cmd::PullUsers]);
+        w.app.users_tick(asked + USERS_EVERY + Duration::from_secs(5));
+        assert!(w.cmds().is_empty(), "the hour restarts at each pull");
+        // frames never ask on their own
+        for _ in 0..5 {
+            w.frames(vec![]);
+        }
+        assert!(w.cmds().is_empty());
+    }
+
+    #[test]
+    fn the_startup_users_pull_never_queues_ahead_of_other_work() {
+        let mut w = Win::with_texts(&["a"]);
+        w.app.users_at = None;
+        // the restore page pull is out: the users wait for it
+        w.app.send(Cmd::Pull { id: "p".into(), force: false });
+        for _ in 0..3 {
+            w.frames(vec![]);
+        }
+        assert_eq!(w.cmds(), [Cmd::Pull { id: "p".into(), force: false }]);
+        assert_eq!(w.app.users_at, None);
+        // answered: the next frame asks, once
+        w.answer(Event::Pulled { id: "p".into(), report: PullReport::default() });
+        w.frames(vec![]);
+        assert_eq!(w.cmds(), [Cmd::PullUsers]);
+        assert!(w.app.users_at.is_some());
+        w.frames(vec![]);
+        assert!(w.cmds().is_empty());
+    }
+
+    #[test]
+    fn a_403_on_users_is_said_once_and_never_repeated() {
+        let mut w = Win::with_texts(&["a"]);
+        w.app.pending_open = Some("remote".into());
+        w.app.request_users();
+        w.cmds();
+        w.answer(Event::UsersDenied);
+        let msg = w.app.users_note.clone().expect("a message");
+        assert!(msg.contains("403") && msg.contains("Read user information"), "{msg}");
+        assert_eq!(w.app.pending_open.as_deref(), Some("remote"), "unrelated to the page being opened");
+        // neither the hourly tick, nor the @ menu, nor the switcher, nor a frame asks again
+        w.app.users_tick(Instant::now() + USERS_EVERY * 5);
+        w.app.ensure_users();
+        w.press(Key::K, Modifiers::CTRL);
+        for _ in 0..5 {
+            w.frames(vec![]);
+        }
+        assert!(w.cmds().is_empty(), "no repeat");
+        assert_eq!(w.app.last_error, None, "and no second message");
+        // a later pull's event doesn't wipe it, and the status bar still shows it
+        w.app.sent.push_back(Cmd::Pull { id: "p".into(), force: false });
+        w.answer(Event::Pulled { id: "p".into(), report: PullReport::default() });
+        assert!(w.app.users_note.is_some());
+        w.frames(vec![]);
+        assert!(w.shown.contains("Read user information"), "{}", w.shown);
+    }
+
+    #[test]
+    fn other_user_pull_errors_are_shown_and_retried_hourly_but_no_token_is_silent() {
+        let mut w = Win::with_texts(&["a"]);
+        w.app.pending_open = Some("remote".into());
+        w.app.request_users();
+        w.answer(Event::Error("http: timeout".into()));
+        assert_eq!(w.app.last_error.as_deref(), Some("users not loaded: http: timeout"));
+        assert!(!w.app.users_stop);
+        assert_eq!(w.app.pending_open.as_deref(), Some("remote"));
+        w.cmds();
+        w.app.users_tick(w.app.users_at.unwrap() + USERS_EVERY);
+        assert_eq!(w.cmds(), [Cmd::PullUsers]);
+
+        let mut w = Win::with_texts(&["a"]);
+        w.app.request_users();
+        w.answer(Event::Error("offline: NOTION_TOKEN not set".into()));
+        assert_eq!(w.app.last_error, None, "no token: no banner at startup");
+        assert!(w.app.users_stop);
+    }
+
+    #[test]
+    fn pulled_users_and_inline_ones_reach_the_app() {
+        let mut w = Win::with_texts(&["a"]);
+        assert!(w.app.users.is_empty());
+        let u = |id: &str, name: &str| {
+            notion_core::model::User::from_value(&serde_json::json!({ "object": "user", "id": id, "type": "person", "name": name })).unwrap()
+        };
+        w.app.store.put_users(&[u("u1", "Ada")]).unwrap();
+        w.app.sent.push_back(Cmd::PullUsers);
+        w.answer(Event::UsersPulled);
+        assert_eq!(w.app.users.len(), 1);
+        // a page pull brings inline users along
+        w.app.store.put_users(&[u("u2", "Bo")]).unwrap();
+        w.app.sent.push_back(Cmd::PullComments { id: "p".into() });
+        w.answer(Event::CommentsPulled);
+        assert_eq!(w.app.users.len(), 2);
     }
 
     #[test]

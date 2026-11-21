@@ -14,7 +14,7 @@ use eframe::egui::{
     Color32, Frame, Galley, Id, Key, Label, Margin, Modifiers, RichText, Sense, TextBuffer, Ui,
 };
 use notion_core::markdown::{from_markdown, to_markdown};
-use notion_core::model::{plain_text, BlockKind, TargetKind, TextBlock};
+use notion_core::model::{plain_text, BlockKind, TargetKind, TextBlock, User};
 use notion_core::ops::CommentTarget;
 use notion_core::sync::{self, ChangeOutcome};
 use notion_core::store::{PageEntry, Store};
@@ -169,6 +169,9 @@ pub(crate) enum Action {
 /// Opens a web link outside the app (injectable for tests).
 pub(crate) type Opener = Box<dyn Fn(&str) -> Result<(), String>>;
 
+/// ((editor id, name), "Edited by X · 5 min ago") of the page header.
+pub(crate) type PageHead = (Option<(String, String)>, String);
+
 pub struct App {
     pub(crate) store: Store,
     /// None once the worker is shut down.
@@ -237,6 +240,24 @@ pub struct App {
     /// editable ones.
     pub(crate) me: Option<String>,
     pub(crate) me_asked: bool,
+    /// The cached workspace users (by name), reloaded by `refresh`.
+    pub(crate) users: Vec<User>,
+    /// When the users were last asked for; None until the first pull is sent
+    /// (by [`App::users_tick`] once nothing else is in flight).
+    pub(crate) users_at: Option<Instant>,
+    /// No more user pulls this session: a 403 (no "read user information"
+    /// capability) or no token.
+    pub(crate) users_stop: bool,
+    /// The open page's last editor (user id) and edit time (unix seconds).
+    pub(crate) page_edit: Option<(Option<String>, i64)>,
+    /// The page header's editor line, built at most once a minute:
+    /// (now / 60, ((editor id, name), text)).
+    pub(crate) page_head: Option<(i64, Option<PageHead>)>,
+    /// The open page's blocks: (last editor id, edit time) by block id,
+    /// loaded with the page so a hover costs no query.
+    pub(crate) block_edits: std::collections::HashMap<String, (Option<String>, i64)>,
+    /// A standing note from the users pull (the 403); outlives other pulls.
+    pub(crate) users_note: Option<String>,
     pub(crate) switcher: Option<Switcher>,
     pub(crate) last_auto: Option<Instant>,
     /// The command in flight is an auto-pull.
@@ -377,6 +398,13 @@ impl App {
             comment_counts: HashMap::new(),
             me: None,
             me_asked: false,
+            users: Vec::new(),
+            users_at: None,
+            users_stop: false,
+            page_edit: None,
+            page_head: None,
+            block_edits: Default::default(),
+            users_note: None,
             switcher: None,
             last_auto: None,
             auto_pulling: false,
@@ -578,6 +606,7 @@ impl App {
         // owned: the rows below borrow `self` mutably
         let crumbs = self.breadcrumb();
         let title = crate::view::untitled(&self.title).to_string();
+        let edited = self.page_edited(crate::comments::now_secs());
         let mut area = egui::ScrollArea::vertical()
             .id_salt("page")
             .auto_shrink(false);
@@ -595,6 +624,15 @@ impl App {
                     acts.extend(crate::view::breadcrumb(ui, c, &crumbs, &title));
                     ui.add_space(8.0);
                     acts.extend(self.title_ui(ui, &title));
+                    if let Some((who, text)) = &edited {
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            if let Some((id, name)) = who {
+                                crate::people::avatar(ui, id, name, 16.0);
+                            }
+                            ui.label(RichText::new(text).size(12.0).color(c.secondary));
+                        });
+                    }
                     ui.add_space(12.0);
                     for idx in 0..self.rows.len() {
                         if self.shown[idx] {
@@ -768,6 +806,7 @@ impl App {
                 _ => body(self, ui),
             }
         });
+        self.edited_hover(ui, idx, row.response.rect);
         if comments > 0 {
             let mut r = row.response.rect;
             r.set_right(ui.max_rect().right());
@@ -779,6 +818,46 @@ impl App {
         act.into_iter().collect()
     }
 
+    /// The page header's editor line, owned: ((editor id, name), "Edited by X · 5 min ago").
+    /// Built once a minute (and again when the page or the users change).
+    pub(crate) fn page_edited(&mut self, now: i64) -> Option<PageHead> {
+        if self.page_head.as_ref().is_none_or(|(m, _)| *m != now / 60) {
+            let head = self.page_edit.as_ref().map(|(id, then)| {
+                let who = id.as_ref().map(|i| (i.clone(), crate::people::name_of(&self.users, i)));
+                let text = crate::people::edited_header(who.as_ref().map(|w| w.1.as_str()), *then, now);
+                (who, text)
+            });
+            self.page_head = Some((now / 60, head));
+        }
+        self.page_head.as_ref().and_then(|(_, h)| h.clone())
+    }
+
+    /// "Edited by X, 5 min ago" for a cached block (None for an unpushed one).
+    pub(crate) fn block_edited_tip(&self, block_id: &str, now: i64) -> Option<String> {
+        if block_id.starts_with("local-") {
+            return None;
+        }
+        let (by, then) = self.block_edits.get(block_id)?;
+        let who = by.as_deref().map(|u| crate::people::name_of(&self.users, u));
+        Some(crate::people::edited_tip(who.as_deref(), *then, now))
+    }
+
+    /// A tooltip over the row's full width saying who edited the block last.
+    /// Not on the row being edited.
+    fn edited_hover(&self, ui: &Ui, idx: usize, mut rect: egui::Rect) {
+        let id = &self.rows[idx].block_id;
+        rect.set_right(ui.max_rect().right());
+        if !ui.rect_contains_pointer(rect) {
+            return;
+        }
+        let hover = ui.interact(rect, Id::unique(("row-edited", id.as_str())), Sense::hover());
+        if hover.hovered() && self.focus.as_ref().is_none_or(|f| f.idx != idx) {
+            if let Some(t) = self.block_edited_tip(id, crate::comments::now_secs()) {
+                hover.on_hover_text(t);
+            }
+        }
+    }
+
     /// A table: a cell is edited in place on a click, unless the table is
     /// locked (synced) or the cell is read-only (a mention).
     fn table_ui(&mut self, ui: &mut Ui, idx: usize) -> Vec<Action> {
@@ -787,7 +866,7 @@ impl App {
         };
         let (indent, locked) = (26.0 * self.rows[idx].depth as f32, self.rows[idx].locked);
         let mut acts = Vec::new();
-        ui.horizontal_top(|ui| {
+        let grid = ui.horizontal_top(|ui| {
             ui.add_space(indent);
             egui::Grid::new(("table", idx)).striped(true).show(ui, |ui| {
                 for (ri, r) in t.rows.iter().enumerate() {
@@ -800,10 +879,11 @@ impl App {
                             acts.extend(self.cell_edit(ui));
                             continue;
                         }
+                        let users = &self.users;
                         let job = self
                             .table_jobs
                             .entry((idx, ri, ci))
-                            .or_insert_with(|| md::rich_job(&c.rich_text, 15.0, false));
+                            .or_insert_with(|| md::rich_job(&c.rich_text, 15.0, false, users));
                         let mut l = Label::new(job.clone());
                         let click = !locked && c.editable;
                         if click {
@@ -818,6 +898,7 @@ impl App {
                 }
             });
         });
+        self.edited_hover(ui, idx, grid.response.rect);
         acts
     }
 
@@ -827,7 +908,7 @@ impl App {
         if self.focus.as_ref().is_some_and(|f| f.idx == idx) {
             return self.edit_body(ui, idx);
         }
-        let rows = &self.rows;
+        let (rows, users) = (&self.rows, &self.users);
         let job = self.jobs.entry(idx).or_insert_with(|| {
             let r = &rows[idx];
             let (size, bold) = look(&r.marker);
@@ -838,7 +919,7 @@ impl App {
                     Color32::PLACEHOLDER,
                     f32::INFINITY,
                 ),
-                _ => md::rich_job(&r.rich_text, size, bold),
+                _ => md::rich_job(&r.rich_text, size, bold, users),
             }
         });
         let linked = rows[idx].rich_text.iter().any(|r| links::run_link(r).is_some());
@@ -932,7 +1013,7 @@ impl App {
                 filtered = !typed.is_empty() || backspaces > 0;
             }
             let q = menu.query(&f.text, line, col).unwrap_or_default();
-            let src = Sources { tree: &self.tree, recent: &self.recent };
+            let src = Sources { tree: &self.tree, recent: &self.recent, users: &self.users };
             for (key, ek) in [
                 (Key::ArrowUp, EditKey::Up),
                 (Key::ArrowDown, EditKey::Down),
@@ -978,7 +1059,7 @@ impl App {
             act = self.editor_keys(&ctx, id).or(act);
         }
         let f = self.focus.as_mut()?;
-        let src = Sources { tree: &self.tree, recent: &self.recent };
+        let src = Sources { tree: &self.tree, recent: &self.recent, users: &self.users };
         let mut layouter = |ui: &Ui, text: &dyn TextBuffer, wrap: f32| {
             let mut job = md::md_job(text.as_str(), size, bold, dim);
             job.wrap.max_width = wrap;
@@ -1035,6 +1116,7 @@ impl App {
             }
         }
         let mut convert = None;
+        let mut want_users = false;
         let was_picked = picked.is_some();
         let pick_in = picked.and_then(|p| f.menu.take().map(|m| (p, m)));
         if let Some((pick, m)) = pick_in {
@@ -1080,6 +1162,7 @@ impl App {
             };
             if let Some((kind, len)) = open {
                 let days = if kind == Kind::Mention { menu::days(self.clock) } else { Default::default() };
+                want_users = kind == Kind::Mention;
                 f.menu = Some(Menu::new(kind, line, col - len, days));
             }
         }
@@ -1124,6 +1207,9 @@ impl App {
             let pos = out.galley_pos
                 + out.galley.pos_from_cursor(CCursor::new(at)).left_bottom().to_vec2();
             menu::show(&ctx, pos, m, &menu::entries(m, &q, src));
+        }
+        if want_users {
+            self.ensure_users();
         }
         act
     }
@@ -1300,6 +1386,100 @@ mod tests {
             assert_eq!(m["type"], "mention");
             assert_eq!(m["mention"], json!({ "type": "page", "page": { "id": "Alpha" } }));
             assert_eq!(m["plain_text"], "Alpha");
+        }
+
+        fn cache_users(w: &mut Win) {
+            let u = |id: &str, ty: &str, name: &str| {
+                notion_core::model::User::from_value(&json!({ "object": "user", "id": id, "type": ty, "name": name }))
+                    .unwrap()
+            };
+            w.app
+                .store
+                .put_users(&[u("b1", "bot", "Zapper"), u("u1", "person", "Zelda Fitz"), u("u2", "person", "Jürgen")])
+                .unwrap();
+            w.app.load_users();
+        }
+
+        #[test]
+        fn at_menu_picks_a_user_mention_with_the_keyboard_alone() {
+            let mut w = win_with_pages();
+            cache_users(&mut w);
+            w.edit(0);
+            w.send(Event::Text("@".into()));
+            w.send(Event::Text("za".into()));
+            assert_eq!(w.text(), "@za", "typing filters, the text stays");
+            w.send(key(Key::Enter));
+            assert_eq!(w.text(), "@[Zelda Fitz](user:u1)", "persons come before bots");
+            assert!(w.menu().is_none());
+            w.send(key(Key::Escape)); // commits the row
+            let body = queued_body(&w);
+            let m = &body["paragraph"]["rich_text"][0];
+            assert_eq!(m["mention"]["type"], "user");
+            assert_eq!(m["mention"]["user"]["id"], "u1");
+            assert_eq!(m["plain_text"], "Zelda Fitz");
+            assert!(w.cmds().is_empty(), "users are cached: nothing asked for");
+            // the row shows it as @Name
+            assert!(w.shown.contains("@Zelda Fitz"), "{}", w.shown);
+
+            // ↓ reaches the bot; umlauts fold
+            let mut w = win_with_pages();
+            cache_users(&mut w);
+            w.edit(0);
+            w.send(Event::Text("@".into()));
+            w.send(Event::Text("za".into()));
+            w.send(key(Key::ArrowDown));
+            w.send(key(Key::Enter));
+            assert_eq!(w.text(), "@[Zapper](user:b1)");
+            w.edit(1);
+            w.send(Event::Text(" @".into()));
+            w.send(Event::Text("juerg".into()));
+            w.send(key(Key::Enter));
+            assert_eq!(w.text(), "x @[Jürgen](user:u2)");
+        }
+
+        #[test]
+        fn at_menu_asks_for_users_once_when_none_are_cached() {
+            let mut w = win_with_pages();
+            w.edit(0);
+            w.send(Event::Text("@".into()));
+            assert_eq!(w.cmds(), [Cmd::PullUsers]);
+            w.send(key(Key::Escape));
+            w.edit(0);
+            w.send(Event::Text("@".into()));
+            assert!(w.cmds().is_empty(), "one is already out");
+            // answered with nothing found: asked again next time, unless users are off
+            w.app.sent.clear();
+            w.app.users_stop = true;
+            w.send(key(Key::Escape));
+            w.edit(0);
+            w.send(Event::Text("@".into()));
+            assert!(w.cmds().is_empty(), "off after a 403");
+        }
+
+        #[test]
+        fn on_demand_user_pulls_wait_a_minute_and_need_a_named_user() {
+            use std::time::{Duration, Instant};
+            let stub = notion_core::model::User::from_value(&json!({ "object": "user", "id": "u9" })).unwrap();
+            let mut w = win_with_pages();
+            // an inline id-only user doesn't make the cache "non-empty"
+            w.app.store.put_users(&[stub]).unwrap();
+            w.app.load_users();
+            assert_eq!(w.app.users.len(), 1);
+            w.app.users_at = Some(Instant::now());
+            w.app.ensure_users();
+            assert!(w.cmds().is_empty(), "pulled a moment ago");
+            w.app.users_at = Some(Instant::now() - Duration::from_secs(61));
+            w.app.ensure_users();
+            assert_eq!(w.cmds(), [Cmd::PullUsers]);
+            assert!(w.app.users_at.unwrap().elapsed() < Duration::from_secs(5));
+            w.app.sent.clear();
+            w.app.ensure_users();
+            assert!(w.cmds().is_empty(), "and not again at once");
+            // a named user: nothing to ask for, however old the last pull is
+            cache_users(&mut w);
+            w.app.users_at = Some(Instant::now() - Duration::from_secs(600));
+            w.app.ensure_users();
+            assert!(w.cmds().is_empty());
         }
 
         #[test]

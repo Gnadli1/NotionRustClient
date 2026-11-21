@@ -7,7 +7,7 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::model::{Block, Comment, DataSource, Page, Parent};
+use crate::model::{Block, Comment, DataSource, Page, Parent, User};
 use crate::{Error, Result};
 
 const SCHEMA: &str = "
@@ -35,6 +35,14 @@ CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, parent_id TEXT NOT NUL
 CREATE INDEX IF NOT EXISTS comments_parent ON comments(parent_id, created_time);
 CREATE INDEX IF NOT EXISTS comments_discussion ON comments(discussion_id);
 PRAGMA user_version = 2;
+";
+
+/// Schema v3: cached workspace users (same idempotent pattern as v2).
+/// `type` is '' for a user only known by id.
+const MIGRATE_3: &str = "
+CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, type TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '',
+  avatar_url TEXT, email TEXT, raw TEXT NOT NULL);
+PRAGMA user_version = 3;
 ";
 
 /// One sidebar entry: a page, cached or known only from a `child_page` block.
@@ -81,6 +89,9 @@ impl Store {
         }
         if version < 2 {
             conn.execute_batch(&format!("BEGIN; {MIGRATE_2} COMMIT;"))?;
+        }
+        if version < 3 {
+            conn.execute_batch(&format!("BEGIN; {MIGRATE_3} COMMIT;"))?;
         }
         Ok(Store { conn })
     }
@@ -463,6 +474,79 @@ impl Store {
         })
     }
 
+    /// Caches users. A user known only by id (no name and no type, as
+    /// `created_by` inlines are) never wipes what is already known: it adds the
+    /// row if new and changes nothing otherwise. A fuller user replaces the
+    /// row, but keeps an avatar or email it lacks.
+    pub fn put_users(&self, users: &[User]) -> Result<()> {
+        self.atomic(|| {
+            let mut st = self.conn.prepare(
+                "INSERT INTO users (id, type, name, avatar_url, email, raw) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                   type = COALESCE(NULLIF(excluded.type, ''), users.type),
+                   name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE users.name END,
+                   avatar_url = COALESCE(excluded.avatar_url, users.avatar_url),
+                   email = COALESCE(excluded.email, users.email),
+                   raw = excluded.raw
+                 WHERE excluded.name <> '' OR excluded.type <> ''",
+            )?;
+            for u in users {
+                st.execute(params![
+                    u.id,
+                    u.kind,
+                    u.name,
+                    u.avatar_url,
+                    u.email,
+                    serde_json::to_string(&u.raw)?
+                ])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Every cached user, by name. `raw` is left out (Null): a list is for
+    /// names and avatars; `user(id)` has the raw JSON.
+    pub fn users(&self) -> Result<Vec<User>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, type, name, avatar_url, email, 'null' FROM users ORDER BY name COLLATE NOCASE, id",
+        )?;
+        let rows = st.query_map([], user_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// (last editor's user id, last edit time in unix seconds) of every cached
+    /// block of `page_id`, by block id.
+    pub fn block_edits(
+        &self,
+        page_id: &str,
+    ) -> Result<std::collections::HashMap<String, (Option<String>, i64)>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, json_extract(raw, '$.last_edited_by.id'), last_edited_time FROM blocks WHERE page_id = ?1",
+        )?;
+        let rows = st.query_map([page_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, by, time) = row?;
+            if let Ok(t) = DateTime::parse_from_rfc3339(&time) {
+                out.insert(id, (by, t.timestamp()));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn user(&self, id: &str) -> Result<Option<User>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, type, name, avatar_url, email, raw FROM users WHERE id = ?1",
+                [id],
+                user_row,
+            )
+            .optional()?)
+    }
+
     pub fn upsert_data_source(&self, d: &DataSource) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO data_sources (id, database_id, title, last_edited_time, raw)
@@ -571,6 +655,18 @@ impl Store {
         let raws = st.query_map([arg], |r| r.get::<_, String>(0))?;
         raws.map(|s| Ok(serde_json::from_str(&s?)?)).collect()
     }
+}
+
+fn user_row(r: &rusqlite::Row) -> rusqlite::Result<User> {
+    let raw: String = r.get(5)?;
+    Ok(User {
+        id: r.get(0)?,
+        kind: r.get(1)?,
+        name: r.get(2)?,
+        avatar_url: r.get(3)?,
+        email: r.get(4)?,
+        raw: serde_json::from_str(&raw).unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -959,8 +1055,9 @@ mod tests {
     #[test]
     fn fresh_store_has_the_comments_table_and_indexes() {
         let s = Store::open_in_memory().unwrap();
-        assert_eq!(version(&s), 2);
+        assert_eq!(version(&s), 3);
         assert_eq!(tables(&s), ["comments", "comments_discussion", "comments_parent"]);
+        assert!(s.users().unwrap().is_empty(), "the users table exists");
     }
 
     #[test]
@@ -974,12 +1071,69 @@ mod tests {
             c.execute("INSERT INTO id_map VALUES ('l', 'r')", []).unwrap();
         }
         let s = Store::open(&path).unwrap();
-        assert_eq!(version(&s), 2);
+        assert_eq!(version(&s), 3);
         assert_eq!(s.resolve_id("l").unwrap(), "r");
         assert_eq!(tables(&s).len(), 3);
         drop(s);
         // reopening is a no-op
         let s = Store::open(&path).unwrap();
-        assert_eq!((version(&s), tables(&s).len()), (2, 3));
+        assert_eq!((version(&s), tables(&s).len()), (3, 3));
+    }
+
+    #[test]
+    fn existing_v2_store_gets_the_users_table_and_keeps_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        {
+            // a cache.db as the C1 release left it
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(&format!("BEGIN; {SCHEMA} {MIGRATE_2} COMMIT;")).unwrap();
+            c.execute("INSERT INTO id_map VALUES ('l', 'r')", []).unwrap();
+            c.execute(
+                "INSERT INTO comments VALUES ('c', 'p', 'd', 't', 't', 'u', '{}')",
+                [],
+            )
+            .unwrap();
+            assert_eq!(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(version(&s), 3);
+        assert_eq!(s.resolve_id("l").unwrap(), "r");
+        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM comments", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        s.put_users(&[user("u1", "Ada")]).unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!((version(&s), s.users().unwrap().len()), (3, 1), "reopening keeps it");
+    }
+
+    fn user(id: &str, name: &str) -> User {
+        let v = if name.is_empty() {
+            json!({ "object": "user", "id": id })
+        } else {
+            json!({ "object": "user", "id": id, "type": "person", "name": name,
+                   "avatar_url": "https://img/a.png", "person": { "email": "a@x.org" } })
+        };
+        User::from_value(&v).unwrap()
+    }
+
+    #[test]
+    fn id_only_users_never_wipe_a_known_one() {
+        let s = Store::open_in_memory().unwrap();
+        s.put_users(&[user("u1", "Ada"), user("u2", "bob")]).unwrap();
+        s.put_users(&[user("u1", ""), user("u3", "")]).unwrap();
+        let u1 = s.user("u1").unwrap().unwrap();
+        assert_eq!((u1.name.as_str(), u1.kind.as_str()), ("Ada", "person"));
+        assert_eq!(u1.email.as_deref(), Some("a@x.org"));
+        assert_eq!(u1.raw["name"], "Ada", "raw kept too");
+        // typed but nameless (null name) doesn't blank it either
+        s.put_users(&[User::from_value(&json!({ "object": "user", "id": "u1", "type": "person", "name": null })).unwrap()]).unwrap();
+        assert_eq!(s.user("u1").unwrap().unwrap().name, "Ada");
+        assert_eq!(s.user("u3").unwrap().unwrap().name, "", "a new id-only user is a row");
+        assert!(s.user("nope").unwrap().is_none());
+        // a named one replaces (rename), and the list is sorted by name, case-insensitively
+        s.put_users(&[user("u2", "Zed")]).unwrap();
+        let names: Vec<_> = s.users().unwrap().into_iter().map(|u| u.name).collect();
+        assert_eq!(names, ["", "Ada", "Zed"]);
     }
 }

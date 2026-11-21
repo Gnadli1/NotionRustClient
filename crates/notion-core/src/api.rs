@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Instant};
 
-use crate::model::{Block, BlockKind, Comment, DataSource, Page, SearchResult};
+use crate::model::{Block, BlockKind, Comment, DataSource, Page, SearchResult, User};
 use crate::{Error, Result};
 
 pub const NOTION_VERSION: &str = "2025-09-03";
@@ -238,6 +238,13 @@ impl Client {
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| Error::Invalid("users/me has no id".into()))
+    }
+
+    /// Every workspace user, persons and bots, all pages. Needs the
+    /// integration's "read user information" capability (403 otherwise).
+    pub async fn list_users(&self) -> Result<Vec<User>> {
+        let raw: Vec<Value> = self.paginate("/v1/users", None).await?;
+        Ok(raw.iter().filter_map(User::from_value).collect())
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
@@ -839,5 +846,36 @@ mod tests {
             !d.contains("secret-xyz") && d.contains("api.notion.com"),
             "{d}"
         );
+    }
+    #[tokio::test]
+    async fn list_users_paginates_and_parses_persons_and_bots() {
+        let s = MockServer::start().await;
+        let user = |id: &str, ty: &str, name: &str| {
+            let mut u = json!({"object": "user", "id": id, "type": ty, "name": name, "avatar_url": null});
+            if ty == "person" {
+                u["avatar_url"] = json!("https://img/a.png");
+                u["person"] = json!({"email": "a@x.org"});
+            }
+            u
+        };
+        Mock::given(path("/v1/users"))
+            .and(query_param("page_size", "100"))
+            .and(query_param_is_missing("start_cursor"))
+            .respond_with(list(vec![user("u1", "person", "Ada"), user("b1", "bot", "Bot")], Some("c1")))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(path("/v1/users"))
+            .and(query_param("start_cursor", "c1"))
+            .respond_with(list(vec![user("u2", "person", "Bo")], None))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let us = client(&s, 0).list_users().await.unwrap();
+        let got: Vec<_> = us.iter().map(|u| (u.id.as_str(), u.kind.as_str(), u.name.as_str())).collect();
+        assert_eq!(got, [("u1", "person", "Ada"), ("b1", "bot", "Bot"), ("u2", "person", "Bo")]);
+        assert_eq!(us[0].email.as_deref(), Some("a@x.org"));
+        assert_eq!(us[0].avatar_url.as_deref(), Some("https://img/a.png"));
+        assert!(us[1].is_bot() && us[1].avatar_url.is_none() && us[1].email.is_none());
     }
 }

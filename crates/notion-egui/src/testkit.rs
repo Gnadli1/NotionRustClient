@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use std::sync::mpsc::{channel, Sender};
 
 use eframe::egui::{self, Event, Key, Modifiers, RawInput, ViewportCommand, ViewportId};
@@ -81,6 +82,8 @@ pub struct Win {
     pub opened: Rc<RefCell<Vec<String>>>,
     /// Keys pressed in the last frame, released at the start of the next.
     down: Vec<(Key, Modifiers)>,
+    /// The text the last frame drew, one line per label.
+    pub shown: String,
 }
 
 impl Win {
@@ -93,6 +96,8 @@ impl Win {
         let mut app = App::new(store, tx, events, false);
         // the first frame has the focus already: no focus-gain auto-pull
         app.was_focused = true;
+        // users pulled a while ago: not due for the tick, past the on-demand throttle
+        app.users_at = Instant::now().checked_sub(Duration::from_secs(120));
         let opened = Rc::new(RefCell::new(Vec::new()));
         let sink = opened.clone();
         app.opener = Box::new(move |url| {
@@ -106,6 +111,7 @@ impl Win {
             ev,
             opened,
             down: Vec::new(),
+            shown: String::new(),
         };
         w.frames(vec![]);
         w
@@ -162,6 +168,15 @@ impl Win {
             .get(&ViewportId::ROOT)
             .map(|v| v.commands.clone())
             .unwrap_or_default();
+        self.shown = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         out.drop_without_applying_deltas();
         cmds
     }

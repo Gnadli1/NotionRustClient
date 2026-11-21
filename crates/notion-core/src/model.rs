@@ -574,6 +574,11 @@ impl TargetKind {
 }
 
 impl Block {
+    /// User id of whoever last edited the block, as of the last pull.
+    pub fn last_edited_by(&self) -> Option<&str> {
+        self.raw["last_edited_by"]["id"].as_str()
+    }
+
     fn from_value(v: Value) -> Result<Self> {
         let t = str_field(&v, "type")?;
         let kind = BlockKind::parse(&t, &v[t.as_str()])
@@ -678,6 +683,55 @@ impl Comment {
     }
 }
 
+// ---------------------------------------------------------------- users
+
+/// A workspace user. Parsed from `GET /v1/users` and from the user objects
+/// that appear inline (`created_by`, mentions, people properties), which are
+/// often just `{object, id}`: then `kind` and `name` are empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct User {
+    pub id: String,
+    /// "person", "bot", or "" when only the id is known.
+    pub kind: String,
+    pub name: String,
+    pub avatar_url: Option<String>,
+    pub email: Option<String>,
+    pub raw: Value,
+}
+
+impl User {
+    /// The user in `v`, if it is a user object with an id (lenient otherwise).
+    pub fn from_value(v: &Value) -> Option<User> {
+        let s = |x: &Value| x.as_str().filter(|s| !s.is_empty()).map(str::to_string);
+        Some(User {
+            id: s(&v["id"])?,
+            kind: v["type"].as_str().unwrap_or_default().to_string(),
+            name: v["name"].as_str().unwrap_or_default().to_string(),
+            avatar_url: s(&v["avatar_url"]),
+            email: s(&v["person"]["email"]),
+            raw: v.clone(),
+        })
+    }
+
+    pub fn is_bot(&self) -> bool {
+        self.kind == "bot"
+    }
+}
+
+/// Every user object (`"object": "user"` with an id) anywhere in `v`: the
+/// `created_by` / `last_edited_by` of a page or block, user mentions, people
+/// properties. Duplicates are kept; the store merges them.
+pub fn users_in(v: &Value, out: &mut Vec<User>) {
+    match v {
+        Value::Object(m) if m.get("object").and_then(Value::as_str) == Some("user") => {
+            out.extend(User::from_value(v));
+        }
+        Value::Object(m) => m.values().for_each(|x| users_in(x, out)),
+        Value::Array(a) => a.iter().for_each(|x| users_in(x, out)),
+        _ => {}
+    }
+}
+
 // ---------------------------------------------------------------- pages
 
 /// Serialize emits `raw` with these struct fields written back: `properties`
@@ -696,6 +750,11 @@ pub struct Page {
 }
 
 impl Page {
+    /// User id of whoever last edited the page, as of the last pull.
+    pub fn last_edited_by(&self) -> Option<&str> {
+        self.raw["last_edited_by"]["id"].as_str()
+    }
+
     /// Plain text of the property whose type is "title"; "" if none.
     pub fn title(&self) -> String {
         self.properties

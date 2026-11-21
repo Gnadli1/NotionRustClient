@@ -6,7 +6,7 @@ use eframe::egui::{
     text::{LayoutJob, TextFormat},
     Color32, FontFamily, FontId, Stroke,
 };
-use notion_core::model::{RichText, RichTextKind};
+use notion_core::model::{RichText, RichTextKind, User};
 
 use crate::tex::pretty_tex;
 
@@ -66,8 +66,26 @@ pub fn format(size: f32, s: Style) -> TextFormat {
     }
 }
 
-/// A cached row's rich text. `bold` is the row's base weight (headings).
-pub fn rich_job(rt: &[RichText], size: f32, bold: bool) -> LayoutJob {
+/// "@Name" for a user mention: the cached name, else what the API said
+/// (`plain_text`, "@" or not), else the id's first 8 characters.
+fn user_mention_text(m: &serde_json::Value, plain: &str, users: &[User]) -> Option<String> {
+    if m["type"] != "user" {
+        return None;
+    }
+    let id = m["user"]["id"].as_str().unwrap_or_default();
+    let name = match crate::people::find(users, id).filter(|u| !u.name.is_empty()) {
+        Some(u) => u.name.clone(),
+        None => match plain.trim_start_matches('@') {
+            "" => id.chars().take(8).collect(),
+            p => p.to_string(),
+        },
+    };
+    Some(format!("@{name}"))
+}
+
+/// A cached row's rich text. `bold` is the row's base weight (headings);
+/// `users` name the user mentions.
+pub fn rich_job(rt: &[RichText], size: f32, bold: bool, users: &[User]) -> LayoutJob {
     let mut job = LayoutJob::default();
     for r in rt {
         let a = &r.annotations;
@@ -85,6 +103,9 @@ pub fn rich_job(rt: &[RichText], size: f32, bold: bool) -> LayoutJob {
             RichTextKind::Equation { expression } => {
                 s.math = true;
                 pretty_tex(expression).unwrap_or_else(|| expression.clone())
+            }
+            RichTextKind::Mention(m) => {
+                user_mention_text(m, &r.plain_text, users).unwrap_or_else(|| r.plain_text.clone())
             }
             _ => r.plain_text.clone(),
         };
@@ -289,5 +310,35 @@ mod tests {
         assert_eq!(md_job("", 16.0, false, Color32::GRAY).text, "");
         let s = "ß **ä** `ö` é";
         assert_eq!(md_job(s, 16.0, false, Color32::GRAY).text, s);
+    }
+
+    use serde_json::json;
+
+    fn user_mention(plain: &str, id: &str) -> RichText {
+        RichText {
+            plain_text: plain.into(),
+            href: None,
+            annotations: Default::default(),
+            kind: RichTextKind::Mention(json!({ "type": "user", "user": { "object": "user", "id": id } })),
+        }
+    }
+
+    #[test]
+    fn a_user_mention_shows_the_cached_name_with_an_at_sign() {
+        let ada = User::from_value(&json!({ "object": "user", "id": "u1", "type": "person", "name": "Ada" })).unwrap();
+        let text = |r: RichText, us: &[User]| rich_job(&[r], 16.0, false, us).text;
+        assert_eq!(text(user_mention("@Old Name", "u1"), std::slice::from_ref(&ada)), "@Ada", "the cache is newer");
+        // not cached: what the API (or our own token) said, with one "@"
+        assert_eq!(text(user_mention("@Bob", "u2"), &[]), "@Bob");
+        assert_eq!(text(user_mention("Bob", "u2"), std::slice::from_ref(&ada)), "@Bob");
+        assert_eq!(text(user_mention("", "0123456789"), &[]), "@01234567");
+        // other mentions are as they were
+        let page = RichText {
+            kind: RichTextKind::Mention(json!({ "type": "page", "page": { "id": "p" } })),
+            ..user_mention("Home", "x")
+        };
+        assert_eq!(text(page, std::slice::from_ref(&ada)), "Home");
+        let job = rich_job(&[user_mention("", "u1")], 16.0, false, &[]);
+        assert!(job.sections[0].format.background != Color32::TRANSPARENT, "the mention pill");
     }
 }

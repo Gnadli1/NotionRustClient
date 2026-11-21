@@ -5,7 +5,7 @@
 
 use eframe::egui::{self, Frame, Id, Label, RichText as Text};
 use notion_core::markdown::to_markdown;
-use notion_core::model::{Annotations, RichText, RichTextKind, TargetKind};
+use notion_core::model::{Annotations, RichText, RichTextKind, TargetKind, User};
 use notion_core::store::PageEntry;
 use serde_json::json;
 
@@ -14,6 +14,8 @@ use crate::slash::{self, MenuKey};
 
 /// Pages listed by `@` and `[[`.
 const MAX_PAGES: usize = 8;
+/// Users listed by `@`.
+const MAX_USERS: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -127,6 +129,8 @@ pub struct Sources<'a> {
     pub tree: &'a [PageEntry],
     /// Recently opened page ids, most recent first.
     pub recent: &'a [String],
+    /// The cached workspace users.
+    pub users: &'a [User],
 }
 
 /// The entries of `menu` for the filter `q`.
@@ -142,7 +146,7 @@ pub fn entries(menu: &Menu, q: &str, src: Sources) -> Vec<Entry> {
             .collect(),
         Kind::Mention => {
             let mut out = page_entries(q, src);
-            out.extend(user_entries(q));
+            out.extend(user_entries(q, src.users));
             out.extend(date_entries(q, &menu.days));
             out
         }
@@ -160,29 +164,31 @@ fn mention(label: &str, json: serde_json::Value) -> String {
     }])
 }
 
-/// Cached pages whose title matches `q`: a prefix first, then a word prefix,
-/// a substring, a subsequence (fuzzy); recent pages before the rest.
+/// How well `title` matches the folded query `fq`: a prefix first (0), then a
+/// word prefix, a substring, a subsequence (fuzzy). None for no match.
+fn rank(fq: &str, title: &str) -> Option<u8> {
+    let t = slash::fold(title);
+    if t.starts_with(fq) {
+        Some(0)
+    } else if slash::word_prefix(fq, title) {
+        Some(1)
+    } else if t.contains(fq) {
+        Some(2)
+    } else {
+        let mut cs = t.chars();
+        fq.chars().all(|c| cs.any(|x| x == c)).then_some(3)
+    }
+}
+
+/// Cached pages whose title matches `q` (see [`rank`]); recent pages before the rest.
 fn page_entries(q: &str, src: Sources) -> Vec<Entry> {
     let fq = slash::fold(q.trim());
-    let rank = |title: &str| -> Option<u8> {
-        let t = slash::fold(title);
-        if t.starts_with(&fq) {
-            Some(0)
-        } else if slash::word_prefix(&fq, title) {
-            Some(1)
-        } else if t.contains(&fq) {
-            Some(2)
-        } else {
-            let mut cs = t.chars();
-            fq.chars().all(|c| cs.any(|x| x == c)).then_some(3)
-        }
-    };
     let mut hits: Vec<(u8, usize, String, &PageEntry)> = src
         .tree
         .iter()
         .filter_map(|e| {
             let recent = src.recent.iter().position(|r| *r == e.id).unwrap_or(usize::MAX);
-            Some((rank(&e.title)?, recent, slash::fold(&e.title), e))
+            Some((rank(&fq, &e.title)?, recent, slash::fold(&e.title), e))
         })
         .collect();
     // with no query every rank is 0: the recent pages lead
@@ -203,10 +209,27 @@ fn page_entries(q: &str, src: Sources) -> Vec<Entry> {
         .collect()
 }
 
-/// Hook for C2: user mentions (`mention(name, {"type":"user","user":{"id":..}})`)
-/// join the `@` list here once the workspace's users are cached.
-fn user_entries(_q: &str) -> Vec<Entry> {
-    Vec::new()
+/// Cached users whose name matches `q` like page titles do (umlauts fold):
+/// persons first, then bots. Users known only by id have no name to match.
+fn user_entries(q: &str, users: &[User]) -> Vec<Entry> {
+    let fq = slash::fold(q.trim());
+    let mut hits: Vec<(bool, u8, String, &User)> = users
+        .iter()
+        .filter(|u| !u.name.is_empty())
+        .filter_map(|u| Some((u.is_bot(), rank(&fq, &u.name)?, slash::fold(&u.name), u)))
+        .collect();
+    hits.sort_by(|a, b| (a.0, a.1, &a.2, &a.3.id).cmp(&(b.0, b.1, &b.2, &b.3.id)));
+    hits.into_iter()
+        .take(MAX_USERS)
+        .map(|(bot, .., u)| Entry {
+            label: format!("{} {}", if bot { "🤖" } else { "👤" }, u.name),
+            hint: if bot { "Bot" } else { "Person" }.into(),
+            pick: Pick::Insert(mention(
+                &u.name,
+                json!({ "type": "user", "user": { "object": "user", "id": u.id } }),
+            )),
+        })
+        .collect()
 }
 
 /// Heute / Morgen / Gestern (and the English names) as date mentions.
@@ -310,7 +333,7 @@ mod tests {
     }
 
     fn slash_entries(q: &str) -> Vec<Entry> {
-        entries(&menu(Kind::Slash), q, Sources { tree: &[], recent: &[] })
+        entries(&menu(Kind::Slash), q, Sources { tree: &[], recent: &[], users: &[] })
     }
 
     #[test]
@@ -409,7 +432,7 @@ mod tests {
             page("e", ""),
         ];
         let recent = ["c".to_string()];
-        let src = Sources { tree: &tree, recent: &recent };
+        let src = Sources { tree: &tree, recent: &recent, users: &[] };
         let q = |s: &str| labels(&page_entries(s, src));
         assert_eq!(q("")[0], "📄 Notizen Mathe", "the recent page leads");
         assert_eq!(q("math"), ["📄 Mathe Notizen", "📄 Notizen Mathe"], "prefix before word prefix");
@@ -425,14 +448,14 @@ mod tests {
     #[test]
     fn mention_tokens_escape_the_label() {
         let tree = [page("x", "a]b *c*")];
-        let es = page_entries("a", Sources { tree: &tree, recent: &[] });
+        let es = page_entries("a", Sources { tree: &tree, recent: &[], users: &[] });
         let Pick::Insert(t) = &es[0].pick else { panic!() };
         assert_eq!(t, "@[a\\]b \\*c\\*](page:x)");
     }
 
     #[test]
     fn dates_are_german_or_english() {
-        let src = Sources { tree: &[], recent: &[] };
+        let src = Sources { tree: &[], recent: &[], users: &[] };
         let m = menu(Kind::Mention);
         let get = |q: &str| entries(&m, q, src);
         assert_eq!(labels(&get("")).len(), 3);
@@ -446,6 +469,45 @@ mod tests {
         // [[ lists pages only
         let link = entries(&menu(Kind::PageLink), "", src);
         assert!(link.is_empty());
+    }
+
+    fn person(id: &str, name: &str) -> User {
+        User::from_value(&json!({ "object": "user", "id": id, "type": "person", "name": name })).unwrap()
+    }
+
+    fn bot(id: &str, name: &str) -> User {
+        User::from_value(&json!({ "object": "user", "id": id, "type": "bot", "name": name })).unwrap()
+    }
+
+    #[test]
+    fn users_match_like_pages_persons_before_bots() {
+        let users = [
+            bot("b1", "Zeta Bot"),
+            person("u1", "Zoe"),
+            person("u2", "Jürgen Müller"),
+            person("u3", "Nick Zane"),
+            person("u4", ""),
+            User::from_value(&json!({ "object": "user", "id": "u5" })).unwrap(),
+        ];
+        let q = |s: &str| user_entries(s, &users);
+        assert_eq!(labels(&q("")), ["👤 Jürgen Müller", "👤 Nick Zane", "👤 Zoe", "🤖 Zeta Bot"], "persons first; no name, no entry");
+        assert_eq!(labels(&q("z")), ["👤 Zoe", "👤 Nick Zane", "🤖 Zeta Bot"], "prefix, then word prefix; bots last");
+        assert_eq!(labels(&q("juergen")), ["👤 Jürgen Müller"], "umlauts fold");
+        assert_eq!(labels(&q("mueller")), ["👤 Jürgen Müller"], "a word prefix");
+        assert_eq!(labels(&q("jmr")), ["👤 Jürgen Müller"], "fuzzy");
+        assert!(q("qqq").is_empty());
+        let Pick::Insert(t) = &q("zoe")[0].pick else { panic!() };
+        assert_eq!(t, "@[Zoe](user:u1)");
+        assert_eq!(q("zoe")[0].hint, "Person");
+        assert_eq!(q("zeta")[0].hint, "Bot");
+        // the `@` menu lists pages, then users, then dates
+        let src = Sources { tree: &[page("a", "Zebra")], recent: &[], users: &users };
+        let all = entries(&menu(Kind::Mention), "ze", src);
+        assert_eq!(labels(&all)[..4], ["📄 Zebra", "👤 Nick Zane", "👤 Zoe", "🤖 Zeta Bot"]);
+        // `[[` and `/` never list users
+        assert!(entries(&menu(Kind::PageLink), "zoe", src).is_empty());
+        let many: Vec<User> = (0..20).map(|i| person(&format!("u{i}"), &format!("Pat {i}"))).collect();
+        assert_eq!(user_entries("", &many).len(), MAX_USERS);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use notion_core::api::Client;
 use notion_core::model::SearchResult;
 use notion_core::store::Store;
 use notion_core::sync::{self, PullReport, PushReport};
+use notion_core::Error;
 use tokio::sync::mpsc as tmpsc;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,6 +23,8 @@ pub enum Cmd {
     PullComments { id: String },
     /// Asks for the integration's own user id (to tell its comments apart).
     Me,
+    /// Fetches the workspace's users (`sync::pull_users`) into the cache.
+    PullUsers,
 }
 
 #[derive(Debug, PartialEq)]
@@ -35,6 +38,9 @@ pub enum Event {
     SearchResults(Vec<(String, String)>),
     CommentsPulled,
     Me(String),
+    UsersPulled,
+    /// `GET /v1/users` said 403: the integration lacks "read user information".
+    UsersDenied,
     Error(String),
 }
 
@@ -60,6 +66,11 @@ pub async fn run(
                 .await
                 .map(|_| Event::CommentsPulled),
             Cmd::Me => client.me().await.map(Event::Me),
+            Cmd::PullUsers => match sync::pull_users(client, store).await {
+                Ok(_) => Ok(Event::UsersPulled),
+                Err(Error::Api { status: 403, .. }) => Ok(Event::UsersDenied),
+                Err(e) => Err(e),
+            },
             Cmd::Search(q) => client.search(&q).await.map(|rs| {
                 Event::SearchResults(
                     rs.into_iter()
@@ -161,5 +172,63 @@ mod tests {
         handle.join().unwrap();
         // the worker is gone: the channel says so
         assert!(rx.recv_timeout(Duration::from_secs(1)).is_err());
+    }
+    /// A one-thread HTTP server that answers every request with `status` and `body`.
+    fn serve(status: u16, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let _ = write!(
+                    c,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        url
+    }
+
+    /// Each PullUsers gets exactly one event: UsersPulled (cached), UsersDenied
+    /// for a 403, Error otherwise.
+    #[test]
+    fn pull_users_is_answered_by_exactly_one_event() {
+        use notion_core::api::ClientConfig;
+        let list = r#"{"object":"list","results":[{"object":"user","id":"u1","type":"person","name":"Ada"}],"has_more":false,"next_cursor":null}"#;
+        let err = |s: &'static str| format!(r#"{{"object":"error","status":{s},"code":"x","message":"m"}}"#);
+        let err: &'static str = Box::leak(err("403").into_boxed_str());
+        for (status, body) in [(200, list), (403, err), (500, err)] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("cache.db");
+            let url = serve(status, body);
+            let (tx, rx, handle) = spawn_with(db.clone(), egui::Context::default(), move || {
+                Some(Client::new("t".into(), ClientConfig { base_url: url, max_retries: 0, ..Default::default() }))
+            });
+            tx.send(Cmd::PullUsers).unwrap();
+            tx.send(Cmd::Me).unwrap(); // the next event is Me's: PullUsers made just one
+            let ev = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            match status {
+                200 => {
+                    assert_eq!(ev, Event::UsersPulled);
+                    assert_eq!(Store::open(&db).unwrap().user("u1").unwrap().unwrap().name, "Ada");
+                }
+                403 => assert_eq!(ev, Event::UsersDenied),
+                _ => assert!(matches!(&ev, Event::Error(m) if m.contains("500")), "{ev:?}"),
+            }
+            assert!(matches!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Event::Me(_) | Event::Error(_)));
+            drop(tx);
+            handle.join().unwrap();
+            assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "no stray event");
+        }
+        // no client: the offline error, as for every command
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx, handle) = spawn_with(dir.path().join("cache.db"), egui::Context::default(), || None);
+        tx.send(Cmd::PullUsers).unwrap();
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Event::Error(m) if m.starts_with("offline")));
+        drop(tx);
+        handle.join().unwrap();
     }
 }

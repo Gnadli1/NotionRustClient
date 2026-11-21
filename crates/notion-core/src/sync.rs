@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 use crate::api::{BlockNode, Client};
 use crate::markdown::split_runs;
 use crate::model::{
-    Block, BlockKind, Comment, Page, Parent, PropertyValue, RichText, TargetKind, TextBlock,
+    users_in, Block, BlockKind, Comment, Page, Parent, PropertyValue, RichText, TargetKind,
+    TextBlock, User,
 };
 use crate::ops::{CommentTarget, Op, OpKind, OpStatus};
 use crate::store::{ts, Store};
@@ -32,6 +33,26 @@ pub struct PushReport {
 }
 
 // ---------------------------------------------------------------- pull
+
+/// One entry per id, in first-seen order, keeping the fullest one (a name,
+/// else a type, else just the id): a page of blocks names the same few users
+/// over and over.
+fn dedupe_users(found: Vec<User>) -> Vec<User> {
+    let score = |u: &User| u32::from(!u.name.is_empty()) * 2 + u32::from(!u.kind.is_empty());
+    let mut at: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<User> = Vec::new();
+    for u in found {
+        match at.get(&u.id) {
+            Some(&i) if score(&u) > score(&out[i]) => out[i] = u,
+            Some(_) => {}
+            None => {
+                at.insert(u.id.clone(), out.len());
+                out.push(u);
+            }
+        }
+    }
+    out
+}
 
 pub async fn pull_page(
     client: &Client,
@@ -159,6 +180,14 @@ pub async fn pull_page(
         }
         store.replace_children(&page.id, &parent_id, &list)?;
     }
+    let mut found = Vec::new();
+    users_in(&page.raw, &mut found);
+    let mut all: Vec<&BlockNode> = tree.iter().collect();
+    while let Some(n) = all.pop() {
+        users_in(&n.block.raw, &mut found);
+        all.extend(&n.children);
+    }
+    store.put_users(&dedupe_users(found))?;
     let mut page = page;
     keep_queued_props(store, &mut page)?;
     store.upsert_page(&page)?;
@@ -208,7 +237,18 @@ pub async fn pull_comments(client: &Client, store: &Store, parent_id: &str) -> R
         }
     }
     store.replace_comments(parent_id, &list)?;
+    let mut found = Vec::new();
+    list.iter().for_each(|c| users_in(&c.raw, &mut found));
+    store.put_users(&dedupe_users(found))?;
     Ok(list.len())
+}
+
+/// Caches the workspace's users (`GET /v1/users`). A 403 (the integration
+/// lacks "read user information") comes back as `Error::Api`; nothing retries it.
+pub async fn pull_users(client: &Client, store: &Store) -> Result<usize> {
+    let users = client.list_users().await?;
+    store.put_users(&users)?;
+    Ok(users.len())
 }
 
 pub async fn pull_data_source(client: &Client, store: &Store, ds_id: &str) -> Result<PullReport> {
@@ -219,6 +259,9 @@ pub async fn pull_data_source(client: &Client, store: &Store, ds_id: &str) -> Re
         fetched: rows.len(),
         ..Default::default()
     };
+    let mut found = Vec::new();
+    rows.iter().for_each(|r| users_in(&r.raw, &mut found));
+    store.put_users(&dedupe_users(found))?;
     for mut row in rows {
         let cached = store.get_page(&row.id)?;
         if cached.map(|c| c.last_edited_time) != Some(row.last_edited_time) {
@@ -4201,5 +4244,79 @@ mod tests {
         let r = push(&client(&s), &store).await.unwrap();
         assert_eq!((r.applied, r.failed), (1, 0), "{r:?}");
         assert!(store.queued_ops().unwrap().is_empty());
+    }
+    fn user_obj(id: &str, name: Option<&str>) -> Value {
+        match name {
+            Some(n) => json!({ "object": "user", "id": id, "name": n, "type": "person",
+                "avatar_url": null, "person": { "email": format!("{id}@x.org") } }),
+            None => json!({ "object": "user", "id": id }),
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_caches_inline_users_without_wiping_known_names() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        // known from /v1/users
+        store
+            .put_users(&[crate::model::User::from_value(&user_obj("u1", Some("Ada"))).unwrap()])
+            .unwrap();
+        let mut pg = page("p", pp("root"), T);
+        pg["created_by"] = user_obj("u1", None);
+        pg["last_edited_by"] = user_obj("u2", None);
+        let mut a = blk("a", pp("p"), "A", T, false);
+        a["last_edited_by"] = user_obj("u1", None);
+        let mut b = blk("b", pp("p"), "B", T, false);
+        // a mention carries the full user
+        b["paragraph"]["rich_text"] = json!([{ "type": "mention", "plain_text": "@Bob",
+            "mention": { "type": "user", "user": user_obj("u3", Some("Bob")) }, "annotations": {} }]);
+        get(&s, "/v1/pages/p", ok(pg)).await;
+        get(&s, "/v1/blocks/p/children", list(vec![a, b])).await;
+        pull_page(&client(&s), &store, "p", true).await.unwrap();
+
+        let name = |id: &str| store.user(id).unwrap().map(|u| (u.name, u.email));
+        assert_eq!(name("u1"), Some(("Ada".into(), Some("u1@x.org".into()))), "id-only inline kept the name");
+        assert_eq!(name("u2"), Some((String::new(), None)), "unknown name: row with the id");
+        assert_eq!(name("u3").unwrap().0, "Bob", "mention carried the name");
+        assert_eq!(store.get_page("p").unwrap().unwrap().last_edited_by(), Some("u2"));
+        assert_eq!(store.get_block("a").unwrap().unwrap().last_edited_by(), Some("u1"));
+        assert_eq!(store.users().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn inline_users_are_deduped_keeping_the_fullest() {
+        let u = |v: Value| User::from_value(&v).unwrap();
+        let stub = |id: &str| u(json!({ "object": "user", "id": id }));
+        let typed = u(json!({ "object": "user", "id": "u2", "type": "bot" }));
+        let named = u(json!({ "object": "user", "id": "u1", "type": "person", "name": "Ada" }));
+        let got = dedupe_users(vec![stub("u1"), stub("u2"), typed, named, stub("u1"), stub("u3"), stub("u2")]);
+        let view: Vec<_> = got.iter().map(|u| (u.id.as_str(), u.kind.as_str(), u.name.as_str())).collect();
+        assert_eq!(view, [("u1", "person", "Ada"), ("u2", "bot", ""), ("u3", "", "")]);
+    }
+
+    #[tokio::test]
+    async fn pull_users_caches_and_a_403_is_one_request() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        get(
+            &s,
+            "/v1/users",
+            list(vec![user_obj("u1", Some("Ada")), json!({ "object": "user", "id": "bot", "type": "bot", "name": "Notion Client" })]),
+        )
+        .await;
+        assert_eq!(pull_users(&client(&s), &store).await.unwrap(), 2);
+        assert_eq!(store.user("bot").unwrap().unwrap().kind, "bot");
+
+        s.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/users"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "object": "error", "status": 403, "code": "restricted_resource", "message": "no user capability" })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let e = pull_users(&client(&s), &Store::open_in_memory().unwrap()).await.unwrap_err();
+        assert!(matches!(e, Error::Api { status: 403, .. }), "{e:?}");
+        assert_eq!(s.received_requests().await.unwrap().len(), 1, "no retry loop");
     }
 }

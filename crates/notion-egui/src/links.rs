@@ -187,7 +187,7 @@ mod tests {
             run(json!({ "type": "mention", "mention": { "type": "page", "page": { "id": PID } },
                 "plain_text": "pg", "annotations": {} })),
         ];
-        let job = rich_job(&rich, 16.0, false);
+        let job = rich_job(&rich, 16.0, false, &[]);
         // the equation shows as "α" (1 char), not as its 6-char source
         assert_eq!(job.text.chars().count(), 1 + 2 + 2, "{}", job.text);
         assert_eq!(link_at(&rich, &job, 0), None);

@@ -14,6 +14,7 @@ mod keys;
 mod links;
 mod md;
 mod menu;
+mod people;
 mod problems;
 mod shell;
 mod switcher;

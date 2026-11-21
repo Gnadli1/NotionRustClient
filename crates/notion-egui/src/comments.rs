@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Align, Frame, Id, Key, Layout, Margin, Modifiers, RichText, ScrollArea, Sense, TextEdit, Ui};
 use notion_core::markdown::{from_markdown, to_markdown};
-use notion_core::model::{plain_text, Comment};
+use notion_core::model::{plain_text, Comment, User};
 use notion_core::ops::CommentTarget;
 use notion_core::sync;
 
@@ -69,6 +69,16 @@ pub(crate) fn ago(then: i64, now: i64) -> String {
     }
 }
 
+/// Who wrote `c`: "you" for this integration's own, else the cached name
+/// (the id's first 8 characters if the user isn't cached).
+fn author(users: &[User], mine: bool, c: &Comment) -> String {
+    if mine {
+        "you".into()
+    } else {
+        crate::people::name_of(users, &c.created_by)
+    }
+}
+
 /// Whether `c` was written by this integration (or is still unpushed): the
 /// only comments Notion lets it edit or delete. `created_by` is the
 /// integration's bot user, learned from `GET /v1/users/me`.
@@ -76,7 +86,7 @@ fn mine(me: Option<&str>, c: &Comment) -> bool {
     c.id.starts_with("local-") || me == Some(c.created_by.as_str())
 }
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
@@ -272,6 +282,7 @@ impl App {
             return Vec::new();
         };
         let me = self.me.clone();
+        let users = &self.users;
         let label = p.block.as_ref().map(|b| {
             let text = self
                 .rows
@@ -348,7 +359,7 @@ impl App {
                             ui.set_width(ui.available_width());
                             for cm in &t {
                                 let mine = mine(me.as_deref(), cm);
-                                comment_ui(ui, c, cm, mine, now, (&mut *edit, &mut *focus_edit), &mut acts);
+                                comment_ui(ui, c, (cm, mine), (users, now), (&mut *edit, &mut *focus_edit), &mut acts);
                             }
                             let disc = &t[0].discussion_id;
                             let draft = replies.entry(disc.clone()).or_default();
@@ -425,25 +436,22 @@ fn draft_box(ui: &mut Ui, id: Id, text: &mut String, hint: &str) -> Option<Draft
 fn comment_ui(
     ui: &mut Ui,
     c: &Colors,
-    cm: &Comment,
-    mine: bool,
-    now: i64,
+    (cm, mine): (&Comment, bool),
+    (users, now): (&[User], i64),
     (edit, focus_edit): (&mut Option<(String, String)>, &mut bool),
     acts: &mut Vec<Action>,
 ) {
     let local = cm.id.starts_with("local-");
-    let who = if mine {
-        "you".to_string()
-    } else {
-        // ponytail: the user id; C2 adds names
-        cm.created_by.chars().take(8).collect()
-    };
+    let who = author(users, mine, cm);
     let when = if local {
         "queued".to_string()
     } else {
         ago(cm.created_time.timestamp(), now)
     };
     ui.horizontal(|ui| {
+        // our own keep one colour, whether pushed (bot id) or still local
+        let by = if mine { "you" } else { cm.created_by.as_str() };
+        crate::people::avatar(ui, by, &who, 18.0);
         ui.label(RichText::new(format!("{who} · {when}")).size(12.0).color(c.secondary));
         if mine {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -480,7 +488,7 @@ fn comment_ui(
             });
         }
         _ => {
-            ui.add(egui::Label::new(md::rich_job(&cm.rich_text, 14.0, false)).wrap());
+            ui.add(egui::Label::new(md::rich_job(&cm.rich_text, 14.0, false, users)).wrap());
         }
     }
     ui.add_space(4.0);
