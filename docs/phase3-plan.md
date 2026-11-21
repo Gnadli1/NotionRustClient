@@ -145,7 +145,7 @@ I pulled all 164 pages shared with the integration into the cache. One failed wi
 7. **Untested on screen:** Ctrl+Alt+T on the Austrian layout, colours, the selection highlight.
 
 ## Known gaps after F3 (reviewed, deferred)
-1. **Lock is a marker only** (pending your decision): the header shows "locked", but local edits aren't refused, and Notion's API doesn't enforce it for integrations.
+1. **Lock is a marker only** (your decision, 2026-11-22): the header shows "locked"; local edits aren't refused, and Notion's API doesn't enforce it for integrations.
 2. **New pages** need a page open (integrations can't create workspace-level pages). An unpushed page can't be trashed, moved or locked until Ctrl+S.
 3. **Sub-page position:** a new child page may land at the end of its parent in Notion; the order settles on the next pull.
 4. **Covers** show as a coloured band; images load in F7. External URLs only (no uploads).
