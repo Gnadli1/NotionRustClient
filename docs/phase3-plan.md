@@ -120,3 +120,10 @@ I pulled all 164 pages shared with the integration into the cache. One failed wi
 4. **Failed ops** (not conflicts) still only have Discard.
 5. **No push after resolving.** Press Ctrl+S to send the re-queued op.
 6. **Title ops writing other properties** offer Keep mine / Keep theirs only.
+
+## Known gaps after F1 (reviewed, deferred)
+1. **History is in memory only.** Back/forward history is lost on restart.
+2. **Switcher dates after a restart.** Visit times aren't saved, so older pages are grouped by Notion's last edit date.
+3. **Find** searches block text only, not table cells, link cards or child-page titles.
+4. **Find and outline jumps open collapsed toggles** and they stay open.
+5. **Untested on screen:** Ctrl+[ / Ctrl+] on the Austrian layout (Alt+←/→ is the safe default), mouse buttons 4/5, the look of the outline ticks and preview.
