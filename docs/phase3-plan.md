@@ -151,3 +151,12 @@ I pulled all 164 pages shared with the integration into the cache. One failed wi
 4. **Covers** show as a coloured band; images load in F7. External URLs only (no uploads).
 5. **Icon check** is a heuristic (one char ≥ U+2000, no letters/digits).
 6. **Trash view** lists cached trashed pages only; pages trashed elsewhere appear after a pull.
+
+## Known gaps after F4 (reviewed, deferred)
+1. **Column order:** columns after the title are alphabetical, not Notion's schema order (serde_json has no `preserve_order`).
+2. **Schema refresh:** new columns and select/status options added in Notion appear only after a full pull (open after 60 s, Ctrl+R, after a push); the 15 s poll reads rows only.
+3. **Filter and sort are local:** they run over the cached rows; no Notion-side filter/sort query is sent. Fine until a database is very large.
+4. **Rows removed in Notion** disappear on the next full pull, not on a poll.
+5. **A cell changed in Notion while you type** is refused ("changed in Notion meanwhile"); Esc is the only way out, and Ctrl+S and undo wait until then.
+6. **Unpushed rows** can't be trashed or opened as a page until Ctrl+S. Select and avatar colours aren't drawn.
+7. **UNVERIFIED against live Notion:** the property write shapes, `POST /v1/pages` under a `data_source_id`, `GET /v1/databases/{id}`, and the timestamp filter on a data source query.
