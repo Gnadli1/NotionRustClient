@@ -654,7 +654,7 @@ impl App {
     pub(crate) fn title_ui(&mut self, ui: &mut Ui, shown: &str) -> Option<Action> {
         let ctx = ui.ctx().clone();
         let Some(t) = &mut self.title_edit else {
-            let mut l = Label::new(RichText::new(shown).size(38.0).strong()).wrap();
+            let mut l = Label::new(RichText::new(shown).size(crate::theme::TITLE_SIZE).strong()).wrap();
             if self.title_editable {
                 l = l.sense(Sense::click()).selectable(false);
             }
@@ -675,7 +675,7 @@ impl App {
         });
         let out = egui::TextEdit::singleline(&mut t.text)
             .id(id)
-            .font(egui::FontId::new(38.0, crate::md::bold_family()))
+            .font(egui::FontId::new(crate::theme::TITLE_SIZE, crate::md::bold_family()))
             .frame(egui::Frame::NONE)
             .desired_width(f32::INFINITY)
             .show(ui);
@@ -1218,6 +1218,68 @@ mod tests {
     }
 
     #[test]
+    fn tables_share_the_text_left_edge_at_every_depth() {
+        let store = Store::open_in_memory().unwrap();
+        add_page(&store, "p", None, &[]);
+        let mk = |id: &str, parent: &str, t: &str, v: serde_json::Value| {
+            let mut b = blk(id, parent, t, v);
+            b.has_children = true;
+            b
+        };
+        let table = |id: &str, parent: &str| blk(id, parent, "table", json!({ "table_width": 1, "has_column_header": false, "has_row_header": false }));
+        let trow = |id: &str, p: &str, c: &str| blk(id, p, "table_row", json!({ "cells": [rt(c)] }));
+        store
+            .replace_children("p", "p", &[
+                blk("t0", "p", "paragraph", json!({ "rich_text": rt("TXT0") })),
+                table("tb0", "p"),
+                mk("par", "p", "bulleted_list_item", json!({ "rich_text": rt("PAR") })),
+            ])
+            .unwrap();
+        store.replace_children("p", "tb0", &[trow("r0", "tb0", "CELL0")]).unwrap();
+        store
+            .replace_children("p", "par", &[
+                blk("t1", "par", "paragraph", json!({ "rich_text": rt("TXT1") })),
+                table("tb1", "par"),
+            ])
+            .unwrap();
+        store.replace_children("p", "tb1", &[trow("r1", "tb1", "CELL1")]).unwrap();
+        let mut w = Win::new(store);
+        w.app.apply(Action::Open("p".into()));
+        w.frames(vec![]);
+        w.frames(vec![]);
+        let x = |s: &str| w.text_at.iter().find(|(t, _)| t == s).unwrap_or_else(|| panic!("{s} not drawn: {:?}", w.text_at)).1.x;
+        let pad = f32::from(crate::theme::TABLE_PAD_X);
+        let (t0, c0, t1, c1) = (x("TXT0"), x("CELL0") - pad, x("TXT1"), x("CELL1") - pad);
+        assert!((t0 - c0).abs() <= 1.0, "depth 0: text {t0} vs table {c0}");
+        assert!((t1 - c1).abs() <= 1.0, "depth 1: text {t1} vs table {c1}");
+        assert!((t1 - t0 - (c1 - c0)).abs() <= 1.0, "same indent step for text and table");
+    }
+
+    #[test]
+    fn title_breadcrumb_heading_and_paragraph_share_the_left_edge() {
+        let store = Store::open_in_memory().unwrap();
+        add_page(&store, "p", None, &["PARA"]);
+        store
+            .replace_children("p", "p", &[
+                blk("h", "p", "heading_1", json!({ "rich_text": rt("HEAD") })),
+                blk("t", "p", "paragraph", json!({ "rich_text": rt("PARA") })),
+            ])
+            .unwrap();
+        let mut w = Win::new(store);
+        w.app.apply(Action::Open("p".into()));
+        w.frames(vec![]);
+        w.frames(vec![]);
+        let title = crate::view::untitled(&w.app.title).to_string();
+        let xs = |s: &str| w.text_at.iter().filter(|(t, _)| t == s).map(|(_, p)| p.x).collect::<Vec<_>>();
+        // the title and the breadcrumb's current-page label draw the same text
+        let (t, h, p) = (xs(&title), xs("HEAD"), xs("PARA"));
+        assert!(t.len() >= 2 && !h.is_empty() && !p.is_empty(), "{:?}", w.text_at);
+        for x in t.iter().chain(&h) {
+            assert!((x - p[0]).abs() <= 1.0, "{x} vs paragraph {}: {:?}", p[0], w.text_at);
+        }
+    }
+
+    #[test]
     fn a_table_cell_is_edited_as_markdown_and_tab_commits_it() {
         let mut w = table_win();
         w.app.apply(Action::EditCell("r2".into(), 0));
@@ -1315,8 +1377,8 @@ mod tests {
         w.app.apply(Action::Open("p".into()));
         w.frames(vec![]);
         // the layout is unknown: scan the first card down the page
-        for y in (60..260).step_by(4) {
-            let pos = Pos2::new(330.0, y as f32);
+        for y in (60..300).step_by(4) {
+            let pos = Pos2::new(400.0, y as f32);
             let ev = |pressed| Event::PointerButton {
                 pos,
                 button: PointerButton::Primary,
@@ -1373,7 +1435,7 @@ mod tests {
         w.app.apply(Action::Open("p".into()));
         w.frames(vec![]);
         for y in (60..300).step_by(5) {
-            let pos = Pos2::new(330.0, y as f32);
+            let pos = Pos2::new(400.0, y as f32);
             let ev = |pressed| Event::PointerButton { pos, button, pressed, modifiers: mods };
             w.frame_with(vec![Event::PointerMoved(pos)], mods);
             w.frame_with(vec![ev(true)], mods);

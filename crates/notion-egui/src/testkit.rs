@@ -84,6 +84,8 @@ pub struct Win {
     down: Vec<(Key, Modifiers)>,
     /// The text the last frame drew, one line per label.
     pub shown: String,
+    /// Each text the last frame drew, with its top-left corner.
+    pub text_at: Vec<(String, egui::Pos2)>,
     /// Texts the app put on the clipboard (all frames so far).
     pub copied: Vec<String>,
 }
@@ -114,6 +116,7 @@ impl Win {
             opened,
             down: Vec::new(),
             shown: String::new(),
+            text_at: Vec::new(),
             copied: Vec::new(),
         };
         w.frames(vec![]);
@@ -175,6 +178,14 @@ impl Win {
             egui::OutputCommand::CopyText(t) => Some(t.clone()),
             _ => None,
         }));
+        self.text_at = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::epaint::Shape::Text(t) => Some((t.galley.text().to_string(), t.pos)),
+                _ => None,
+            })
+            .collect();
         self.shown = out
             .shapes
             .iter()

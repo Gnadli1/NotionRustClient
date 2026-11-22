@@ -357,9 +357,7 @@ pub(crate) fn edit_id(block_id: &str) -> Id {
 /// (font size, bold) for a row's text.
 fn look(m: &Marker) -> (f32, bool) {
     match m {
-        Marker::Heading(1) => (30.0, true),
-        Marker::Heading(2) => (24.0, true),
-        Marker::Heading(_) => (19.0, true),
+        Marker::Heading(l) => (theme::H_SIZE[usize::from(*l).clamp(1, 3) - 1], true),
         Marker::Code(_) => (14.0, false),
         _ => (16.0, false),
     }
@@ -743,25 +741,29 @@ impl App {
         }
         let out = area.show(ui, |ui| {
             let w = ui.available_width();
-            let col = w.min(900.0);
+            let col = (w - 2.0 * theme::PAGE_PAD).clamp(200.0, theme::PAGE_MAX_WIDTH).min(w);
             ui.horizontal_top(|ui| {
                 ui.add_space((w - col) / 2.0);
                 ui.vertical(|ui| {
                     ui.set_max_width(col);
-                    ui.add_space(16.0);
+                    ui.spacing_mut().item_spacing.y = theme::BLOCK_GAP;
+                    ui.add_space(theme::TITLE_TOP);
                     acts.extend(crate::pages::header(ui, c, &self.meta, self.current.as_deref().and_then(|id| self.cover_shown(ui, id))));
-                    acts.extend(crate::view::breadcrumb(ui, c, &crumbs, &title));
-                    ui.add_space(8.0);
-                    acts.extend(self.title_ui(ui, &title));
-                    if let Some((who, text)) = &edited {
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            if let Some((id, name)) = who {
-                                crate::people::avatar(ui, id, name, 16.0);
-                            }
-                            ui.label(RichText::new(text).size(12.0).color(c.secondary));
-                        });
-                    }
+                    // breadcrumb, title and edited line share the text rows' left edge
+                    Frame::new().inner_margin(Margin { left: theme::TEXT_INSET as i8, ..Margin::ZERO }).show(ui, |ui| {
+                        acts.extend(crate::view::breadcrumb(ui, c, &crumbs, &title));
+                        ui.add_space(8.0);
+                        acts.extend(self.title_ui(ui, &title));
+                        if let Some((who, text)) = &edited {
+                            ui.add_space(2.0);
+                            ui.horizontal(|ui| {
+                                if let Some((id, name)) = who {
+                                    crate::people::avatar(ui, id, name, 16.0);
+                                }
+                                ui.label(RichText::new(text).size(12.0).color(c.secondary));
+                            });
+                        }
+                    });
                     ui.add_space(12.0);
                     let selected = self.sel_rows();
                     for idx in 0..self.rows.len() {
@@ -778,8 +780,14 @@ impl App {
                             let block = theme::block_color(&self.rows[idx].color, ui.visuals().dark_mode).1;
                             let fills = block.into_iter().chain(tint.map(|t| c.accent.gamma_multiply(t)));
                             let bgs: Vec<_> = fills.map(|f| (ui.painter().add(egui::Shape::Noop), f)).collect();
+                            if let Marker::Heading(l) = self.rows[idx].marker {
+                                ui.add_space(theme::H_ABOVE[usize::from(l).clamp(1, 3) - 1]);
+                            }
                             let top = ui.cursor().top();
                             acts.extend(self.row_ui(ui, idx));
+                            if matches!(self.rows[idx].marker, Marker::Heading(_)) {
+                                ui.add_space(theme::H_BELOW);
+                            }
                             let r = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
                             for (bg, f) in bgs {
                                 ui.painter().set(bg, egui::Shape::rect_filled(r, 3.0, f));
@@ -828,7 +836,7 @@ impl App {
             if comments > 0 {
                 ui.set_max_width(full - 52.0);
             }
-            let (gutter, _) = ui.allocate_exact_size(egui::vec2(12.0, 20.0), Sense::hover());
+            let (gutter, _) = ui.allocate_exact_size(egui::vec2(theme::TEXT_INSET - ui.spacing().item_spacing.x, 20.0), Sense::hover());
             if let Some(col) = dot {
                 ui.painter().circle_filled(gutter.center(), 3.0, col);
             }
@@ -933,7 +941,7 @@ impl App {
                         });
                     }
                 }
-                Marker::LinkCard { kind, url, label } => {
+                Marker::LinkCard { kind, url, label } if kind != "image" => {
                     let text = format!("🔗 [{kind}] {}", if label.is_empty() { url } else { label });
                     let r = ui.add(Label::new(text).sense(Sense::click()));
                     if clicked_new_tab(ui, &r).is_some() {
@@ -943,13 +951,28 @@ impl App {
                 Marker::Synced | Marker::ColumnList | Marker::Column | Marker::Breadcrumb => {
                     ui.label(RichText::new(marker.label()).color(grey));
                 }
-                Marker::Unsupported(t) if t == "image" => {
+                // the outline turns an image with a URL into a link card: draw the picture
+                Marker::Unsupported(t) | Marker::LinkCard { kind: t, .. } if t == "image" => {
                     let id = &self.rows[idx].block_id;
-                    match self.media.src(&self.store, id, false) {
-                        Some(src) => crate::media::block_image(ui, &self.media.show(ui.ctx(), id, false, &src), grey),
-                        None => {
-                            ui.label(RichText::new("[image]").color(grey));
+                    let (url, label) = match &marker {
+                        Marker::LinkCard { url, label, .. } => (url.as_str(), label.as_str()),
+                        _ => ("", ""),
+                    };
+                    let shown = self.media.src(&self.store, id, false).map(|src| self.media.show(ui.ctx(), id, false, &src));
+                    if !url.is_empty() && !matches!(shown, Some(crate::media::Shown::Tex(_) | crate::media::Shown::Loading)) {
+                        let r = ui.add(Label::new(format!("🔗 [image] {}", if label.is_empty() { url } else { label })).sense(Sense::click()));
+                        if clicked_new_tab(ui, &r).is_some() {
+                            act = Some(Action::Link { link: crate::links::route(url), new_tab: false });
                         }
+                    } else if let Some(shown) = shown {
+                        ui.vertical(|ui| {
+                            crate::media::block_image(ui, &shown, grey);
+                            if !label.is_empty() && label != url {
+                                ui.label(RichText::new(label).small().color(grey));
+                            }
+                        });
+                    } else {
+                        ui.label(RichText::new("[image]").color(grey));
                     }
                 }
                 Marker::Unsupported(t) => {
@@ -1027,35 +1050,83 @@ impl App {
         };
         let (indent, locked) = (26.0 * self.rows[idx].depth as f32, self.rows[idx].locked);
         let mut acts = Vec::new();
+        let c = theme::colors(ui);
+        let mut cells = Vec::new();
         let grid = ui.horizontal_top(|ui| {
+            // the same gutter text rows reserve, so tables share their left edge
+            ui.allocate_exact_size(egui::vec2(theme::TEXT_INSET - ui.spacing().item_spacing.x, 20.0), Sense::hover());
             ui.add_space(indent);
-            egui::Grid::new(("table", idx)).striped(true).show(ui, |ui| {
-                for (ri, r) in t.rows.iter().enumerate() {
-                    for (ci, c) in r.cells.iter().enumerate() {
-                        let editing = self
-                            .focus
-                            .as_ref()
-                            .is_some_and(|f| f.idx == idx && f.cell == Some((r.id.clone(), ci)));
-                        if editing {
-                            acts.extend(self.cell_edit(ui));
-                            continue;
+            egui::ScrollArea::horizontal().id_salt(("table-scroll", self.rows[idx].block_id.clone())).show(ui, |ui| {
+                let header_bg = ui.painter().add(egui::Shape::Noop);
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                    egui::Grid::new(("table", idx)).min_col_width(0.0).min_row_height(0.0).show(ui, |ui| {
+                        for (ri, r) in t.rows.iter().enumerate() {
+                            for (ci, cell) in r.cells.iter().enumerate() {
+                                let pad = Margin::symmetric(theme::TABLE_PAD_X, theme::TABLE_PAD_Y);
+                                let rect = Frame::new().inner_margin(pad).show(ui, |ui| {
+                                    let editing = self
+                                        .focus
+                                        .as_ref()
+                                        .is_some_and(|f| f.idx == idx && f.cell == Some((r.id.clone(), ci)));
+                                    if editing {
+                                        acts.extend(self.cell_edit(ui));
+                                        return;
+                                    }
+                                    let users = &self.users;
+                                    let job = self
+                                        .table_jobs
+                                        .entry((idx, ri, ci))
+                                        .or_insert_with(|| md::rich_job(&cell.rich_text, 15.0, false, users));
+                                    let mut l = Label::new(job.clone());
+                                    let click = !locked && cell.editable;
+                                    if click {
+                                        l = l.sense(Sense::click()).selectable(false);
+                                    }
+                                    let resp = ui.add(l);
+                                    if click && resp.on_hover_cursor(egui::CursorIcon::Text).clicked() {
+                                        acts.push(Action::EditCell(r.id.clone(), ci));
+                                    }
+                                });
+                                cells.push((ri, ci, rect.response.rect));
+                            }
+                            ui.end_row();
                         }
-                        let users = &self.users;
-                        let job = self
-                            .table_jobs
-                            .entry((idx, ri, ci))
-                            .or_insert_with(|| md::rich_job(&c.rich_text, 15.0, false, users));
-                        let mut l = Label::new(job.clone());
-                        let click = !locked && c.editable;
-                        if click {
-                            l = l.sense(Sense::click()).selectable(false);
-                        }
-                        let resp = ui.add(l);
-                        if click && resp.on_hover_cursor(egui::CursorIcon::Text).clicked() {
-                            acts.push(Action::EditCell(r.id.clone(), ci));
-                        }
+                    });
+                });
+                // cell borders: every cell padded to its column's width and row's height
+                let (mut cw, mut rh) = (Vec::<f32>::new(), Vec::<f32>::new());
+                for &(ri, ci, r) in &cells {
+                    if cw.len() <= ci {
+                        cw.resize(ci + 1, 0.0);
                     }
-                    ui.end_row();
+                    if rh.len() <= ri {
+                        rh.resize(ri + 1, 0.0);
+                    }
+                    cw[ci] = cw[ci].max(r.width());
+                    rh[ri] = rh[ri].max(r.height());
+                }
+                let Some(&(_, _, first)) = cells.first() else {
+                    return;
+                };
+                    let stroke = egui::Stroke::new(1.0, c.border);
+                // grid lines drawn once; a ragged row is padded to the widest
+                let (w, h) = (cw.iter().sum::<f32>(), rh.iter().sum::<f32>());
+                let whole = egui::Rect::from_min_size(first.min, egui::vec2(w, h));
+                ui.painter().rect_stroke(whole, 0.0, stroke, egui::StrokeKind::Inside);
+                let mut x = first.left();
+                for cwi in cw.iter().take(cw.len().saturating_sub(1)) {
+                    x += cwi;
+                    ui.painter().line_segment([egui::pos2(x, whole.top()), egui::pos2(x, whole.bottom())], stroke);
+                }
+                let mut y = first.top();
+                for rhi in rh.iter().take(rh.len().saturating_sub(1)) {
+                    y += rhi;
+                    ui.painter().line_segment([egui::pos2(whole.left(), y), egui::pos2(whole.right(), y)], stroke);
+                }
+                let header = (t.column_header && !rh.is_empty()).then(|| egui::Rect::from_min_size(first.min, egui::vec2(w, rh[0])));
+            if let Some(r) = header {
+                    ui.painter().set(header_bg, egui::Shape::rect_filled(r, 0.0, c.text.gamma_multiply(theme::TABLE_HEADER_TINT)));
                 }
             });
         });
@@ -1080,11 +1151,23 @@ impl App {
                     Color32::PLACEHOLDER,
                     f32::INFINITY,
                 ),
+                Marker::TableOfContents => {
+                    let mut job = md::rich_job(&r.rich_text, size, bold, users);
+                    for s in &mut job.sections {
+                        s.format.line_height = Some(size * theme::TOC_LINE);
+                    }
+                    job
+                }
                 _ => md::rich_job(&r.rich_text, size, bold, users),
             }
         });
         let linked = rows[idx].rich_text.iter().any(|r| links::run_link(r).is_some());
         let mut tinted = job.clone();
+        if matches!(rows[idx].marker, Marker::TableOfContents) {
+            // at draw time, so a theme change recolours it
+            let border = egui::Stroke::new(1.0, theme::colors(ui).border);
+            tinted.sections.iter_mut().for_each(|s| s.format.underline = border);
+        }
         if let Some(t) = theme::block_color(&rows[idx].color, ui.visuals().dark_mode).0 {
             md::tint(&mut tinted, t);
         }

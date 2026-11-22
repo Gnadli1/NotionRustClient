@@ -95,6 +95,7 @@ pub(crate) fn header(ui: &mut Ui, c: &Colors, m: &Meta, pic: Option<Shown>) -> O
         ui.add_space(6.0);
     }
     ui.horizontal(|ui| {
+        ui.add_space(crate::theme::TEXT_INSET);
         let icon = m.icon.as_deref().unwrap_or("＋");
         let size = if m.icon.is_some() { 44.0 } else { 16.0 };
         let l = Label::new(RichText::new(icon).size(size).color(if m.icon.is_some() { c.text } else { c.secondary })).sense(Sense::click());
@@ -610,6 +611,31 @@ mod tests {
         // one undo step each
         w.press(Key::Z, Modifiers::CTRL);
         assert_eq!(w.app.meta.icon.as_deref(), Some("🦄"));
+    }
+
+    #[test]
+    fn real_shaped_image_blocks_take_the_media_path_not_a_link_label() {
+        use crate::outline::tests::blk;
+        let store = Store::open_in_memory().unwrap();
+        add_page(&store, "p", None, &[]);
+        let file = blk("imf", "p", "image", serde_json::json!({ "type": "file", "caption": [],
+            "file": { "url": "https://s3.test/a.png?sig=1", "expiry_time": "2099-01-01T00:00:00.000Z" } }));
+        let ext = blk("ime", "p", "image", serde_json::json!({ "type": "external", "caption": [],
+            "external": { "url": "https://x.test/b.png" } }));
+        store.replace_children("p", "p", &[file, ext]).unwrap();
+        let mut w = Win::new(store);
+        w.app.apply(crate::app::Action::Open("p".into()));
+        w.frames(vec![]);
+        w.frames(vec![]);
+        for id in ["imf", "ime"] {
+            assert!(w.app.media.src(&w.app.store, id, false).is_some(), "{id} has a source");
+        }
+        let asked: Vec<_> = w.cmds().into_iter().filter_map(|c| match c {
+            crate::worker::Cmd::Media { id, .. } => Some(id),
+            _ => None,
+        }).collect();
+        assert!(asked.contains(&"imf".to_string()) && asked.contains(&"ime".to_string()), "asked: {asked:?}");
+        assert!(!w.shown.contains("[image]"), "no link label: {}", w.shown);
     }
 
     #[test]

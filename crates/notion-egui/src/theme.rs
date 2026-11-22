@@ -40,6 +40,27 @@ pub const DARK: Colors = Colors {
     error: Color32::from_rgb(0xE6, 0x6A, 0x6A),
 };
 
+// Page layout, tuned to Notion's proportions (points).
+pub const TITLE_SIZE: f32 = 40.0;
+pub const TITLE_TOP: f32 = 24.0;
+pub const PAGE_PAD: f32 = 48.0;
+/// Where text starts inside the page column: the row gutter plus the item
+/// spacing a text row gets. Icon, breadcrumb, title, blocks and tables share it.
+pub const TEXT_INSET: f32 = 20.0;
+pub const PAGE_MAX_WIDTH: f32 = 900.0;
+/// Vertical gap between blocks.
+pub const BLOCK_GAP: f32 = 5.0;
+pub const H_SIZE: [f32; 3] = [30.0, 24.0, 19.0];
+/// Extra space above / below a heading of level 1, 2, 3.
+pub const H_ABOVE: [f32; 3] = [28.0, 20.0, 14.0];
+pub const H_BELOW: f32 = 2.0;
+/// A table of contents line is this many times the font size tall.
+pub const TOC_LINE: f32 = 1.6;
+pub const TABLE_PAD_X: i8 = 9;
+pub const TABLE_PAD_Y: i8 = 6;
+/// Fill of the table's header row.
+pub const TABLE_HEADER_TINT: f32 = 0.06;
+
 /// The palette of the theme `ui` is drawn in.
 pub fn colors(ui: &egui::Ui) -> &'static Colors {
     if ui.visuals().dark_mode {

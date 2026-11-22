@@ -1421,7 +1421,7 @@ impl App {
         if self.current.is_some() && self.heads.len() >= 2 && ctx.content_rect().width() >= 1000.0 {
             acts.extend(
                 egui::Panel::right("outline")
-                    .frame(Frame::new())
+                    .frame(Frame::new().fill(c.bg))
                     .exact_size(28.0)
                     .resizable(false)
                     .show_separator_line(false)
