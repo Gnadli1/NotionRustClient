@@ -160,3 +160,10 @@ I pulled all 164 pages shared with the integration into the cache. One failed wi
 5. **A cell changed in Notion while you type** is refused ("changed in Notion meanwhile"); Esc is the only way out, and Ctrl+S and undo wait until then.
 6. **Unpushed rows** can't be trashed or opened as a page until Ctrl+S. Select and avatar colours aren't drawn.
 7. **UNVERIFIED against live Notion:** the property write shapes, `POST /v1/pages` under a `data_source_id`, `GET /v1/databases/{id}`, and the timestamp filter on a data source query.
+
+## Known gaps after C5 (reviewed, deferred)
+1. **Set `NOTION_USER_ID`** to your Notion user id (not a secret). Internal integrations are owned by the workspace, so without it Updates records nothing and says so.
+2. **Built from what the app pulls:** activity on pages you never pull (open, poll, sync-all) doesn't appear. Database rows don't raise page-edit entries.
+3. **Viewing reads:** the page open in a focused window marks its entries read straight away.
+4. **Resolved or deleted comments** keep their entry. The list shows the newest 200.
+5. **UNVERIFIED on screen:** the Updates modal and its keys (Ctrl+Shift+J, Ctrl+Shift+A); the sidebar-click guard has no test.
