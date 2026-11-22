@@ -12,5 +12,5 @@ tokio.workspace = true
 image.workspace = true
 
 [dev-dependencies]
-# session.rs (shared with notion-gui) tests use it
+# session.rs tests use it
 tempfile.workspace = true

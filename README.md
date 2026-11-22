@@ -35,7 +35,6 @@ You need a Notion integration, and pages shared with it, before anything shows u
 | `notion-egui` | **The app.** The desktop client (egui/eframe). |
 | `notion-core` | Notion API client, SQLite cache, sync, ops queue and conflict handling. |
 | `notion-cli` | A small command-line tool: `search`, `pull`, `sync-all`, `cat`, `edit-block`, `push`, `status`. |
-| `notion-gui` | The older iced prototype, kept for reference. Use `notion-egui`. |
 
 ## Limitations
 
@@ -44,8 +43,6 @@ Some things aren't possible through Notion's public API:
 - sharing and permissions;
 - Notion's own inbox and notifications;
 - keystroke-level live updates. Changes appear once Notion saves them, which is usually within seconds.
-
-Known gaps for each feature are listed in [`docs/phase3-plan.md`](docs/phase3-plan.md).
 
 ## Development
 

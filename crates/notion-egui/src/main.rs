@@ -29,24 +29,17 @@ mod undo;
 mod view;
 mod views;
 mod worker;
-// shared with notion-gui for now; a crate of their own later
 #[allow(dead_code)]
-#[path = "../../notion-gui/src/outline.rs"]
 mod outline;
 #[allow(dead_code)]
-#[path = "../../notion-gui/src/session.rs"]
 mod session;
 #[allow(dead_code)]
-#[path = "../../notion-gui/src/sidebar.rs"]
 mod sidebar;
 #[allow(dead_code)]
-#[path = "../../notion-gui/src/slash.rs"]
 mod slash;
 #[allow(dead_code)]
-#[path = "../../notion-gui/src/tabs.rs"]
 mod tabs;
 #[allow(dead_code)]
-#[path = "../../notion-gui/src/tex.rs"]
 mod tex;
 
 use std::path::{Path, PathBuf};
