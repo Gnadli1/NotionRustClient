@@ -21,6 +21,43 @@ use crate::{Error, Result};
 /// with `NOTION_PRIVATE_BASE`.
 pub const DEFAULT_BASE: &str = "https://www.notion.so";
 
+/// Whether `base` may receive the session cookie: the real site, or a
+/// loopback `http://127.0.0.1:<port>` / `http://localhost:<port>` for tests.
+pub fn safe_base(base: &str) -> bool {
+    let base = base.trim_end_matches('/');
+    if base == DEFAULT_BASE {
+        return true;
+    }
+    reqwest::Url::parse(base).is_ok_and(|u| {
+        u.scheme() == "http"
+            && matches!(u.host_str(), Some("127.0.0.1" | "localhost"))
+            && u.port().is_some()
+            && u.path() == "/"
+            && u.username().is_empty()
+    })
+}
+
+/// Whether the `file_token` cookie may be sent to `url`: a `notion.so` host
+/// over https, or the (already validated) private base itself.
+pub fn cookie_url_ok(url: &str, base: &str) -> bool {
+    let (Ok(u), Ok(b)) = (reqwest::Url::parse(url), reqwest::Url::parse(base)) else {
+        return false;
+    };
+    let notion = u.scheme() == "https"
+        && u.host_str()
+            .is_some_and(|h| h == "notion.so" || h.ends_with(".notion.so"));
+    notion
+        || (safe_base(base)
+            && u.scheme() == b.scheme()
+            && u.host_str() == b.host_str()
+            && u.port_or_known_default() == b.port_or_known_default())
+}
+
+/// Escapes a key for use as one JSON-pointer segment.
+fn ptr(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
 /// The browser-session credential and the workspace it is scoped to.
 #[derive(Clone)]
 pub struct PrivateAuth {
@@ -284,7 +321,7 @@ impl Records {
                     if let Some(schema) = collection.get("schema").and_then(Value::as_object) {
                         for (key, entry) in schema {
                             if entry.get("type").and_then(Value::as_str) == Some("title") {
-                                if let Some(value) = rec.pointer(&format!("/properties/{key}")) {
+                                if let Some(value) = rec.pointer(&format!("/properties/{}", ptr(key))) {
                                     properties.insert(
                                         key.clone(),
                                         json!({ "id": key, "type": "title",
@@ -293,7 +330,7 @@ impl Records {
                                 }
                                 continue;
                             }
-                            if let Some(value) = rec.pointer(&format!("/properties/{key}")) {
+                            if let Some(value) = rec.pointer(&format!("/properties/{}", ptr(key))) {
                                 properties.insert(key.clone(), property_to_official(entry, value));
                             }
                         }
@@ -473,7 +510,7 @@ impl Records {
     fn schema_entry(&self, rec: &Value, key: &str) -> Option<Value> {
         let parent_id = rec.get("parent_id").and_then(Value::as_str)?;
         let collection = self.collections.get(parent_id)?;
-        collection.pointer(&format!("/schema/{key}")).cloned()
+        collection.pointer(&format!("/schema/{}", ptr(key))).cloned()
     }
 
     fn collection_name(&self, rec: &Value) -> Option<String> {
@@ -726,7 +763,7 @@ fn table_cells(records: &Records, rec: &Value) -> Vec<Value> {
         .iter()
         .map(|col| {
             Value::Array(
-                rec.pointer(&format!("/properties/{col}"))
+                rec.pointer(&format!("/properties/{}", ptr(col)))
                     .map(rich_text_to_official)
                     .unwrap_or_default(),
             )
@@ -1291,6 +1328,7 @@ pub async fn browser_spaces(token_v2: &str, base: &str) -> Result<(Option<String
     if token.is_empty() {
         return Err(Error::Invalid("token_v2 is empty".into()));
     }
+    let base = if safe_base(base) { base } else { DEFAULT_BASE };
     let http = reqwest::Client::new();
     // `getUserSpaces` lists every workspace the account belongs to, including
     // workspaces other people shared with it. The older bootstrap endpoints
@@ -1339,14 +1377,15 @@ async fn space_post(
         .header("Cookie", format!("token_v2={token}"))
         .json(&json!({}))
         .send()
-        .await?;
+        .await
+        .map_err(|e| Error::Http(e.without_url()))?;
     let status = resp.status().as_u16();
-    let text = resp.text().await?;
+    let text = resp.text().await.map_err(|e| Error::Http(e.without_url()))?;
     if !(200..300).contains(&status) {
         return Err(Error::Api {
             status,
             code: "browser_login_failed".into(),
-            message: text,
+            message: "the browser login request was refused".into(),
         });
     }
     Ok(serde_json::from_str(&text)?)
@@ -1473,9 +1512,17 @@ pub fn block_record_from_official(
     space_id: &str,
     user_id: Option<&str>,
 ) -> Result<Value> {
+    // An update body has no "type" (sync strips it): infer it from the one
+    // `{<type>: payload}` key so the block is never treated as a paragraph.
     let ty = body
         .get("type")
         .and_then(Value::as_str)
+        .or_else(|| {
+            body.as_object()?
+                .keys()
+                .map(String::as_str)
+                .find(|k| *k == "paragraph" || private_type_of(k) != "text")
+        })
         .unwrap_or("paragraph");
     let ptype = private_type_of(ty);
     let payload = body.get(ty).cloned().unwrap_or_else(|| json!({}));
@@ -1484,11 +1531,11 @@ pub fn block_record_from_official(
     let mut format = Map::new();
     match ptype {
         "text" | "header" | "sub_header" | "sub_sub_header" | "header_4" | "bulleted_list"
-        | "numbered_list" | "toggle" | "quote" | "callout" | "code" | "equation" => {
-            props.insert(
-                "title".into(),
-                rich_text_to_private(payload.get("rich_text").unwrap_or(&json!([]))),
-            );
+        | "numbered_list" | "to_do" | "toggle" | "quote" | "callout" | "code" | "equation" => {
+            // only fields present are written, so a partial update never wipes text
+            if let Some(rt) = payload.get("rich_text") {
+                props.insert("title".into(), rich_text_to_private(rt));
+            }
             if let Some(color) = payload.get("color").and_then(Value::as_str) {
                 format.insert("block_color".into(), json!(color));
             }
@@ -1499,20 +1546,10 @@ pub fn block_record_from_official(
             {
                 format.insert("toggleable".into(), json!(true));
             }
-            if ptype == "to_do" {
+            if let Some(checked) = payload.get("checked").and_then(Value::as_bool) {
                 props.insert(
                     "checked".into(),
-                    json!([[
-                        if payload
-                            .get("checked")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                        {
-                            "Yes"
-                        } else {
-                            "No"
-                        }
-                    ]]),
+                    json!([[if checked { "Yes" } else { "No" }]]),
                 );
             }
             if ptype == "code" {
@@ -1533,23 +1570,25 @@ pub fn block_record_from_official(
                 .or_else(|| payload.pointer("/file_upload/id"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            props.insert("source".into(), json!([[url]]));
-            props.insert(
-                "caption".into(),
-                rich_text_to_private(payload.get("caption").unwrap_or(&json!([]))),
-            );
-            format.insert("display_source".into(), json!(url));
+            if !url.is_empty() {
+                props.insert("source".into(), json!([[url]]));
+                format.insert("display_source".into(), json!(url));
+            }
+            if let Some(caption) = payload.get("caption") {
+                props.insert("caption".into(), rich_text_to_private(caption));
+            }
         }
         "bookmark" | "embed" => {
             let url = payload
                 .get("url")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            props.insert("link".into(), json!([[url]]));
-            props.insert(
-                "caption".into(),
-                rich_text_to_private(payload.get("caption").unwrap_or(&json!([]))),
-            );
+            if !url.is_empty() {
+                props.insert("link".into(), json!([[url]]));
+            }
+            if let Some(caption) = payload.get("caption") {
+                props.insert("caption".into(), rich_text_to_private(caption));
+            }
         }
         "table" | "table_row" => {
             return Err(Error::Invalid(
@@ -1582,12 +1621,13 @@ pub fn block_record_from_official(
 }
 
 /// Official property body -> private property value, using a collection schema.
-pub fn property_to_private(entry: &Value, value: &Value) -> Value {
+/// Types that can't be written losslessly are an `Error::Invalid`.
+pub fn property_to_private(entry: &Value, value: &Value) -> Result<Value> {
     let typ = entry
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("rich_text");
-    match typ {
+    Ok(match typ {
         "title" => rich_text_to_private(value.get("title").unwrap_or(&json!([]))),
         "rich_text" => rich_text_to_private(value.get("rich_text").unwrap_or(&json!([]))),
         "number" => json!([[value.get("number").map(value_text).unwrap_or_default()]]),
@@ -1606,9 +1646,14 @@ pub fn property_to_private(entry: &Value, value: &Value) -> Value {
                 .into_iter()
                 .flatten()
                 .filter_map(|o| o.get("name").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join(",");
-            json!([[names]])
+                .collect::<Vec<_>>();
+            // the reader splits the stored text on commas
+            if let Some(n) = names.iter().find(|n| n.contains(',')) {
+                return Err(Error::Invalid(format!(
+                    "multi-select option `{n}` contains a comma, which the browser backend can't store"
+                )));
+            }
+            json!([[names.join(",")]])
         }
         "checkbox" => json!([[
             if value
@@ -1674,8 +1719,12 @@ pub fn property_to_private(entry: &Value, value: &Value) -> Value {
             }
             Value::Array(runs)
         }
-        _ => rich_text_to_private(value.get("rich_text").unwrap_or(&json!([]))),
-    }
+        other => {
+            return Err(Error::Invalid(format!(
+                "the browser backend can't write `{other}` properties"
+            )))
+        }
+    })
 }
 
 fn value_text(v: &Value) -> String {
@@ -1746,6 +1795,29 @@ pub fn list_op(block_id: &str, space_id: &str, path: &str, command: &str, args: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pointer_keys_are_escaped() {
+        assert_eq!(ptr("a/b~c"), "a~1b~0c");
+        let rec = json!({ "properties": { "a/b": 1, "a": { "b": 2 } } });
+        assert_eq!(rec.pointer(&format!("/properties/{}", ptr("a/b"))), Some(&json!(1)));
+    }
+
+    #[test]
+    fn bases_and_cookie_hosts_are_checked() {
+        assert!(safe_base("https://www.notion.so/") && safe_base("http://127.0.0.1:8080"));
+        assert!(safe_base("http://localhost:9"));
+        for b in ["https://evil.example", "http://www.notion.so", "http://127.0.0.1", "https://www.notion.so.evil.com"] {
+            assert!(!safe_base(b), "{b}");
+        }
+        let b = "http://127.0.0.1:8080";
+        assert!(cookie_url_ok("https://file.notion.so/f/a.png?x=1", DEFAULT_BASE));
+        assert!(cookie_url_ok("https://notion.so/a", DEFAULT_BASE));
+        assert!(cookie_url_ok("http://127.0.0.1:8080/a.png", b));
+        for u in ["https://s3.amazonaws.com/x", "https://evilnotion.so/x", "https://notion.so.evil.com/x", "http://file.notion.so/x", "http://127.0.0.1:9/x"] {
+            assert!(!cookie_url_ok(u, b), "{u}");
+        }
+    }
+
     use super::*;
 
     fn rec(id: &str, ty: &str) -> Value {
@@ -1881,5 +1953,68 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn partial_update_bodies_never_wipe_or_retype() {
+        let body = json!({ "heading_2": { "color": "red" } });
+        let rec = block_record_from_official("b", &body, "p", "block", "s", None).unwrap();
+        assert_eq!(rec["type"], "sub_header");
+        assert!(rec["properties"].get("title").is_none());
+        let todo = json!({ "to_do": { "checked": false } });
+        let rec = block_record_from_official("b", &todo, "p", "block", "s", None).unwrap();
+        assert_eq!(rec["properties"]["checked"], json!([["No"]]));
+    }
+
+    #[test]
+    fn lossy_property_writes_are_refused() {
+        let formula = json!({ "type": "formula" });
+        assert!(property_to_private(&formula, &json!({ "formula": {} })).is_err());
+        let ms = json!({ "type": "multi_select" });
+        let tags = |n: &str| json!({ "multi_select": [{ "name": "a" }, { "name": n }] });
+        assert!(property_to_private(&ms, &tags("b,c")).is_err());
+        assert_eq!(
+            property_to_private(&ms, &tags("b")).unwrap(),
+            json!([["a,b"]])
+        );
+    }
+
+    #[test]
+    fn property_values_round_trip_through_the_reader() {
+        let opts = json!([{ "name": "a", "id": "1" }, { "name": "b", "id": "2" }]);
+        let e = |t: &str| json!({ "id": "k", "type": t, "options": opts });
+        let cases = [
+            ("select", json!({ "select": { "name": "a" } })),
+            ("multi_select", json!({ "multi_select": [{ "name": "a" }, { "name": "b" }] })),
+            ("number", json!({ "number": 4.5 })),
+            ("checkbox", json!({ "checkbox": true })),
+            ("checkbox", json!({ "checkbox": false })),
+            ("date", json!({ "date": { "start": "2024-01-02", "end": null } })),
+        ];
+        for (t, v) in cases {
+            let stored = property_to_private(&e(t), &v).unwrap();
+            let back = property_to_official(&e(t), &stored);
+            match t {
+                "select" => assert_eq!(back[t]["name"], "a"),
+                "multi_select" => assert_eq!(back[t].as_array().unwrap().len(), 2),
+                "number" => assert_eq!(back[t], json!(4.5)),
+                "checkbox" => assert_eq!(back[t], v["checkbox"]),
+                _ => assert_eq!(back[t]["start"], "2024-01-02"),
+            }
+        }
+        let text = json!({ "id": "k", "type": "rich_text" });
+        let stored = property_to_private(&text, &json!({ "rich_text": [] })).unwrap();
+        assert_eq!(property_to_official(&text, &stored)["rich_text"], json!([]));
+        for t in ["rollup", "formula", "files"] {
+            assert!(property_to_private(&json!({ "type": t }), &json!({})).is_err(), "{t}");
+        }
+    }
+
+    #[test]
+    fn lookalike_hosts_are_rejected() {
+        for u in ["https://notion.so.evil.com/", "https://evilnotion.so/", "http://www.notion.so/"] {
+            assert!(!safe_base(u), "{u}");
+            assert!(!cookie_url_ok(u, DEFAULT_BASE), "{u}");
+        }
     }
 }

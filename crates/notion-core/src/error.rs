@@ -8,6 +8,8 @@ pub enum Error {
         code: String,
         message: String,
     },
+    #[error("browser session expired — sign in again")]
+    SessionExpired,
     #[error("rate limited, retries exhausted")]
     RetriesExhausted,
     #[error("sqlite: {0}")]

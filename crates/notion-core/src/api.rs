@@ -100,6 +100,8 @@ struct PrivateState {
     views_for_collection: HashMap<String, Vec<String>>,
     /// Short-lived browser-file cookie from `GET /f/refresh`.
     file_token: Option<String>,
+    /// `token_v2` was refused (401, or 403 from /f/refresh); private calls fail without network.
+    expired: bool,
 }
 
 impl std::fmt::Debug for Client {
@@ -132,8 +134,7 @@ impl Client {
     pub fn new_private(auth: PrivateAuth, cfg: ClientConfig) -> Self {
         let base = std::env::var("NOTION_PRIVATE_BASE")
             .ok()
-            .filter(|b| b.starts_with("http"))
-            .unwrap_or_else(|| private::DEFAULT_BASE.to_string());
+            .unwrap_or_default();
         Self::new_private_at(base, auth, cfg)
     }
 
@@ -150,9 +151,27 @@ impl Client {
             limiter: Limiter::new(cfg.requests_per_sec, cfg.burst),
             cfg,
             private: Some(auth),
-            private_base: base.into(),
+            private_base: Some(base.into())
+                .filter(|b| private::safe_base(b))
+                .unwrap_or_else(|| private::DEFAULT_BASE.into()),
             private_state: std::sync::Mutex::new(PrivateState::default()),
         }
+    }
+
+    fn session_expired(&self) -> bool {
+        self.private_state.lock().is_ok_and(|s| s.expired)
+    }
+
+    fn expire_session(&self) -> Error {
+        if let Ok(mut s) = self.private_state.lock() {
+            s.expired = true;
+        }
+        Error::SessionExpired
+    }
+
+    /// Whether the `file_token` cookie may be sent to `url`.
+    pub fn file_cookie_ok(&self, url: &str) -> bool {
+        private::cookie_url_ok(url, &self.private_base)
     }
 
     pub fn is_private(&self) -> bool {
@@ -173,6 +192,9 @@ impl Client {
             .private
             .as_ref()
             .ok_or_else(|| Error::Invalid("not a browser-session client".into()))?;
+        if self.session_expired() {
+            return Err(Error::SessionExpired);
+        }
         let url = format!(
             "{}/api/v3/{endpoint}",
             self.private_base.trim_end_matches('/')
@@ -196,12 +218,15 @@ impl Client {
             if let Some(user) = &auth.user_id {
                 req = req.header("x-notion-active-user-header", user);
             }
-            let resp = req.send().await?;
+            let resp = req.send().await.map_err(|e| Error::Http(e.without_url()))?;
             let status = resp.status().as_u16();
             let wait = Self::retry_after(&resp);
-            let text = resp.text().await?;
+            let text = resp.text().await.map_err(|e| Error::Http(e.without_url()))?;
             if (200..300).contains(&status) {
                 return Ok(serde_json::from_str(&text)?);
+            }
+            if status == 401 {
+                return Err(self.expire_session());
             }
             if status == 429 || status >= 500 {
                 last = Some(status);
@@ -223,7 +248,7 @@ impl Client {
                 .get("message")
                 .and_then(Value::as_str)
                 .or_else(|| err.get("error_description").and_then(Value::as_str))
-                .unwrap_or(&text);
+                .unwrap_or("request failed");
             return Err(Error::Api {
                 status,
                 code: code.to_string(),
@@ -383,6 +408,9 @@ impl Client {
             return Ok(token);
         }
         let auth = self.private_auth()?;
+        if self.session_expired() {
+            return Err(Error::SessionExpired);
+        }
         let url = format!("{}/f/refresh", self.private_base.trim_end_matches('/'));
         let resp = self
             .http
@@ -394,7 +422,8 @@ impl Client {
             )
             .header("Cookie", format!("token_v2={}", auth.token_v2))
             .send()
-            .await?;
+            .await
+            .map_err(|e| Error::Http(e.without_url()))?;
         let status = resp.status().as_u16();
         let cookies: Vec<String> = resp
             .headers()
@@ -404,11 +433,13 @@ impl Client {
             .map(str::to_string)
             .collect();
         if !(200..300).contains(&status) {
-            let text = resp.text().await.unwrap_or_default();
+            if status == 401 || status == 403 {
+                return Err(self.expire_session());
+            }
             return Err(Error::Api {
                 status,
                 code: "file_token_failed".into(),
-                message: text,
+                message: "could not get a file token".into(),
             });
         }
         let token = cookies.iter().find_map(|c| {
@@ -764,16 +795,17 @@ impl Client {
                 .header("Content-Type", mime)
                 .body(bytes)
                 .send()
-                .await?;
+                .await
+                .map_err(|e| Error::Http(e.without_url()))?;
             if !resp.status().is_success() {
                 return Err(Error::Invalid(format!(
                     "upload failed with HTTP {}",
                     resp.status().as_u16()
                 )));
             }
+            // `url` is the stable file reference; `signedGetUrl` expires.
             return Ok(created
-                .get("signedGetUrl")
-                .or_else(|| created.get("url"))
+                .get("url")
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::Invalid("upload URL has no file URL".into()))?
                 .to_string());
@@ -962,10 +994,7 @@ impl Client {
                 == Some("collection"))
             .then_some(parent_id.as_str());
             let schema = match collection {
-                Some(collection) => self
-                    .private_collection_schema(collection)
-                    .await
-                    .unwrap_or_default(),
+                Some(collection) => self.private_collection_schema(collection).await?,
                 None => Map::new(),
             };
             let mut private_props = Map::new();
@@ -974,8 +1003,9 @@ impl Client {
                     (key == "title" || value.get("title").is_some())
                         .then(|| json!({ "id": "title", "type": "title" }))
                 });
-                let Some(entry) = entry else { continue };
-                private_props.insert(key.clone(), private::property_to_private(&entry, value));
+                let entry =
+                    entry.ok_or_else(|| Error::Invalid(format!("unknown property `{key}`")))?;
+                private_props.insert(key.clone(), private::property_to_private(&entry, value)?);
             }
             if !private_props.is_empty() {
                 let ops = private_props
@@ -1029,9 +1059,7 @@ impl Client {
             let id = private::new_id();
             let official_props = body.get("properties").cloned().unwrap_or_else(|| json!({}));
             let schema = if parent_table == "collection" {
-                self.private_collection_schema(&parent_id)
-                    .await
-                    .unwrap_or_default()
+                self.private_collection_schema(&parent_id).await?
             } else {
                 Map::new()
             };
@@ -1039,7 +1067,7 @@ impl Client {
             if parent_table == "collection" {
                 for (key, entry) in &schema {
                     if let Some(value) = official_props.get(key) {
-                        props.insert(key.clone(), private::property_to_private(entry, value));
+                        props.insert(key.clone(), private::property_to_private(entry, value)?);
                     } else if entry.get("type").and_then(Value::as_str) == Some("title") {
                         props.insert(key.clone(), json!([[""]]));
                     }
@@ -1147,20 +1175,48 @@ impl Client {
     pub async fn move_page(&self, id: &str, parent: &str) -> Result<Value> {
         if self.is_private() {
             let space = self.private_space_id()?;
+            // reject moving a page under itself or one of its descendants
+            let mut cur = parent.to_string();
+            let mut rooted = false;
+            for _ in 0..64 {
+                if cur == id {
+                    return Err(Error::Invalid("cannot move a page under itself".into()));
+                }
+                let rec = self.private_record(&cur).await?;
+                if rec.get("parent_table").and_then(Value::as_str) != Some("block") {
+                    rooted = true;
+                    break;
+                }
+                cur = rec
+                    .get("parent_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            if !rooted {
+                return Err(Error::Invalid("page tree too deep to move safely".into()));
+            }
             let current = self.private_record(id).await?;
             let old_parent = current
                 .get("parent_id")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let mut ops = Vec::new();
-            if !old_parent.is_empty() {
-                ops.push(private::list_op(
+            match current.get("parent_table").and_then(Value::as_str) {
+                Some("block") if !old_parent.is_empty() => ops.push(private::list_op(
                     old_parent,
                     &space,
                     "content",
                     "listRemove",
                     json!({ "id": id }),
-                ));
+                )),
+                Some("collection") => {
+                    return Err(Error::Invalid(
+                        "a database row can't be moved out of its database here".into(),
+                    ))
+                }
+                // a space/workspace root page has no `content` list to remove from
+                _ => {}
             }
             ops.push(private::update_op(
                 id,
@@ -2539,6 +2595,28 @@ mod private_api_tests {
         })
     }
 
+    #[test]
+    fn a_non_notion_base_falls_back_to_the_default() {
+        let c = Client::new_private_at("https://evil.example", auth(), ClientConfig::default());
+        assert_eq!(c.private_base, private::DEFAULT_BASE);
+        assert!(!c.file_cookie_ok("https://s3.amazonaws.com/x"));
+    }
+
+    #[tokio::test]
+    async fn a_401_expires_the_session_and_stops_further_calls() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("token_v2=tok"))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let c = client(&s);
+        let e = c.private_post("loadUserContent", json!({})).await.unwrap_err();
+        assert!(matches!(e, Error::SessionExpired), "{e}");
+        let e = c.private_post("loadUserContent", json!({})).await.unwrap_err();
+        assert!(matches!(e, Error::SessionExpired));
+    }
+
     #[tokio::test]
     async fn browser_spaces_reads_the_cookie_and_spaces() {
         let s = MockServer::start().await;
@@ -2703,5 +2781,265 @@ mod private_api_tests {
             .unwrap();
         assert_eq!(resp["object"], "page");
         assert!(resp["id"].as_str().is_some());
+    }
+
+    fn rt(text: &str) -> Value {
+        json!([{ "type": "text", "text": { "content": text, "link": null },
+            "annotations": { "bold": false, "italic": false, "strikethrough": false,
+                "underline": false, "code": false, "color": "default" },
+            "plain_text": text, "href": null }])
+    }
+
+    fn record(id: &str, ty: &str, parent: &str, table: &str) -> Value {
+        json!({
+            "id": id, "type": ty, "alive": true,
+            "parent_id": parent, "parent_table": table,
+            "properties": { "title": [["Old"]] }, "content": [],
+            "created_time": 1700000000000_i64, "last_edited_time": 1700000000000_i64,
+        })
+    }
+
+    async fn serve_records(s: &MockServer, recs: Vec<Value>) {
+        let blocks: Map<String, Value> = recs
+            .into_iter()
+            .map(|r| (r["id"].as_str().unwrap().to_string(), json!({ "value": r })))
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/api/v3/syncRecordValues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "recordMap": { "block": blocks }
+            })))
+            .mount(s)
+            .await;
+    }
+
+    async fn mount_fanout(s: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/api/v3/saveTransactionsFanout"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(s)
+            .await;
+    }
+
+    async fn fanout_ops(s: &MockServer) -> Vec<Value> {
+        let reqs = s.received_requests().await.unwrap();
+        let req = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("saveTransactionsFanout"))
+            .expect("no transaction was sent");
+        let body: Value = serde_json::from_slice(&req.body).unwrap();
+        body["transactions"][0]["operations"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn updating_a_heading_without_type_keeps_type_and_text() {
+        let s = MockServer::start().await;
+        serve_records(&s, vec![record("h1", "header", "p1", "block")]).await;
+        mount_fanout(&s).await;
+        // the shape sync's `enqueue_kind` sends: no "type" key
+        let body = json!({ "heading_1": { "rich_text": rt("New"), "color": "red" } });
+        client(&s).update_block("h1", &body).await.unwrap();
+        let ops = fanout_ops(&s).await;
+        let title = ops
+            .iter()
+            .find(|o| o["path"] == json!(["properties", "title"]));
+        assert_eq!(title.unwrap()["args"], json!([["New"]]));
+        // nothing rewrites the record or its type
+        assert!(ops
+            .iter()
+            .all(|o| o["path"] != json!([]) && o["path"] != json!(["type"])));
+    }
+
+    #[tokio::test]
+    async fn to_do_checked_round_trips() {
+        let s = MockServer::start().await;
+        serve_records(&s, vec![record("t1", "to_do", "p1", "block")]).await;
+        mount_fanout(&s).await;
+        let body = json!({ "to_do": { "rich_text": rt("Task"), "checked": true } });
+        client(&s).update_block("t1", &body).await.unwrap();
+        let ops = fanout_ops(&s).await;
+        let at = |k: &str| ops.iter().find(|o| o["path"] == json!(["properties", k]));
+        assert_eq!(at("checked").unwrap()["args"], json!([["Yes"]]));
+        assert_eq!(at("title").unwrap()["args"], json!([["Task"]]));
+    }
+
+    #[tokio::test]
+    async fn a_failed_schema_fetch_fails_the_property_write() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/syncRecordValues"))
+            .and(body_partial_json(
+                json!({ "requests": [{ "pointer": { "table": "collection" } }] }),
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&s)
+            .await;
+        serve_records(&s, vec![record("r1", "page", "c1", "collection")]).await;
+        mount_fanout(&s).await;
+        let props = json!({ "Name": { "title": rt("x") } });
+        assert!(client(&s)
+            .update_page_properties("r1", &props)
+            .await
+            .is_err());
+        let reqs = s.received_requests().await.unwrap();
+        assert!(reqs
+            .iter()
+            .all(|r| !r.url.path().ends_with("saveTransactionsFanout")));
+    }
+
+    #[tokio::test]
+    async fn moving_a_page_under_its_descendant_is_refused() {
+        let s = MockServer::start().await;
+        serve_records(
+            &s,
+            vec![
+                record("p1", "page", "s1", "space"),
+                record("b1", "page", "p1", "block"),
+            ],
+        )
+        .await;
+        mount_fanout(&s).await;
+        let c = client(&s);
+        assert!(matches!(
+            c.move_page("p1", "b1").await,
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            c.move_page("p1", "p1").await,
+            Err(Error::Invalid(_))
+        ));
+        let reqs = s.received_requests().await.unwrap();
+        assert!(reqs
+            .iter()
+            .all(|r| !r.url.path().ends_with("saveTransactionsFanout")));
+    }
+
+    #[tokio::test]
+    async fn moving_a_root_page_does_not_list_remove_from_the_space() {
+        let s = MockServer::start().await;
+        serve_records(
+            &s,
+            vec![
+                record("p1", "page", "s1", "space"),
+                record("p2", "page", "s1", "space"),
+            ],
+        )
+        .await;
+        mount_fanout(&s).await;
+        client(&s).move_page("p1", "p2").await.unwrap();
+        let ops = fanout_ops(&s).await;
+        assert!(ops.iter().all(|o| o["command"] != "listRemove"));
+    }
+
+    #[tokio::test]
+    async fn upload_stores_the_stable_url_not_the_signed_one() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/getUploadFileUrl"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "url": "attachment:abc:a.png",
+                "signedGetUrl": "https://signed.example/a.png?X-Amz-Expires=1",
+                "signedPutUrl": format!("{}/put", s.uri()),
+            })))
+            .mount(&s)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/put"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&s)
+            .await;
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.png");
+        std::fs::write(&f, b"png").unwrap();
+        assert_eq!(
+            client(&s).upload_file(&f).await.unwrap(),
+            "attachment:abc:a.png"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_403_does_not_expire_the_session() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "name": "x" })))
+            .expect(2)
+            .mount(&s)
+            .await;
+        let c = client(&s);
+        for _ in 0..2 {
+            let e = c.private_post("loadUserContent", json!({})).await.unwrap_err();
+            assert!(matches!(e, Error::Api { status: 403, .. }), "{e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_property_key_is_refused_without_a_transaction() {
+        let s = MockServer::start().await;
+        serve_records(&s, vec![record("r1", "page", "p1", "block")]).await;
+        mount_fanout(&s).await;
+        let props = json!({ "Nope": { "number": 1 } });
+        assert!(client(&s).update_page_properties("r1", &props).await.is_err());
+        let reqs = s.received_requests().await.unwrap();
+        assert!(reqs.iter().all(|r| !r.url.path().ends_with("saveTransactionsFanout")));
+    }
+
+    #[tokio::test]
+    async fn moving_a_database_row_is_refused() {
+        let s = MockServer::start().await;
+        serve_records(
+            &s,
+            vec![
+                record("r1", "page", "c1", "collection"),
+                record("p2", "page", "s1", "space"),
+            ],
+        )
+        .await;
+        mount_fanout(&s).await;
+        assert!(matches!(client(&s).move_page("r1", "p2").await, Err(Error::Invalid(_))));
+        let reqs = s.received_requests().await.unwrap();
+        assert!(reqs.iter().all(|r| !r.url.path().ends_with("saveTransactionsFanout")));
+    }
+
+    #[tokio::test]
+    async fn bulleted_quote_toggle_updates_keep_type_and_text() {
+        for (key, ty) in [
+            ("bulleted_list_item", "bulleted_list"),
+            ("quote", "quote"),
+            ("toggle", "toggle"),
+        ] {
+            let s = MockServer::start().await;
+            serve_records(&s, vec![record("b1", ty, "p1", "block")]).await;
+            mount_fanout(&s).await;
+            let body = json!({ key: { "rich_text": rt("New") } });
+            client(&s).update_block("b1", &body).await.unwrap();
+            let ops = fanout_ops(&s).await;
+            let t = ops.iter().find(|o| o["path"] == json!(["properties", "title"]));
+            assert_eq!(t.unwrap()["args"], json!([["New"]]), "{key}");
+            assert!(ops.iter().all(|o| o["path"] != json!(["type"])), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn move_page_refuses_a_tree_deeper_than_the_cap() {
+        let s = MockServer::start().await;
+        // every block's parent is another block, so the walk never reaches a root
+        Mock::given(method("POST"))
+            .and(path("/api/v3/syncRecordValues"))
+            .respond_with(move |req: &wiremock::Request| {
+                let b: Value = serde_json::from_slice(&req.body).unwrap();
+                let id = b["requests"][0]["pointer"]["id"].as_str().unwrap().to_string();
+                let rec = json!({ "id": id, "type": "page", "alive": true,
+                    "parent_id": format!("{id}x"), "parent_table": "block" });
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "recordMap": { "block": { id.clone(): { "role": "editor", "value": rec } } }
+                }))
+            })
+            .mount(&s)
+            .await;
+        let e = client(&s).move_page("a", "b").await.unwrap_err();
+        assert!(matches!(e, Error::Invalid(_)), "{e}");
     }
 }

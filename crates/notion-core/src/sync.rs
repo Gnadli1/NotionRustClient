@@ -537,7 +537,7 @@ pub async fn pull_all(
                 Ok((true, _)) => report.skipped += 1,
                 Ok((false, false)) => report.pages += 1,
                 Ok((false, true)) => report.data_sources += 1,
-                Err(e @ Error::Api { status: 401, .. }) => return Err(e),
+                Err(e @ (Error::Api { status: 401, .. } | Error::SessionExpired)) => return Err(e),
                 Err(Error::Http(e)) if e.is_connect() || e.is_timeout() => {
                     return Err(Error::Http(e))
                 }
@@ -556,7 +556,7 @@ pub async fn pull_all(
             Ok((true, _)) => report.skipped += 1,
             Ok((false, false)) => report.pages += 1,
             Ok((false, true)) => report.data_sources += 1,
-            Err(e @ Error::Api { status: 401, .. }) => return Err(e),
+            Err(e @ (Error::Api { status: 401, .. } | Error::SessionExpired)) => return Err(e),
             Err(Error::Http(e)) if e.is_connect() || e.is_timeout() => return Err(Error::Http(e)),
             Err(e) => report.errors.push(format!("{title}: {e}")),
         }
@@ -813,7 +813,9 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
             }
             let resp = match client.create_page(&req).await {
                 // Never reached Notion (or it said no): safe to retry or fail as usual.
-                Err(e @ (Error::Api { .. } | Error::RetriesExhausted)) => return Err(e),
+                Err(e @ (Error::Api { .. } | Error::RetriesExhausted | Error::SessionExpired)) => {
+                    return Err(e)
+                }
                 Err(Error::Http(e)) if e.is_connect() => return Err(Error::Http(e)),
                 // The POST may have landed: a retry could create it twice.
                 Err(_) => {
@@ -949,7 +951,9 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
             body["rich_text"] = rich_text.clone();
             let resp = match client.create_comment(&body).await {
                 // Never reached Notion (or it said no): safe to retry or fail as usual.
-                Err(e @ (Error::Api { .. } | Error::RetriesExhausted)) => return Err(e),
+                Err(e @ (Error::Api { .. } | Error::RetriesExhausted | Error::SessionExpired)) => {
+                    return Err(e)
+                }
                 Err(Error::Http(e)) if e.is_connect() => return Err(Error::Http(e)),
                 // The POST may have landed: a retry could post it twice.
                 Err(_) => {
@@ -7598,5 +7602,67 @@ mod tests {
 
     fn ts_parse(t: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc)
+    }
+
+    fn private_client(s: &MockServer) -> Client {
+        Client::new_private_at(
+            s.uri(),
+            crate::private::PrivateAuth {
+                token_v2: "tok".into(),
+                space_id: "s1".into(),
+                user_id: None,
+                cookies: None,
+            },
+            ClientConfig {
+                requests_per_sec: 1000.0,
+                burst: 1000,
+                max_retries: 0,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn a_pull_on_a_dead_private_session_aborts() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/api/v3/search"))
+            .respond_with(ok(json!({
+                "results": ["p1"],
+                "recordMap": { "block": { "p1": { "role": "editor", "value": {
+                    "id": "p1", "type": "page", "alive": true,
+                    "parent_id": "s1", "parent_table": "space",
+                    "properties": { "title": [["Hello"]] }, "content": [],
+                    "created_time": 1700000000000_i64,
+                    "last_edited_time": 1700000000000_i64 } } } }
+            })))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/loadPageChunk"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&s)
+            .await;
+        let e = pull_all(&private_client(&s), &store, |_, _, _| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::SessionExpired), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn a_create_page_on_a_dead_session_stays_queued() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        local_create_page(&store, "p", None, "New").unwrap();
+        let p = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&p)
+            .await;
+        let e = push(&private_client(&p), &store).await.unwrap_err();
+        assert!(matches!(e, Error::SessionExpired), "{e:?}");
+        assert_eq!(store.queued_ops().unwrap().len(), 1);
     }
 }

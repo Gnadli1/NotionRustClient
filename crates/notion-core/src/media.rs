@@ -387,13 +387,13 @@ pub async fn fetch(client: &Client, store: &Store, id: &str, owner: Owner) -> Re
         attachment = true;
         src.url = client.signed_file_url(id, &src.url).await?;
     }
-    let mut file_cookie = if attachment {
+    let mut file_cookie = if attachment && client.file_cookie_ok(&src.url) {
         Some(format!("file_token={}", client.file_token().await?))
     } else {
         None
     };
     let bytes = match download(&http, &src.url, MAX_DOWNLOAD, file_cookie.as_deref()).await {
-        Err(Dl::Forbidden) if attachment => {
+        Err(Dl::Forbidden) if file_cookie.is_some() => {
             // The file token can expire; exchange the API session once more.
             client.clear_file_token();
             file_cookie = Some(format!("file_token={}", client.file_token().await?));
@@ -1042,6 +1042,18 @@ mod tests {
             att,
             "the stable attachment URL is cached, not the signature"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_signed_download_leaves_the_query_out_of_the_error() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let url = format!("http://127.0.0.1:{port}/a.png?X-Amz-Signature=SECRET");
+        let Err(Dl::Failed(e)) = download(&reqwest::Client::new(), &url, 10, None).await else {
+            panic!("expected a failure");
+        };
+        assert!(!e.to_string().contains("SECRET"), "{e}");
     }
 
     #[test]
