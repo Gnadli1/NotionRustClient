@@ -167,3 +167,9 @@ I pulled all 164 pages shared with the integration into the cache. One failed wi
 3. **Viewing reads:** the page open in a focused window marks its entries read straight away.
 4. **Resolved or deleted comments** keep their entry. The list shows the newest 200.
 5. **UNVERIFIED on screen:** the Updates modal and its keys (Ctrl+Shift+J, Ctrl+Shift+A); the sidebar-click guard has no test.
+
+## Known gaps after F5 (reviewed, deferred)
+1. **Saved views** supply only name and type; their group-by, filter and sort are ignored. The `GET /v1/views` shape is UNVERIFIED and may need a newer Notion-Version; on any error the local views are used.
+2. **Board** groups by the first status, else first select; **calendar** uses the first date property and ignores time zones. A card can't move to "No value" on a status board.
+3. **Keys** (Ctrl+Shift+V, Ctrl+Shift+←/→, PageUp/PageDown) are fixed, not in the keymap. Ctrl+Enter on a non-table view adds a row but opens no title editor.
+4. **UNVERIFIED on screen:** layout of all four views, horizontal board scroll, gallery key steps. Gallery images come with F7.
