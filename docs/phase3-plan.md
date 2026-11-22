@@ -173,3 +173,10 @@ I pulled all 164 pages shared with the integration into the cache. One failed wi
 2. **Board** groups by the first status, else first select; **calendar** uses the first date property and ignores time zones. A card can't move to "No value" on a status board.
 3. **Keys** (Ctrl+Shift+V, Ctrl+Shift+←/→, PageUp/PageDown) are fixed, not in the keymap. Ctrl+Enter on a non-table view adds a row but opens no title editor.
 4. **UNVERIFIED on screen:** layout of all four views, horizontal board scroll, gallery key steps. Gallery images come with F7.
+
+## Known gaps after F7 (reviewed, deferred)
+1. **Dependencies:** `image` 0.25 (png/jpeg/gif/webp) and reqwest's `multipart` feature. `egui_extras` was approved but isn't needed.
+2. **Not built:** uploading a cover (external cover URLs still work), opening or downloading `file` blocks (they show as "[file]"), avatar pictures (still initials). Gallery cards show covers only, not the first image block.
+3. **Limits:** disk cache 500 MB (oldest evicted), 32 textures kept beyond what's on screen, 2 decodes at once, covers and thumbnails at 512 px, block images at 2048 px, downloads capped at 50 MB. A retry after a failed attach re-uploads the file (Notion drops the orphan after 1 h).
+4. **External image URLs** follow up to 3 redirects to any host; private addresses aren't refused.
+5. **UNVERIFIED against live Notion:** the File Upload request shapes under 2025-09-03, and whether image responses carry `expiry_time`. **On screen:** layout, cover crop, thumbnails on gallery cards.
