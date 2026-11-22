@@ -19,6 +19,8 @@ pub fn show(
     tree: &[PageEntry],
     open: &HashSet<String>,
     current: Option<&str>,
+    unread: usize,
+    no_person: bool,
 ) -> Option<Action> {
     let mut act = None;
     let hint = RichText::new("Ctrl+K").small().color(c.secondary);
@@ -31,6 +33,21 @@ pub fn show(
     });
     if search.clicked() {
         act = Some(Action::Search);
+    }
+    let inbox = super::item(ui, c, false, 30.0, |ui| {
+        ui.label("🔔");
+        ui.label(if unread > 0 { RichText::new("Updates").strong() } else { RichText::new("Updates") });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if unread > 0 {
+                ui.label(RichText::new(unread.to_string()).small().strong());
+            }
+        });
+    });
+    if inbox.clicked() {
+        act = Some(Action::Updates);
+    }
+    if no_person {
+        ui.label(RichText::new(crate::inbox::NO_PERSON).small().color(c.secondary));
     }
     let sync = super::item(ui, c, false, 30.0, |ui| {
         ui.label("⟳");

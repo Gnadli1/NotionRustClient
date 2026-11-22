@@ -11,6 +11,7 @@ mod comments;
 mod edit;
 mod editing;
 mod grid;
+mod inbox;
 mod keys;
 mod links;
 mod md;

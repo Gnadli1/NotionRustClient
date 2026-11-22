@@ -69,11 +69,27 @@ pub async fn run(
     mut cmds: tmpsc::UnboundedReceiver<Cmd>,
     mut emit: impl FnMut(Event),
 ) {
+    // who "you" are, for the Updates inbox: `users/me` the first time a
+    // command that records activity runs, retried at most every 5 minutes
+    // until it works; NOTION_USER_ID (a user id, not a secret) names the person
+    let env_user = std::env::var("NOTION_USER_ID").ok().filter(|u| !u.is_empty());
+    // refetched once per session so a removed or changed NOTION_USER_ID takes effect
+    let mut identity_done = false;
+    let mut identity_try: Option<std::time::Instant> = None;
     while let Some(cmd) = cmds.recv().await {
         let Some(client) = client else {
             emit(Event::Error("offline: NOTION_TOKEN not set".into()));
             continue;
         };
+        if !identity_done
+            && matches!(cmd, Cmd::Pull { .. } | Cmd::Poll { .. } | Cmd::PullComments { .. } | Cmd::SyncAll)
+            && identity_try.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(300))
+        {
+            identity_try = Some(std::time::Instant::now());
+            if let Ok((bot, owner)) = client.me_identity().await {
+                identity_done = store.set_identity(&bot, owner.as_deref(), env_user.as_deref()).is_ok();
+            }
+        }
         let ev = match cmd {
             Cmd::Pull { id, force } => sync::pull_any(client, store, &id, force)
                 .await
@@ -85,7 +101,10 @@ pub async fn run(
             Cmd::PullComments { id } => sync::pull_comments(client, store, &id)
                 .await
                 .map(|_| Event::CommentsPulled),
-            Cmd::Me => client.me().await.map(Event::Me),
+            Cmd::Me => client.me_identity().await.map(|(bot, owner)| {
+                identity_done |= store.set_identity(&bot, owner.as_deref(), env_user.as_deref()).is_ok();
+                Event::Me(bot)
+            }),
             Cmd::PullUsers => match sync::pull_users(client, store).await {
                 Ok(_) => Ok(Event::UsersPulled),
                 Err(Error::Api { status: 403, .. }) => Ok(Event::UsersDenied),
@@ -359,5 +378,60 @@ mod tests {
         assert!(matches!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Event::Error(m) if m.contains("not a conflict")));
         drop(tx);
         handle.join().unwrap();
+    }
+
+    /// The users/me identity fetch happens at most once per session (even when
+    /// it fails), is saved, and adds no Event: one answer per command.
+    #[test]
+    fn identity_is_fetched_once_and_emits_no_extra_event() {
+        use notion_core::api::ClientConfig;
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use std::sync::Arc;
+        for me_ok in [true, false] {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", l.local_addr().unwrap());
+            let hits = Arc::new(AtomicUsize::new(0));
+            let h = hits.clone();
+            std::thread::spawn(move || {
+                for mut c in l.incoming().flatten() {
+                    let mut buf = [0u8; 4096];
+                    let n = c.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let (status, body) = if req.contains("/v1/users/me") {
+                        h.fetch_add(1, SeqCst);
+                        if me_ok {
+                            (200, r#"{"id":"bot1","bot":{"owner":{"type":"user","user":{"id":"owner1"}}}}"#)
+                        } else {
+                            (500, r#"{"object":"error","status":500,"code":"x","message":"m"}"#)
+                        }
+                    } else {
+                        (500, r#"{"object":"error","status":500,"code":"x","message":"m"}"#)
+                    };
+                    let _ = write!(
+                        c,
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("cache.db");
+            let (tx, rx, handle) = spawn_with(db.clone(), egui::Context::default(), move || {
+                Some(Client::new("t".into(), ClientConfig { base_url: url, max_retries: 0, ..Default::default() }))
+            });
+            tx.send(Cmd::Pull { id: "p".into(), force: false }).unwrap();
+            tx.send(Cmd::PullComments { id: "p".into() }).unwrap();
+            tx.send(Cmd::Poll { id: "p".into(), skip: sync::Skip::Never }).unwrap();
+            tx.send(Cmd::SyncAll).unwrap();
+            drop(tx);
+            handle.join().unwrap();
+            let evs: Vec<Event> = rx.try_iter().filter(|e| !matches!(e, Event::Progress { .. })).collect();
+            assert_eq!(evs.len(), 4, "exactly one event per command: {evs:?}");
+            assert!(!evs.iter().any(|e| matches!(e, Event::Me(_))), "{evs:?}");
+            assert_eq!(hits.load(SeqCst), 1, "users/me once (me_ok={me_ok})");
+            let id = Store::open(&db).unwrap().identity().unwrap();
+            assert_eq!(id.is_some(), me_ok);
+        }
     }
 }

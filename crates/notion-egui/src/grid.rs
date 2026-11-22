@@ -592,6 +592,7 @@ impl App {
         let Some(db) = &self.db else { return };
         if self.switcher.is_some()
             || self.dlg.is_some()
+            || self.inbox.is_some()
             || self.conflict.is_some()
             || self.problems_open
             || self.comments.is_some()

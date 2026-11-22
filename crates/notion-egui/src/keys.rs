@@ -243,6 +243,9 @@ pub enum Command {
     MovePage,
     ToggleLock,
     TrashView,
+    /// The local Updates inbox (C5), and marking all of it read.
+    Updates,
+    MarkAllRead,
 }
 
 impl Command {
@@ -276,6 +279,8 @@ impl Command {
                 | Command::MovePage
                 | Command::ToggleLock
                 | Command::TrashView
+                | Command::Updates
+                | Command::MarkAllRead
         )
     }
 }
@@ -334,6 +339,8 @@ const NAMES: &[(&str, Command)] = &[
     ("move_page", Command::MovePage),
     ("toggle_lock", Command::ToggleLock),
     ("trash_view", Command::TrashView),
+    ("updates", Command::Updates),
+    ("mark_all_read", Command::MarkAllRead),
 ];
 
 /// Notion's Linux keys (Ctrl+Shift+0-9 for block types; 9, "page", has no
@@ -399,6 +406,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("ctrl+shift+p", "move_page"),
     ("ctrl+shift+l", "toggle_lock"),
     ("ctrl+shift+delete", "trash_view"),
+    ("ctrl+shift+j", "updates"),
+    ("ctrl+shift+a", "mark_all_read"),
 ];
 
 fn command(name: &str) -> Option<Command> {
@@ -850,6 +859,18 @@ mod tests {
         assert!(p.is_empty(), "{p:?}");
         assert_eq!(k.get(&ch("ctrl+d")), Some(Command::Duplicate));
         assert_eq!(k.get(&ch("ctrl+alt+t")), Some(Command::ToggleAll));
+    }
+
+    #[test]
+    fn inbox_keys_are_bound_and_defaults_have_no_clashes() {
+        let k = Keymap::default();
+        assert_eq!(k.get(&ch("ctrl+shift+j")), Some(Command::Updates));
+        assert_eq!(k.get(&ch("ctrl+shift+a")), Some(Command::MarkAllRead));
+        let mut chords = std::collections::HashSet::new();
+        for (c, _) in DEFAULTS {
+            assert!(chords.insert(*c), "duplicate default chord {c}");
+        }
+        assert_eq!(k.0.len(), DEFAULTS.len());
     }
 
     #[test]

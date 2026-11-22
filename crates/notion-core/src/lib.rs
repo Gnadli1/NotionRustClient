@@ -1,5 +1,6 @@
 //! Headless Notion core: API client, models, SQLite mirror, op queue, sync.
 
+pub mod activity;
 pub mod api;
 pub mod error;
 pub mod markdown;

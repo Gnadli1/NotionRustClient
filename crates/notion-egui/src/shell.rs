@@ -58,6 +58,7 @@ impl App {
             self.last_error = Some(e.to_string());
         }
         self.load_comments();
+        self.refresh_unread();
         // a push may have renamed the edited local-* block
         if let Some(f) = &mut self.focus {
             match self.store.resolve_id(&f.block_id) {
@@ -139,6 +140,11 @@ impl App {
         self.page_head = None;
         self.meta = page.as_ref().map(crate::pages::Meta::of).unwrap_or_default();
         self.block_edits = self.store.block_edits(id)?;
+        // viewing the page reads its Updates entries (C5), once the window is
+        // focused (on focus gain the frame loop marks it)
+        if let Some(e) = self.was_focused.then(|| self.store.mark_page_read(id)).and_then(Result::err) {
+            self.last_error = Some(e.to_string());
+        }
         self.title = page
             .as_ref()
             .map_or_else(|| "(not cached)".into(), |p| p.title());
@@ -1033,7 +1039,10 @@ impl App {
             self.sidebar = !self.sidebar;
             out.retain(|c| *c != Command::ToggleSidebar);
         }
-        if self.dlg.is_some() {
+        if self.inbox.is_some() {
+            // the inbox is modal: it has the keys, bar its own two
+            out.retain(|c| matches!(c, Command::Updates | Command::MarkAllRead));
+        } else if self.dlg.is_some() {
             // a page dialog is modal: it has the keys
             out.clear();
         } else if self.switcher.is_some() {
@@ -1083,6 +1092,7 @@ impl App {
         // Esc closes the find bar when nothing else wants it
         let free = self.switcher.is_none()
             && self.dlg.is_none()
+            && self.inbox.is_none()
             && self.conflict.is_none()
             && self.comments.is_none()
             && !self.problems_open
@@ -1113,6 +1123,10 @@ impl App {
             | Command::MovePage
             | Command::ToggleLock
             | Command::TrashView => self.page_command(c),
+            Command::Updates | Command::MarkAllRead
+                if self.switcher.is_some() || self.conflict.is_some() || self.dlg.is_some() => {}
+            Command::Updates => self.toggle_inbox(),
+            Command::MarkAllRead => self.mark_all_read(),
             Command::ToggleAll
                 if self.switcher.is_some()
                     || self.conflict.is_some()
@@ -1283,9 +1297,13 @@ impl App {
         if let Some(d) = self.dlg_keys(&ctx) {
             self.dlg_done(d);
         }
+        self.inbox_keys(&ctx);
         let focused = ctx.input(|i| i.focused);
         let gained = focused && !self.was_focused;
         self.was_focused = focused;
+        if gained {
+            self.mark_open_page_read();
+        }
         let now = Instant::now();
         self.poll_at(now, gained);
         self.users_tick(now);
@@ -1334,7 +1352,7 @@ impl App {
                     .size_range(180.0..=420.0)
                     .default_size(260.0)
                     .show(ui, |ui| {
-                        view::sidebar::show(ui, c, &self.tree, &self.tree_open, self.current.as_deref())
+                        view::sidebar::show(ui, c, &self.tree, &self.tree_open, self.current.as_deref(), self.unread, self.no_person)
                     })
                     .inner,
             );
@@ -1417,6 +1435,7 @@ impl App {
         if let Some(d) = self.dlg_ui(&ctx, c) {
             self.dlg_done(d);
         }
+        self.inbox_ui(&ctx, c);
         blur_first(&mut acts);
         for a in acts {
             self.apply(a);

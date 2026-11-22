@@ -248,6 +248,9 @@ pub async fn pull_loaded(
     if let Err(e) = pull_comments(client, store, &page.id).await {
         tracing::warn!("comments of {} not pulled: {e}", page.id);
     }
+    if let Err(e) = store.note_page(&page) {
+        tracing::warn!("updates of {} not recorded: {e}", page.id);
+    }
     Ok(report)
 }
 
@@ -282,6 +285,9 @@ pub async fn pull_comments(client: &Client, store: &Store, parent_id: &str) -> R
         }
     }
     store.replace_comments(parent_id, &list)?;
+    if let Err(e) = store.note_comments(parent_id, &list) {
+        tracing::warn!("updates of comments on {parent_id} not recorded: {e}");
+    }
     let mut found = Vec::new();
     list.iter().for_each(|c| users_in(&c.raw, &mut found));
     store.put_users(&dedupe_users(found))?;

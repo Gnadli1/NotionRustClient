@@ -147,6 +147,8 @@ pub(crate) enum Action {
     /// An outline tick: scroll to this row.
     Goto(usize),
     NewTab,
+    /// Opens or closes the Updates inbox.
+    Updates,
     /// Opens the Ctrl+K switcher.
     Search,
     /// The sidebar's "Sync everything".
@@ -315,6 +317,11 @@ pub struct App {
     pub(crate) switcher: Option<Switcher>,
     /// The page dialog (icon, cover, trash confirm, trash view), while open.
     pub(crate) dlg: Option<Dlg>,
+    /// The Updates inbox view (C5), and the unread count the sidebar shows.
+    pub(crate) inbox: Option<crate::inbox::Inbox>,
+    pub(crate) unread: usize,
+    /// No person identity (NOTION_USER_ID or a person-owned integration): nothing is recorded.
+    pub(crate) no_person: bool,
     /// The open page's icon, cover and lock.
     pub(crate) meta: Meta,
     /// When each open page was last polled (see [`App::poll_at`]).
@@ -483,6 +490,9 @@ impl App {
             users_note: None,
             switcher: None,
             dlg: None,
+            inbox: None,
+            unread: 0,
+            no_person: true,
             meta: Meta::default(),
             polled: HashMap::new(),
             full_at: HashMap::new(),
@@ -633,6 +643,8 @@ impl App {
             Action::Color { text, color } => self.step(|s| s.set_color(text, color)),
             Action::Paste(text) => self.step(|s| s.paste_lines(&text)),
             Action::NewPage(text) => self.new_page(text),
+            Action::Updates if self.switcher.is_some() || self.conflict.is_some() || self.dlg.is_some() => {}
+            Action::Updates => self.toggle_inbox(),
             Action::Dlg(d) => {
                 if self.commit() {
                     self.dlg = Some(d);

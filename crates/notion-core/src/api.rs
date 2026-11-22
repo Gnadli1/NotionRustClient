@@ -256,11 +256,20 @@ impl Client {
 
     /// The integration's own (bot) user id: `created_by` of comments made here.
     pub async fn me(&self) -> Result<String> {
+        Ok(self.me_identity().await?.0)
+    }
+
+    /// [`me`](Self::me) plus the person who owns the integration (`bot.owner`
+    /// of type "user"; None if the workspace owns it): the "you" of the inbox.
+    pub async fn me_identity(&self) -> Result<(String, Option<String>)> {
         let v = self.send(Method::GET, "/v1/users/me", &[], None).await?;
-        v["id"]
+        let id = v["id"]
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| Error::Invalid("users/me has no id".into()))
+            .ok_or_else(|| Error::Invalid("users/me has no id".into()))?;
+        let owner = &v["bot"]["owner"];
+        let owner = (owner["type"] == "user").then(|| owner["user"]["id"].as_str().map(str::to_string)).flatten();
+        Ok((id, owner))
     }
 
     /// Every workspace user, persons and bots, all pages. Needs the
@@ -903,6 +912,19 @@ mod tests {
             "{d}"
         );
     }
+    #[tokio::test]
+    async fn me_identity_reads_the_owner_only_when_a_person() {
+        for (body, want) in [
+            (json!({"id": "b", "bot": {"owner": {"type": "user", "user": {"id": "u1"}}}}), Some("u1")),
+            (json!({"id": "b", "bot": {"owner": {"type": "workspace", "workspace": true}}}), None),
+            (json!({"id": "b"}), None),
+        ] {
+            let s = MockServer::start().await;
+            Mock::given(path("/v1/users/me")).respond_with(ResponseTemplate::new(200).set_body_json(body)).mount(&s).await;
+            assert_eq!(client(&s, 0).me_identity().await.unwrap(), ("b".to_string(), want.map(str::to_string)));
+        }
+    }
+
     #[tokio::test]
     async fn list_users_paginates_and_parses_persons_and_bots() {
         let s = MockServer::start().await;
