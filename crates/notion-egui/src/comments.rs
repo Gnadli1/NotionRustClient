@@ -44,6 +44,8 @@ pub(crate) struct Panel {
     pub block_comments: Vec<Comment>,
     /// Ids already fetched since the panel opened.
     asked: HashSet<String>,
+    /// When the threads were last polled (see `App::poll_comments_at`).
+    pub(crate) polled: Option<std::time::Instant>,
 }
 
 /// Comments grouped by thread, in order of each thread's first comment.
@@ -127,6 +129,7 @@ impl App {
             page_comments: Vec::new(),
             block_comments: Vec::new(),
             asked: HashSet::new(),
+            polled: None,
         });
         // the page's threads may be stale too: one request each
         if let Some(p) = self.current.clone() {

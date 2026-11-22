@@ -1282,6 +1282,20 @@ fn enqueue_update(store: &Store, base: &Block, block: &Block, body: Value) -> Re
             store.update_op_kind(id, &kind)?;
             return Ok(id);
         }
+        // the same block edited again with nothing queued since (typing
+        // across polls): one PATCH, keeping the first op's base for conflicts
+        if let Some(op) = store.queued_ops()?.pop() {
+            if let OpKind::UpdateBlock { block_id, body: old } = &op.kind {
+                if store.resolve_id(block_id)? == block.id {
+                    let kind = OpKind::UpdateBlock {
+                        block_id: block_id.clone(),
+                        body: merge_bodies(old.clone(), body),
+                    };
+                    store.update_op_kind(op.id, &kind)?;
+                    return Ok(op.id);
+                }
+            }
+        }
         store.enqueue(
             OpKind::UpdateBlock {
                 block_id: block.id.clone(),
@@ -1291,6 +1305,25 @@ fn enqueue_update(store: &Store, base: &Block, block: &Block, body: Value) -> Re
             Some(serde_json::to_value(base)?),
         )
     })
+}
+
+/// `new` over `old`, two levels deep: `{"to_do":{"checked":true}}` then
+/// `{"to_do":{"rich_text":..}}` keeps both.
+fn merge_bodies(mut old: Value, new: Value) -> Value {
+    match (old.as_object_mut(), new) {
+        (Some(o), Value::Object(n)) => {
+            for (k, v) in n {
+                match (o.get_mut(&k).and_then(Value::as_object_mut), v) {
+                    (Some(inner), Value::Object(vn)) => inner.extend(vn),
+                    (_, v) => {
+                        o.insert(k, v);
+                    }
+                }
+            }
+            old
+        }
+        (_, new) => new,
+    }
 }
 
 /// Rewrites a cached block's text and queues the update. Returns the op id.
@@ -3223,9 +3256,18 @@ mod tests {
     async fn remote_edit_in_same_minute_as_own_write_conflicts() {
         let s = MockServer::start().await;
         let store = Store::open_in_memory().unwrap();
-        seed(&s, &store, &["b"]).await;
+        seed(&s, &store, &["b", "c"]).await;
         local_edit_text(&store, "b", "one").unwrap();
+        // another op in between: two ops for b, not merged
+        local_edit_text(&store, "c", "x").unwrap();
         local_edit_text(&store, "b", "two").unwrap();
+        assert_eq!(queue(&store).len(), 3);
+        get(&s, "/v1/blocks/c", ok(blk("c", pp("p"), "c", T, false))).await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/c"))
+            .respond_with(ok(blk("c", pp("p"), "x", T2, false)))
+            .mount(&s)
+            .await;
         Mock::given(method("GET"))
             .and(path("/v1/blocks/b"))
             .respond_with(ok(blk("b", pp("p"), "b", T, false)))
@@ -3249,7 +3291,7 @@ mod tests {
         assert_eq!(
             r,
             PushReport {
-                applied: 1,
+                applied: 2,
                 conflicts: 1,
                 failed: 0
             }
@@ -3407,32 +3449,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn merged_bodies_keep_both_halves_of_a_payload() {
+        let m = merge_bodies(json!({ "to_do": { "checked": true } }), json!({ "to_do": { "rich_text": [] }, "color": "red" }));
+        assert_eq!(m, json!({ "to_do": { "checked": true, "rich_text": [] }, "color": "red" }));
+    }
+
     #[tokio::test]
-    async fn two_edits_of_same_block_both_apply() {
+    async fn two_edits_of_same_block_are_one_patch_of_the_last_text() {
         let s = MockServer::start().await;
         let store = Store::open_in_memory().unwrap();
         seed(&s, &store, &["b"]).await;
         local_edit_text(&store, "b", "one").unwrap();
         local_edit_text(&store, "b", "two").unwrap();
-        // first GET sees the base; afterwards the remote carries our first write's time
-        Mock::given(method("GET"))
-            .and(path("/v1/blocks/b"))
-            .respond_with(ok(blk("b", pp("p"), "b", T, false)))
-            .up_to_n_times(1)
-            .mount(&s)
-            .await;
-        get(&s, "/v1/blocks/b", ok(blk("b", pp("p"), "one", T2, false))).await;
+        assert_eq!(queue(&store).len(), 1);
+        get(&s, "/v1/blocks/b", ok(blk("b", pp("p"), "b", T, false))).await;
         Mock::given(method("PATCH"))
             .and(path("/v1/blocks/b"))
-            .respond_with(ok(blk("b", pp("p"), "one", T2, false)))
-            .expect(2)
+            .and(body_string_contains("two"))
+            .respond_with(ok(blk("b", pp("p"), "two", T2, false)))
+            .expect(1)
             .mount(&s)
             .await;
         let r = push(&client(&s), &store).await.unwrap();
         assert_eq!(
             r,
             PushReport {
-                applied: 2,
+                applied: 1,
                 conflicts: 0,
                 failed: 0
             }
@@ -4820,11 +4863,11 @@ mod tests {
         assert_eq!(block_id, "r1");
         assert_eq!(body["table_row"]["cells"], cells(&store, "r1"));
 
-        // no coalescing (same as text edits): a second op carrying both edits
+        // the same row again with nothing queued since: one op carrying both edits
         local_edit_table_cell(&store, "r1", 0, vec![RichText::plain("A")]).unwrap();
         let q = queue(&store);
-        assert_eq!(q.len(), 2);
-        let OpKind::UpdateBlock { body, .. } = &q[1] else {
+        assert_eq!(q.len(), 1);
+        let OpKind::UpdateBlock { body, .. } = &q[0] else {
             panic!()
         };
         assert_eq!(body["table_row"]["cells"][0][0]["plain_text"], "A");
@@ -4832,7 +4875,7 @@ mod tests {
 
         assert!(local_edit_table_cell(&store, "r1", 2, vec![]).is_err());
         assert!(local_edit_table_cell(&store, "tbl", 0, vec![]).is_err());
-        assert_eq!(queue(&store).len(), 2);
+        assert_eq!(queue(&store).len(), 1);
     }
 
     #[tokio::test]
@@ -4951,6 +4994,50 @@ mod tests {
             panic!()
         };
         assert!(block.to_string().contains("\"x\""), "{block}");
+    }
+
+    #[test]
+    fn undoing_merged_edits_of_one_block_steps_back_one_edit_at_a_time() {
+        let store = undo_store();
+        let before = snap(&store);
+        let c1 = record(&store, |s| {
+            local_edit_text(s, "b", "one").unwrap();
+        });
+        let mid = snap(&store);
+        let c2 = record(&store, |s| {
+            local_edit_text(s, "b", "two").unwrap();
+        });
+        assert_eq!(queue(&store).len(), 1, "merged");
+        assert!(restore(&store, &c2).unwrap());
+        assert_eq!(snap(&store), mid);
+        assert_eq!(text(&store, "b"), "one");
+        let q = queue(&store);
+        assert_eq!(q.len(), 1);
+        let OpKind::UpdateBlock { body, .. } = &q[0] else {
+            panic!()
+        };
+        assert!(body.to_string().contains("one"), "{body}");
+        assert!(restore(&store, &c1).unwrap());
+        assert_eq!(snap(&store), before);
+        assert!(queue(&store).is_empty());
+    }
+
+    #[test]
+    fn edits_of_an_unpushed_block_fold_into_its_create_not_an_update() {
+        let store = undo_store();
+        let para = BlockKind::Paragraph(TextBlock {
+            rich_text: Vec::new(),
+            color: "default".into(),
+        });
+        let l = local_create_block(&store, "p", None, para).unwrap();
+        local_edit_text(&store, &l, "x").unwrap();
+        local_edit_text(&store, &l, "y").unwrap();
+        let q = queue(&store);
+        assert_eq!(q.len(), 1);
+        let OpKind::CreateBlock { block, .. } = &q[0] else {
+            panic!("not a create: {:?}", q[0])
+        };
+        assert!(block.to_string().contains("\"y\""), "{block}");
     }
 
     #[test]

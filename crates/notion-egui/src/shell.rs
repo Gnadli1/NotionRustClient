@@ -24,14 +24,23 @@ use crate::worker::{Cmd, Event};
 use crate::keys::{self, Command};
 use crate::{sidebar, theme};
 
-/// The open page is polled this often, every other tab's page this often.
+/// The open page is polled this often while the window has focus (near
+/// live), this often without it, and every other tab's page this often.
+pub const POLL_LIVE: Duration = Duration::from_secs(3);
 pub const POLL_OPEN: Duration = Duration::from_secs(15);
 pub const POLL_BG: Duration = Duration::from_secs(60);
+/// The comment panel's threads are polled this often while the window has focus.
+pub const POLL_COMMENTS: Duration = Duration::from_secs(10);
 /// A window that gains focus polls its page unless it was polled this lately.
 const FOCUS_GAP: Duration = Duration::from_secs(5);
 /// Notion's edit time has minute precision, so a poll of a recently edited
 /// page pulls in full even if the time is unchanged: at most this often per page.
 pub(crate) const FULL_MIN: Duration = Duration::from_secs(60);
+/// Live polling pulls the open page in full every [`FULL_COST`] times as long
+/// as its last full pull took (that keeps a big page at about a third of the
+/// worker's time), but not more often than this nor less than [`FULL_MIN`].
+const FULL_LIVE_MIN: Duration = Duration::from_secs(5);
+const FULL_COST: u32 = 3;
 /// How long a block a poll changed stays tinted.
 pub const FLASH: Duration = Duration::from_secs(2);
 /// The workspace's users are pulled again this often (they rarely change).
@@ -392,7 +401,8 @@ impl App {
     /// The pages to poll with their period: the open one, then the other
     /// tabs' (once each).
     pub(crate) fn poll_pages(&self) -> Vec<(String, Duration)> {
-        let mut v: Vec<(String, Duration)> = self.current.iter().map(|p| (p.clone(), POLL_OPEN)).collect();
+        let open = if self.was_focused { POLL_LIVE } else { POLL_OPEN };
+        let mut v: Vec<(String, Duration)> = self.current.iter().map(|p| (p.clone(), open)).collect();
         for (i, t) in self.tabs.iter().enumerate() {
             if let Some(p) = t.page.as_ref().filter(|p| i != self.active && v.iter().all(|(q, _)| q != *p)) {
                 v.push((p.clone(), POLL_BG));
@@ -487,7 +497,13 @@ impl App {
         if let Event::Pulled { id, report } = &ev {
             if !report.skipped {
                 self.full_at.insert(id.clone(), Instant::now());
+                if let Some(t) = self.poll_sent.filter(|_| poll) {
+                    self.pull_took.insert(id.clone(), t.elapsed());
+                }
             }
+        }
+        if poll {
+            self.poll_sent = None;
         }
         if poll {
             self.on_poll(ev);
@@ -1243,9 +1259,37 @@ impl App {
         if open.as_ref() == Some(&id) && !self.poll_flush() {
             return;
         }
-        let full_due = self.full_at.get(&id).is_none_or(|t| now.saturating_duration_since(*t) >= FULL_MIN);
+        let gap = match self.pull_took.get(&id) {
+            Some(t) if self.was_focused && open.as_ref() == Some(&id) => (*t * FULL_COST).clamp(FULL_LIVE_MIN, FULL_MIN),
+            _ => FULL_MIN,
+        };
+        let full_due = self.full_at.get(&id).is_none_or(|t| now.saturating_duration_since(*t) >= gap);
         let skip = if full_due { sync::poll_settle() } else { Skip::IfUnchanged };
+        // the real clock: the answer's `elapsed` measures the pull
+        self.poll_sent = Some(Instant::now());
         self.send(Cmd::Poll { id, skip });
+    }
+
+    /// The threads in the comment panel (the page's, and the shown row's)
+    /// every [`POLL_COMMENTS`] while the window has focus; the first a period
+    /// after the panel opened (opening fetched them). One request each.
+    pub(crate) fn poll_comments_at(&mut self, now: Instant) {
+        if !self.was_focused || self.poll_blocked() {
+            return;
+        }
+        let ids: Vec<String> = match &self.comments {
+            Some(p) => self.current.iter().chain(&p.block).filter(|i| !i.starts_with("local-")).cloned().collect(),
+            None => return,
+        };
+        let p = self.comments.as_mut().expect("checked");
+        let last = *p.polled.get_or_insert(now);
+        if ids.is_empty() || now.saturating_duration_since(last) < POLL_COMMENTS {
+            return;
+        }
+        p.polled = Some(now);
+        for id in ids {
+            self.send(Cmd::PullComments { id });
+        }
     }
 
     /// [`flush`](Self::flush) for a poll. Typing in one block for a minute
@@ -1312,7 +1356,10 @@ impl App {
             let due = |(id, every): (String, Duration)| {
                 (self.polled.get(&id).map_or(now, |t| *t + every)).saturating_duration_since(now)
             };
-            self.poll_pages().into_iter().map(due).min().unwrap_or(POLL_BG).max(Duration::from_secs(1))
+            let comments = self.comments.as_ref().filter(|_| self.was_focused).map(|p| {
+                p.polled.map_or(POLL_COMMENTS, |t| (t + POLL_COMMENTS).saturating_duration_since(now))
+            });
+            self.poll_pages().into_iter().map(due).chain(comments).min().unwrap_or(POLL_BG).max(Duration::from_secs(1))
         };
         let ends = self.flash.values().map(|t| t.saturating_duration_since(now));
         ends.chain([polls]).min().unwrap_or(polls)
@@ -1345,6 +1392,7 @@ impl App {
         }
         let now = Instant::now();
         self.poll_at(now, gained);
+        self.poll_comments_at(now);
         self.users_tick(now);
         self.expire_flash(now);
         ctx.request_repaint_after(self.next_wake(now));
@@ -1574,6 +1622,7 @@ mod tests {
     #[test]
     fn polls_the_open_page_every_15s_and_the_other_tabs_every_60s() {
         let mut w = with_tabs(&["q1", "q2", "q3", "q4"]);
+        w.app.was_focused = false;
         let t0 = w.app.polled["p"];
         let mut polls: Vec<(u64, String)> = Vec::new();
         for t in 0..=300 {
@@ -1600,6 +1649,7 @@ mod tests {
     #[test]
     fn a_page_is_pulled_in_full_at_most_once_a_minute_by_polls() {
         let mut w = Win::with_texts(&["a"]);
+        w.app.was_focused = false;
         let t0 = w.app.polled["p"];
         let at = |w: &mut Win, s: u64| {
             w.app.poll_at(t0 + Duration::from_secs(s), false);
@@ -1612,6 +1662,81 @@ mod tests {
             w.app.on_event(skipped("p"));
         }
         assert_eq!(at(&mut w, 75), [poll("p", sync::poll_settle())], "a minute on");
+    }
+
+    /// With focus the open page is polled every 3 s, without it every 15 s.
+    #[test]
+    fn a_focused_window_polls_its_page_every_3s() {
+        let mut w = Win::with_texts(&["a"]);
+        let t0 = w.app.polled["p"];
+        let mut at = Vec::new();
+        for t in 0..=30 {
+            w.app.was_focused = t < 15;
+            w.app.poll_at(t0 + Duration::from_secs(t), false);
+            if !w.cmds().is_empty() {
+                at.push(t);
+                w.app.on_event(skipped("p"));
+            }
+        }
+        assert_eq!(at, [3, 6, 9, 12, 27], "live, then 15 s after the last poll");
+    }
+
+    /// A live page edited lately is pulled in full every 3× as long as its
+    /// last full pull took, between 5 s and a minute; unchanged polls between.
+    #[test]
+    fn live_full_pulls_are_spaced_by_their_cost() {
+        for (took, gap) in [(0u64, 5u64), (4, 12), (30, 60)] {
+            let mut w = Win::with_texts(&["a"]);
+            let t0 = w.app.polled["p"];
+            w.app.poll_at(t0 + POLL_LIVE, false);
+            assert_eq!(w.cmds(), [poll("p", sync::poll_settle())]);
+            w.app.on_event(changed("p"));
+            assert!(w.app.pull_took.contains_key("p"), "a poll's full pull is timed");
+            w.app.pull_took.insert("p".into(), Duration::from_secs(took));
+            let full = w.app.full_at["p"];
+            w.app.polled.insert("p".into(), full);
+            let mut fulls = Vec::new();
+            for s in 1..=60 {
+                w.app.poll_at(full + Duration::from_secs(s), false);
+                for c in w.cmds() {
+                    if c == poll("p", sync::poll_settle()) {
+                        fulls.push(s);
+                    }
+                    w.app.on_event(skipped("p"));
+                }
+            }
+            // the first poll (every 3 s) at or after the gap
+            assert_eq!(fulls.first(), Some(&(gap.div_ceil(3) * 3)), "took {took}s");
+        }
+    }
+
+    /// The comment panel's threads (page and row) every 10 s while focused.
+    #[test]
+    fn the_comment_panel_is_polled_while_focused() {
+        let mut w = Win::with_texts(&["a"]);
+        let t0 = Instant::now();
+        w.app.poll_comments_at(t0 + POLL_COMMENTS);
+        assert!(w.cmds().is_empty(), "no panel");
+        w.app.open_comments(Some("p-0".into()));
+        w.cmds();
+        w.app.sent.clear();
+        // pages aren't due: only comments
+        w.app.polled.insert("p".into(), t0 + POLL_COMMENTS * 10);
+        w.app.poll_comments_at(t0);
+        assert!(w.cmds().is_empty(), "opening fetched them");
+        w.app.poll_comments_at(t0 + POLL_COMMENTS);
+        let c = w.cmds();
+        assert_eq!(c, [Cmd::PullComments { id: "p".into() }, Cmd::PullComments { id: "p-0".into() }]);
+        w.app.poll_comments_at(t0 + POLL_COMMENTS * 2);
+        assert!(w.cmds().is_empty(), "waits for the answers");
+        w.app.on_event(Event::CommentsPulled);
+        w.app.on_event(Event::CommentsPulled);
+        w.app.was_focused = false;
+        w.app.poll_comments_at(t0 + POLL_COMMENTS * 3);
+        assert!(w.cmds().is_empty(), "not without focus");
+        w.app.was_focused = true;
+        w.app.poll_comments_at(t0 + POLL_COMMENTS * 3);
+        assert_eq!(w.cmds().len(), 2);
     }
 
     #[test]
@@ -1818,6 +1943,41 @@ mod tests {
         w.answer(skipped("q"));
         let pages: Vec<&str> = w.app.undo.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(pages, ["p", "p", "q"]);
+    }
+
+    #[test]
+    fn typing_across_live_polls_then_ctrl_s_is_one_op_and_one_undo_step() {
+        let mut w = Win::with_texts(&["a"]);
+        w.app.was_focused = true;
+        let t0 = w.app.polled["p"];
+        w.edit(0);
+        for (i, c) in ["1", "2", "3"].into_iter().enumerate() {
+            w.type_text(c);
+            poll_answered(&mut w, t0, 3 * (i as u64 + 1), skipped("p"));
+        }
+        w.frame_with(vec![crate::testkit::key_mod(Key::S, Modifiers::CTRL)], Modifiers::CTRL);
+        w.frames(vec![]);
+        assert_eq!(w.queued(), 1);
+        assert_eq!(w.app.undo.len(), 1);
+        let b = w.app.store.get_block("p-0").unwrap().unwrap();
+        assert_eq!(plain_text(&b.kind.text().unwrap().rich_text), "a123");
+        assert_eq!(w.cmds(), [Cmd::Push]);
+        w.app.sent.clear(); // the push is not in flight
+        w.app.undo_redo(true);
+        assert_eq!(w.queued(), 0, "one undo reverts everything typed");
+        assert!(w.app.undo.is_empty());
+    }
+
+    #[test]
+    fn a_focused_window_without_a_comment_panel_pulls_no_comments() {
+        let mut w = Win::with_texts(&["a"]);
+        w.app.was_focused = true;
+        assert!(w.app.comments.is_none());
+        let t0 = Instant::now();
+        for s in [0, 10, 20, 100] {
+            w.app.poll_comments_at(t0 + Duration::from_secs(s));
+        }
+        assert!(w.cmds().iter().all(|c| !matches!(c, Cmd::PullComments { .. })));
     }
 
     #[test]
@@ -2581,7 +2741,7 @@ mod tests {
         assert_eq!(w.app.rows[0].marker, crate::outline::Marker::Todo(true));
         w.app.apply(Action::Check(0));
         assert_eq!(w.app.rows[0].marker, crate::outline::Marker::Todo(false));
-        assert_eq!(w.queued(), 2, "each change is its own op");
+        assert_eq!(w.queued(), 1, "the same block again: one op, the last state");
     }
 
     // ------------------------------------------------------- same-frame keys

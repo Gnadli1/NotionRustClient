@@ -106,12 +106,19 @@ I pulled all 164 pages shared with the integration into the cache. One failed wi
 5. **No `@` menu in the comment box.** Mentions in comments are plain text for now.
 
 ## Known gaps after C3 (reviewed, deferred)
-1. **One op per poll flush.** While typing, each 15 s poll writes the edit as its own queued UpdateBlock, so a push sends a few PATCHes for one block. Undo stays one step.
+1. ~~One op per poll flush.~~ Fixed with live polling: an edit of the block that has the newest queued UpdateBlock merges into it (first op's base kept for conflicts).
 2. **Typing during a poll's round trip.** If you start typing in a block while a poll is in flight and that same block was edited in Notion, your push can overwrite it. The status bar warns ("this block was edited in Notion meanwhile").
-3. **Same-minute edits.** On a recently edited page, a remote edit in the same minute can take up to ~60 s to show (one full pull per minute per page).
+3. **Same-minute edits.** On a recently edited page, a remote edit in the same minute can take up to ~60 s to show (one full pull per minute per page). With live polling the open, focused page re-pulls every 3× its last pull time (5–60 s).
 4. **Undo tail.** Ctrl+Z after a poll flush first undoes the typing since that flush, then the earlier part.
 5. **Highlight** ignores remote deletions and reordering; the tint colour is untuned.
 6. **Pushes wait behind a running poll** (the worker is serial).
+
+## Live polling (after the phase: near-live collaboration)
+- The open page is polled every 3 s while the window has focus (15 s without, other tabs 60 s). On a page edited in the last 2 minutes, a full pull runs every 3× as long as the last one took, between 5 s and 60 s. That keeps a big page at about a third of the request budget.
+- The comment panel's threads (the page's and the shown row's) are re-pulled every 10 s while focused. Comments elsewhere still only arrive by opening them.
+- Typing across polls is one queued op per block (see C3 gap 1).
+- Not possible with the API: presence, live cursors, keystroke-level updates. Webhooks would be no faster for content (Notion batches `page.content_updated` for about a minute).
+- Gaps: a focused window left idle keeps polling (1 request every 3 s); pushes wait behind a running full pull.
 
 ## Known gaps after C4 (reviewed, deferred)
 1. **Two-way diff.** The panel compares your text with Notion's, not against the common base.

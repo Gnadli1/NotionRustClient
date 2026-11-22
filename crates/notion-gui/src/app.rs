@@ -2015,8 +2015,8 @@ mod tests {
         assert_eq!(editing(&s), Some("t"));
         assert_eq!(
             kinds(&s),
-            vec!["update_block"; 2],
-            "commit, then the checkbox"
+            vec!["update_block"; 1],
+            "commit and checkbox: one op for the block"
         );
         let t = s.store.get_block("t").unwrap().unwrap();
         assert_eq!(
@@ -2971,7 +2971,8 @@ mod tests {
         up(&mut s, Message::FocusCell("r1".into(), 1));
         assert_eq!(cell_text(&s, "r1", 0), "a!!");
         assert_eq!(cell_text(&s, "r2", 1), "c?");
-        assert_eq!(kinds(&s).len(), 4);
+        // r1's three commits are one op, then r2's
+        assert_eq!(kinds(&s).len(), 2);
         assert_eq!(ids(&s), ["s", "st", "sp", "stbl", "card", "tbl", "b"]);
 
         // a pull makes the edited cell read-only (a mention): the text survives

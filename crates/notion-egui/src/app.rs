@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{mpsc::Receiver, Arc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self,
@@ -335,6 +335,10 @@ pub struct App {
     pub(crate) polled: HashMap<String, Instant>,
     /// When each page was last pulled in full, by anyone.
     pub(crate) full_at: HashMap<String, Instant>,
+    /// How long each page's last full pull by a poll took, and when the
+    /// poll in flight was sent: live polling spaces full pulls by their cost.
+    pub(crate) pull_took: HashMap<String, Duration>,
+    pub(crate) poll_sent: Option<Instant>,
     /// The (page, block, cell) of the last poll flush, the checkpoint under the
     /// undo step it made, and that step: the next poll flush extends it (see `poll_flush`).
     pub(crate) poll_cp: Option<(PollKey, sync::Checkpoint, crate::undo::Step)>,
@@ -505,6 +509,8 @@ impl App {
             meta: Meta::default(),
             polled: HashMap::new(),
             full_at: HashMap::new(),
+            pull_took: HashMap::new(),
+            poll_sent: None,
             poll_cp: None,
             flash: HashMap::new(),
             was_focused: false,
