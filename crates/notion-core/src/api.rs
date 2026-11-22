@@ -221,6 +221,14 @@ impl Client {
             .await
     }
 
+    /// The saved views of a data source (`GET /v1/views?data_source_id=`), raw.
+    /// UNVERIFIED against live Notion: the endpoint shape is a guess and may
+    /// need a newer Notion-Version; any error makes the callers fall back to
+    /// local views.
+    pub async fn list_views(&self, data_source_id: &str) -> Result<Vec<Value>> {
+        self.paginate_with("/v1/views", None, &[("data_source_id", data_source_id)]).await
+    }
+
     /// Unresolved comments on a page or block, all pages. Needs the
     /// integration's "read comments" capability (403 otherwise).
     pub async fn list_comments(&self, block_or_page_id: &str) -> Result<Vec<Comment>> {
@@ -302,6 +310,16 @@ impl Client {
         path: &str,
         body: Option<Value>,
     ) -> Result<Vec<T>> {
+        self.paginate_with(path, body, &[]).await
+    }
+
+    /// `paginate` with extra GET query pairs (url-encoded by reqwest).
+    async fn paginate_with<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: Option<Value>,
+        extra: &[(&str, &str)],
+    ) -> Result<Vec<T>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
@@ -316,6 +334,7 @@ impl Client {
                 }
                 None => {
                     let mut q = vec![("page_size", "100")];
+                    q.extend_from_slice(extra);
                     if let Some(c) = &cursor {
                         q.push(("start_cursor", c));
                     }
@@ -741,6 +760,22 @@ mod tests {
             .await;
         let v = client(&s, 0).get_database("db").await.unwrap();
         assert_eq!(v["data_sources"][0]["id"], "ds");
+    }
+
+    #[tokio::test]
+    async fn list_views_reads_the_results_and_an_error_is_an_error() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/views"))
+            .and(wiremock::matchers::query_param("data_source_id", "ds"))
+            .respond_with(list(vec![json!({"id": "v1", "type": "board"})], None))
+            .mount(&s)
+            .await;
+        let v = client(&s, 0).list_views("ds").await.unwrap();
+        assert_eq!(v[0]["type"], "board");
+        let s = MockServer::start().await;
+        Mock::given(path("/v1/views")).respond_with(ResponseTemplate::new(404)).mount(&s).await;
+        assert!(client(&s, 0).list_views("ds").await.is_err());
     }
 
     #[tokio::test]

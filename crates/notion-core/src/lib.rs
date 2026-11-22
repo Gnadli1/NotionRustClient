@@ -9,5 +9,6 @@ pub mod ops;
 pub mod props;
 pub mod store;
 pub mod sync;
+pub mod views;
 
 pub use error::{Error, Result};

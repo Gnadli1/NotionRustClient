@@ -20,6 +20,7 @@ use crate::keys::{take_exact, Command};
 use crate::pages::Dlg;
 use crate::slash::fold;
 use crate::theme::{self, Colors};
+use crate::views::Kind;
 use crate::view::untitled;
 use crate::worker::Cmd;
 
@@ -82,12 +83,27 @@ pub(crate) struct Db {
     pub edit: Option<CellEdit>,
     pub focus_filter: bool,
     /// Scroll the selected cell into view.
-    reveal: bool,
+    pub(crate) reveal: bool,
     offset: f32,
     height: f32,
+    /// F5: the views on offer and the shown one, the calendar's (year, month),
+    /// the board/calendar/list lanes, and each lane's scroll (offset, height).
+    pub defs: Vec<crate::views::ViewDef>,
+    pub cur: usize,
+    pub month: (i32, u32),
+    pub lanes: Vec<crate::views::Lane>,
+    pub scroll: Vec<(f32, f32)>,
+    /// Gallery cards per row, as last drawn (the up/down step).
+    pub per: usize,
 }
 
 pub(crate) enum Act {
+    /// A card or line of the board, list, gallery or calendar: select it.
+    Card(String),
+    /// The view with this index of `Db::defs`.
+    View(usize),
+    /// The calendar's previous (-1) or next (1) month.
+    Month(i32),
     Cell(String, usize),
     Sort(usize),
     /// A popup choice (index).
@@ -132,7 +148,7 @@ fn filter_id() -> Id {
 
 impl Db {
     /// The table of `ds` with its (live) `pages`, in the order given. `sort`
-    /// is the remembered (column name, descending).
+    /// is the remembered (column name, descending). The caller runs `arrange`.
     pub fn new(ds: &DataSource, pages: &[Page], users: &[User], sort: Option<&(String, bool)>) -> Db {
         let schema = ds.properties.as_object();
         let col = |(name, p): (&String, &Value)| Col {
@@ -162,7 +178,7 @@ impl Db {
             })
             .collect();
         let sort = sort.and_then(|(n, d)| Some((cols.iter().position(|c| c.name == *n)?, *d)));
-        let mut db = Db {
+        Db {
             ds: ds.id.clone(),
             tabs: Vec::new(),
             cols,
@@ -176,9 +192,13 @@ impl Db {
             reveal: false,
             offset: 0.0,
             height: 0.0,
-        };
-        db.arrange();
-        db
+            defs: crate::views::defs(None),
+            cur: 0,
+            month: crate::views::this_month(),
+            lanes: Vec::new(),
+            scroll: Vec::new(),
+            per: 1,
+        }
     }
 
     /// Rebuilds `view`: the filter (case-insensitive, umlauts folded, over
@@ -204,6 +224,7 @@ impl Db {
             });
         }
         self.view = v;
+        self.relane();
         if self.sel.as_ref().is_some_and(|(id, _)| self.pos(id).is_none()) {
             self.sel = None;
         }
@@ -315,6 +336,12 @@ impl App {
         let mut pages: Vec<Page> = self.store.rows(id)?.into_iter().filter(|p| !p.in_trash).collect();
         pages.sort_by(|a, b| (a.created_time, &a.id).cmp(&(b.created_time, &b.id)));
         let mut db = Db::new(&ds, &pages, &self.users, self.db_sorts.get(id));
+        if !self.db_views.contains_key(id) {
+            let pref = self.store.view_pref(id)?.unwrap_or_default();
+            self.db_views.insert(id.to_string(), pref);
+        }
+        db.defs = crate::views::defs(self.saved_views.get(id));
+        db.cur = crate::views::pick(&db.defs, &self.db_views[id]);
         let all = self.store.data_sources_of(&ds.database_id)?;
         if all.len() > 1 {
             db.tabs = all.into_iter().map(|d| (d.id, d.title)).collect();
@@ -328,6 +355,7 @@ impl App {
                 e
             });
             (db.focus_filter, db.reveal, db.offset, db.height) = (old.focus_filter, old.reveal, old.offset, old.height);
+            db.month = old.month;
             if db.edit.as_ref().is_some_and(|e| db.row(&e.row).is_none() || e.col >= db.cols.len()) {
                 db.edit = None;
             }
@@ -335,8 +363,8 @@ impl App {
             if db.sel.as_ref().is_some_and(|(_, c)| *c >= db.cols.len()) {
                 db.sel = None;
             }
-            db.arrange();
         }
+        db.arrange();
         self.db = Some(db);
         Ok(())
     }
@@ -352,7 +380,11 @@ impl App {
         let fresh = self.full_at.get(&ds).is_some_and(|t| t.elapsed() < crate::shell::FULL_MIN);
         let out = self.sent.iter().any(|c| matches!(c, Cmd::Pull { id, .. } if *id == ds));
         if !(fresh || out || self.worker_gone || self.offline() || ds.starts_with("local-")) {
-            self.send(Cmd::Pull { id: ds, force: false });
+            self.send(Cmd::Pull { id: ds.clone(), force: false });
+        }
+        // once per session, after the pull: the saved views (any error keeps the local ones)
+        if !(self.worker_gone || self.offline() || ds.starts_with("local-")) && self.views_asked.insert(ds.clone()) {
+            self.send(Cmd::Views { ds });
         }
     }
 
@@ -482,9 +514,40 @@ impl App {
                     d.reveal = true;
                 }
                 self.refresh();
-                self.db_activate();
+                if self.db.as_ref().is_some_and(|d| d.mode() == Kind::Table) {
+                    self.db_activate();
+                } else {
+                    self.info = Some("row added: Ctrl+Shift+V for the table to name it".into());
+                }
             }
             Err(e) => self.last_error = Some(e.to_string()),
+        }
+    }
+
+    /// Shows view `i` of `Db::defs` and remembers it for the data source.
+    pub(crate) fn db_set_view(&mut self, i: usize) {
+        let Some(d) = self.db.as_mut().filter(|d| i < d.defs.len()) else { return };
+        (d.cur, d.reveal) = (i, true);
+        d.arrange();
+        let (ds, label) = (d.ds.clone(), crate::views::pref(&d.defs[i]));
+        if let Err(e) = self.store.set_view_pref(&ds, &label) {
+            self.last_error = Some(e.to_string());
+        }
+        self.db_views.insert(ds, label);
+    }
+
+    /// Ctrl+Shift+Left / Right on the board: the selected card to the
+    /// neighbouring column, as one property edit (undo, push and conflicts as
+    /// for a cell).
+    fn db_move_card(&mut self, dl: isize) {
+        let Some(d) = &self.db else { return };
+        let Some((id, _)) = d.sel.clone() else {
+            self.info = Some("select a card first".into());
+            return;
+        };
+        let Some((col, value)) = d.move_target(&id, dl) else { return };
+        if self.db_write(&id, col, &value) {
+            self.refresh();
         }
     }
 
@@ -556,6 +619,24 @@ impl App {
                 };
             }
             Act::Pick(i) => self.db_pick(i),
+            Act::Card(id) => {
+                if self.db_commit(true) {
+                    if let Some(d) = &mut self.db {
+                        d.sel = Some((id, 0));
+                    }
+                }
+            }
+            Act::View(i) => {
+                if self.db_commit(true) {
+                    self.db_set_view(i);
+                }
+            }
+            Act::Month(by) => {
+                if let Some(d) = &mut self.db {
+                    d.month = crate::views::step_month(d.month, by);
+                    d.relane();
+                }
+            }
             Act::Commit(row, col) => {
                 if self.db.as_ref().and_then(|d| d.edit.as_ref()).is_some_and(|e| e.row == row && e.col == col) {
                     self.db_commit(true);
@@ -637,19 +718,50 @@ impl App {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
+        let cs = Modifiers::CTRL | Modifiers::SHIFT;
+        let next_view = take(cs, Key::V).0 > 0;
+        let (mv_l, mv_r) = (take(cs, Key::ArrowLeft).0, take(cs, Key::ArrowRight).0);
+        let (prev_m, next_m) = (take(none, Key::PageUp).0, take(none, Key::PageDown).0);
         let (up, down) = (take(none, Key::ArrowUp).1, take(none, Key::ArrowDown).1);
         let (left, right) = (take(none, Key::ArrowLeft).1, take(none, Key::ArrowRight).1);
         let (enter, space) = (take(none, Key::Enter).0 > 0, take(none, Key::Space).0 > 0);
         let new = take(Modifiers::CTRL, Key::Enter).0 > 0;
         let open = take(Modifiers::CTRL | Modifiers::SHIFT, Key::O).0 > 0;
         let Some(db) = &mut self.db else { return };
-        if up + down + left + right > 0 {
-            db.step(down as isize - up as isize, right as isize - left as isize);
+        let mode = db.mode();
+        if next_view {
+            let i = (db.cur + 1) % db.defs.len();
+            return self.db_set_view(i);
         }
-        if enter {
+        if up + down + left + right > 0 {
+            let (dr, dc) = (down as isize - up as isize, right as isize - left as isize);
+            if mode == Kind::Table {
+                db.step(dr, dc);
+            } else if mode == Kind::Gallery {
+                db.step_lane(dr * db.per as isize + dc, 0);
+            } else {
+                db.step_lane(dr, dc);
+            }
+        }
+        if mode == Kind::Calendar && prev_m + next_m > 0 {
+            db.month = crate::views::step_month(db.month, next_m as i32 - prev_m as i32);
+            db.relane();
+        }
+        if mode == Kind::Board && mv_l + mv_r > 0 {
+            if self.pushing() {
+                self.last_error = Some("editing is paused while a push runs".into());
+            } else {
+                self.db_move_card(mv_r as isize - mv_l as isize);
+            }
+        }
+        if enter && mode != Kind::Table {
+            if let Some((row, _)) = self.db.as_ref().and_then(|d| d.sel.clone()) {
+                self.db_act(Act::OpenRow(row));
+            }
+        } else if enter {
             self.db_activate();
         }
-        if space {
+        if space && mode == Kind::Table {
             let sel = self.db.as_ref().and_then(|d| d.sel.clone());
             if let Some((row, col)) = sel.filter(|(_, c)| self.db.as_ref().is_some_and(|d| d.cols[*c].kind == "checkbox")) {
                 if self.pushing() {
@@ -712,6 +824,13 @@ fn grid_ui(ui: &mut Ui, c: &Colors, db: &mut Db, crumbs: &[(String, String, Stri
             });
         }
         ui.horizontal(|ui| {
+            for (i, d) in db.defs.iter().enumerate() {
+                if ui.selectable_label(i == db.cur, &d.name).on_hover_text("Ctrl+Shift+V: next view").clicked() && i != db.cur {
+                    acts.push(Action::Db(Act::View(i)));
+                }
+            }
+        });
+        ui.horizontal(|ui| {
             let f = ui.add(TextEdit::singleline(&mut db.filter).id(filter_id()).hint_text("Filter…  (Ctrl+F)").desired_width(220.0));
             if db.focus_filter {
                 f.request_focus();
@@ -726,7 +845,11 @@ fn grid_ui(ui: &mut Ui, c: &Colors, db: &mut Db, crumbs: &[(String, String, Stri
             }
         });
         ui.add_space(6.0);
-        table(ui, c, db, choices, &mut acts);
+        if db.mode() == Kind::Table {
+            table(ui, c, db, choices, &mut acts);
+        } else {
+            crate::views::body(ui, c, db, &mut acts);
+        }
     });
     acts
 }
@@ -986,8 +1109,9 @@ mod tests {
         let mut w = Win::new(store);
         w.app.apply(Action::Open("ds".into()));
         w.frames(vec![]);
-        assert_eq!(w.cmds(), [Cmd::Pull { id: "ds".into(), force: false }]);
+        assert_eq!(w.cmds(), [Cmd::Pull { id: "ds".into(), force: false }, Cmd::Views { ds: "ds".into() }]);
         w.answer(skipped("ds"));
+        w.answer(WEvent::Views { ds: "ds".into(), views: Vec::new() });
         w
     }
 
@@ -1056,8 +1180,9 @@ mod tests {
         // by title: Archive < Tasks
         assert_eq!(w.app.current.as_deref(), Some("ds2"));
         assert_eq!(db(&w).tabs.iter().map(|t| t.0.as_str()).collect::<Vec<_>>(), ["ds2", "ds"]);
-        assert_eq!(w.cmds(), [Cmd::Pull { id: "ds2".into(), force: false }]);
+        assert_eq!(w.cmds(), [Cmd::Pull { id: "ds2".into(), force: false }, Cmd::Views { ds: "ds2".into() }]);
         w.answer(skipped("ds2"));
+        w.answer(WEvent::Views { ds: "ds2".into(), views: Vec::new() });
         assert!(db(&w).rows.is_empty() && w.shown.contains("Archive"));
         // another tab shows its own rows
         w.app.apply(Action::Db(Act::Tab("ds".into())));
@@ -1582,5 +1707,216 @@ mod tests {
         w.frames(vec![]);
         let sel = db(&w).sel.as_ref().unwrap().0.clone();
         assert!(w.shown.contains(&db(&w).row(&sel).unwrap().cells[0]), "the selected row is drawn: {sel}");
+    }
+
+    // --- F5: board, list, calendar, gallery ---
+
+    /// r1 Todo, 30 Mar - 2 Apr 2025; r2 Done, 10 Apr; r3 no state, no date.
+    fn planned() -> Win {
+        let mut w = win();
+        for (row, c, text) in [("r1", "State", "Todo"), ("r2", "State", "Done"), ("r1", "Due", "2025-03-30 → 2025-04-02"), ("r2", "Due", "2025-04-10")] {
+            let c = col(&w, c);
+            assert!(w.app.db_write(row, c, text));
+        }
+        w.app.refresh();
+        w
+    }
+
+    fn lanes(w: &Win) -> Vec<(String, Vec<String>)> {
+        let d = db(w);
+        d.lanes.iter().map(|l| (l.label.clone(), l.rows.iter().map(|&i| d.rows[i].id.clone()).collect())).collect()
+    }
+
+    fn to_view(w: &mut Win, kind: Kind) {
+        for _ in 0..5 {
+            if db(w).mode() == kind {
+                return;
+            }
+            w.press(Key::V, CS);
+        }
+        panic!("no {kind:?} view");
+    }
+
+    #[test]
+    fn the_board_groups_by_the_first_status_in_option_order_with_no_value() {
+        let mut w = planned();
+        to_view(&mut w, Kind::Board);
+        let l = |a: &str, b: &[&str]| (a.to_string(), b.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(lanes(&w), [l("No value", &["r3"]), l("Todo", &["r1"]), l("Done", &["r2"])]);
+        // no status: the first select
+        let cols = [("Kind", "select"), ("Qty", "number")].map(|(n, k)| Col { name: n.into(), kind: k.into(), opts: vec!["A".into()] });
+        assert_eq!(crate::views::group_col(&cols), Some(0));
+        w.frames(vec![]);
+    }
+
+    #[test]
+    fn a_moved_card_is_one_property_op_that_undoes_and_a_status_can_not_be_cleared() {
+        let mut w = planned();
+        to_view(&mut w, Kind::Board);
+        w.app.db.as_mut().unwrap().sel = Some(("r3".into(), 0));
+        w.press(Key::ArrowRight, CS);
+        assert_eq!(sent(&w, "r3"), json!({ "State": { "status": { "name": "Todo" } } }));
+        assert_eq!(cell(&w, "r3", "State"), "Todo");
+        assert_eq!(lanes(&w)[1].1, ["r1", "r3"]);
+        assert_eq!(db(&w).sel.as_ref().map(|s| s.0.as_str()), Some("r3"));
+        w.press(Key::Z, Modifiers::CTRL);
+        assert_eq!(cell(&w, "r3", "State"), "");
+        assert!(!ops(&w).iter().any(|o| matches!(o, OpKind::UpdatePageProperties { page_id, .. } if page_id == "r3")));
+        // into No value: a status can't be empty; the edge: nothing
+        w.app.db.as_mut().unwrap().sel = Some(("r1".into(), 0));
+        w.press(Key::ArrowLeft, CS);
+        assert_eq!(cell(&w, "r1", "State"), "Todo");
+        assert!(w.app.last_error.is_some());
+        w.app.db.as_mut().unwrap().sel = Some(("r2".into(), 0));
+        w.press(Key::ArrowRight, CS);
+        assert_eq!(cell(&w, "r2", "State"), "Done");
+    }
+
+    #[test]
+    fn the_calendar_buckets_rows_by_month_and_day_and_lists_rows_without_dates() {
+        let mut w = planned();
+        to_view(&mut w, Kind::Calendar);
+        let days = |w: &Win| db(w).lanes.iter().map(|l| (l.day, l.rows.len())).collect::<Vec<_>>();
+        w.app.db.as_mut().unwrap().month = (2025, 3);
+        w.app.db.as_mut().unwrap().relane();
+        assert_eq!(days(&w), [(30, 1), (31, 1), (0, 1)], "r1 spans two days of March; r3 has no date");
+        w.press(Key::PageDown, NONE);
+        assert_eq!(db(&w).month, (2025, 4));
+        assert_eq!(days(&w), [(1, 1), (2, 1), (10, 1), (0, 1)]);
+        assert_eq!(lanes(&w).last().unwrap().1, ["r3"]);
+        w.press(Key::PageUp, NONE);
+        w.press(Key::PageUp, NONE);
+        assert_eq!(db(&w).month, (2025, 2));
+        assert_eq!(days(&w), [(0, 1)]);
+        w.frames(vec![]);
+        assert_eq!(crate::views::step_month((2025, 12), 1), (2026, 1));
+        assert_eq!(crate::views::step_month((2025, 1), -1), (2024, 12));
+    }
+
+    #[test]
+    fn every_view_draws_moves_the_selection_and_opens_a_row_and_the_choice_persists() {
+        let mut w = planned();
+        for kind in [Kind::Board, Kind::List, Kind::Calendar, Kind::Gallery] {
+            to_view(&mut w, kind);
+            w.frames(vec![]);
+            w.press(Key::ArrowDown, NONE);
+            w.press(Key::ArrowRight, NONE);
+            assert!(db(&w).sel.is_some(), "{kind:?}");
+        }
+        assert_eq!(w.app.store.view_pref("ds").unwrap().as_deref(), Some("gallery:Gallery"));
+        // remembered when the table is rebuilt, and read back from the store
+        w.app.db_views.clear();
+        w.app.refresh();
+        assert_eq!(db(&w).mode(), Kind::Gallery);
+        w.press(Key::Enter, NONE);
+        assert_ne!(w.app.current.as_deref(), Some("ds"), "Enter opened the card as a page");
+    }
+
+    #[test]
+    fn saved_views_are_offered_and_an_api_error_leaves_the_local_ones() {
+        let mut w = win();
+        let names = |w: &Win| db(w).defs.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&w), ["Table", "Board", "List", "Calendar", "Gallery"]);
+        w.app.views_asked.clear();
+        w.app.db_pull_if_stale();
+        assert_eq!(w.cmds(), [Cmd::Pull { id: "ds".into(), force: false }, Cmd::Views { ds: "ds".into() }]);
+        w.answer(skipped("ds"));
+        w.answer(WEvent::Error("404".into()));
+        w.app.db_pull_if_stale();
+        assert!(!w.cmds().contains(&Cmd::Views { ds: "ds".into() }), "asked once per session");
+        w.answer(skipped("ds"));
+        assert_eq!(names(&w), ["Table", "Board", "List", "Calendar", "Gallery"]);
+        assert!(w.app.last_error.is_none());
+        let saved = |id: &str, name: &str, kind: &str| notion_core::views::SavedView { id: id.into(), name: name.into(), kind: kind.into() };
+        w.answer(WEvent::Views { ds: "ds".into(), views: vec![saved("1", "Sprint", "board"), saved("2", "Gantt", "timeline"), saved("3", "Wall", "gallery")] });
+        assert_eq!(names(&w), ["Sprint", "Wall", "Table", "List", "Calendar"]);
+    }
+
+    #[test]
+    fn lane_steps_and_moves_skip_empty_columns_and_stop_at_the_edges() {
+        let mut w = planned();
+        to_view(&mut w, Kind::Board);
+        // r3 is alone in No value; make Todo empty by moving r1 to Done
+        assert!(w.app.db_write("r1", col(&w, "State"), "Done"));
+        w.app.refresh();
+        assert_eq!(lanes(&w)[1].1, Vec::<String>::new());
+        w.app.db.as_mut().unwrap().sel = Some(("r3".into(), 0));
+        w.press(Key::ArrowRight, NONE);
+        assert_eq!(db(&w).sel.as_ref().unwrap().0, lanes(&w)[2].1[0], "the empty Todo is skipped");
+        // at the last column: stays
+        let last = db(&w).sel.clone();
+        w.press(Key::ArrowRight, NONE);
+        assert_eq!(db(&w).sel, last);
+        // move_target: past the edges is None, onto an empty column is fine
+        let d = db(&w);
+        assert_eq!(d.move_target("r2", 1), None);
+        assert_eq!(d.move_target("r3", -1), None);
+        assert_eq!(d.move_target("r3", 1).map(|t| t.1), Some("Todo".to_string()));
+        assert_eq!(d.move_target("nope", 1), None);
+        // moving at the last column writes nothing
+        let before = ops(&w).len();
+        w.app.db.as_mut().unwrap().sel = Some(("r2".into(), 0));
+        w.press(Key::ArrowRight, CS);
+        assert_eq!(ops(&w).len(), before);
+    }
+
+    #[test]
+    fn a_value_that_is_no_option_lands_in_no_value() {
+        let mut w = planned();
+        to_view(&mut w, Kind::Board);
+        let g = col(&w, "State");
+        w.app.db.as_mut().unwrap().rows.iter_mut().find(|r| r.id == "r1").unwrap().cells[g] = "Gone".into();
+        w.app.db.as_mut().unwrap().relane();
+        assert_eq!(lanes(&w)[0].1, ["r1", "r3"]);
+    }
+
+    #[test]
+    fn an_unknown_stored_view_label_falls_back_to_the_table() {
+        let mut w = planned();
+        w.app.store.set_view_pref("ds", "Timeline").unwrap();
+        w.app.db_views.clear();
+        w.app.refresh();
+        assert_eq!(db(&w).mode(), Kind::Table);
+    }
+
+    #[test]
+    fn the_stored_view_is_kind_and_name_with_a_fallback_to_the_kind() {
+        let mut w = planned();
+        let saved = |id: &str, name: &str, kind: &str| notion_core::views::SavedView { id: id.into(), name: name.into(), kind: kind.into() };
+        let two = vec![saved("1", "Board view", "board"), saved("2", "Board view", "board"), saved("3", "Wall", "gallery")];
+        w.answer(WEvent::Views { ds: "ds".into(), views: two });
+        let names = db(&w).defs.iter().map(|d| (d.name.clone(), d.kind)).collect::<Vec<_>>();
+        assert_eq!(names[..2], [("Board view".to_string(), Kind::Board), ("Board view".to_string(), Kind::Board)]);
+        w.app.db_set_view(1);
+        assert_eq!(w.app.store.view_pref("ds").unwrap().as_deref(), Some("board:Board view"));
+        // a stored local "Board" is lost once saved views come: the first board def stands in
+        w.app.store.set_view_pref("ds", "board:Board").unwrap();
+        w.app.db_views.clear();
+        w.app.refresh();
+        assert_eq!((db(&w).cur, db(&w).mode()), (0, Kind::Board));
+        // an old label without a kind still finds its kind
+        w.app.store.set_view_pref("ds", "Gallery").unwrap();
+        w.app.db_views.clear();
+        w.app.refresh();
+        assert_eq!(db(&w).mode(), Kind::Gallery);
+    }
+
+    #[test]
+    fn view_keys_do_nothing_under_a_dialog_the_inbox_the_switcher_or_a_cell_editor() {
+        let mut w = planned();
+        w.app.dlg = Some(Dlg::Bin { sel: 0 });
+        w.press(Key::V, CS);
+        assert_eq!(db(&w).mode(), Kind::Table, "dialog");
+        w.app.dlg = None;
+        w.app.toggle_inbox();
+        assert!(w.app.inbox.is_some());
+        w.press(Key::V, CS);
+        assert_eq!(db(&w).mode(), Kind::Table, "inbox");
+        w.app.inbox = None;
+        select(&mut w, "r1", "Notes");
+        w.app.db_activate();
+        assert!(db(&w).edit.is_some());
+        w.press(Key::V, CS);
+        assert_eq!(db(&w).mode(), Kind::Table, "cell editor");
     }
 }

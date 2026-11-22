@@ -10,6 +10,7 @@ use eframe::egui;
 use notion_core::api::Client;
 use notion_core::model::SearchResult;
 use notion_core::store::Store;
+use notion_core::views::SavedView;
 use notion_core::sync::{self, PullReport, PushReport, Skip, SyncAllReport};
 use notion_core::Error;
 use tokio::sync::mpsc as tmpsc;
@@ -36,6 +37,8 @@ pub enum Cmd {
     /// Pulls every shared page and data source (`sync::pull_all`); answered by
     /// one `SyncedAll` or `Error`, after any number of `Progress`.
     SyncAll,
+    /// The saved views of a data source (`Client::list_views`).
+    Views { ds: String },
 }
 
 #[derive(Debug, PartialEq)]
@@ -54,6 +57,7 @@ pub enum Event {
     UsersDenied,
     Fetched { op: i64, what: sync::Fetched },
     Resolved(i64),
+    Views { ds: String, views: Vec<SavedView> },
     SyncedAll(SyncAllReport),
     /// (done, total) of a running `SyncAll`. Not an answer: the app must not
     /// pop `sent` for it.
@@ -123,6 +127,10 @@ pub async fn run(
                     .await
                     .map(Event::SyncedAll)
             }
+            Cmd::Views { ds } => client.list_views(&ds).await.map(|vs| Event::Views {
+                views: vs.iter().filter_map(SavedView::from_value).collect(),
+                ds,
+            }),
             Cmd::Search(q) => client.search(&q).await.map(|rs| {
                 Event::SearchResults(
                     rs.into_iter()
@@ -225,6 +233,31 @@ mod tests {
         // the worker is gone: the channel says so
         assert!(rx.recv_timeout(Duration::from_secs(1)).is_err());
     }
+    /// Each Views gets exactly one event: Error offline and on a 404, Views on success.
+    #[test]
+    fn views_is_answered_by_exactly_one_event() {
+        use notion_core::api::ClientConfig;
+        let ok = r#"{"object":"list","results":[{"object":"view","id":"v1","name":"All","type":"table"}],"has_more":false,"next_cursor":null}"#;
+        let nf = r#"{"object":"error","status":404,"code":"x","message":"m"}"#;
+        for (status, body) in [(0, ""), (404, nf), (200, ok)] {
+            let dir = tempfile::tempdir().unwrap();
+            let url = if status == 0 { String::new() } else { serve(status, body) };
+            let (tx, rx, handle) = spawn_with(dir.path().join("cache.db"), egui::Context::default(), move || {
+                (status != 0).then(|| Client::new("t".into(), ClientConfig { base_url: url, max_retries: 0, ..Default::default() }))
+            });
+            tx.send(Cmd::Views { ds: "ds".into() }).unwrap();
+            let ev = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            match status {
+                0 => assert!(matches!(&ev, Event::Error(m) if m.starts_with("offline")), "{ev:?}"),
+                404 => assert!(matches!(&ev, Event::Error(m) if m.contains("404")), "{ev:?}"),
+                _ => assert!(matches!(&ev, Event::Views { ds, .. } if ds == "ds"), "{ev:?}"),
+            }
+            drop(tx);
+            handle.join().unwrap();
+            assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "no stray event");
+        }
+    }
+
     /// A one-thread HTTP server that answers every request with `status` and `body`.
     fn serve(status: u16, body: &'static str) -> String {
         use std::io::{Read, Write};

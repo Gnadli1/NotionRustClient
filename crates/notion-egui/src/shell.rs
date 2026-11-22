@@ -519,6 +519,12 @@ impl App {
                 self.refresh();
             }
             Event::Progress { .. } => {}
+            Event::Views { ds, views } => {
+                self.saved_views.insert(ds, views);
+                self.refresh();
+            }
+            // saved views are optional: any error leaves the local views
+            Event::Error(_) if matches!(answered, Some(Cmd::Views { .. })) => {}
             Event::Me(id) => self.me = Some(id),
             Event::UsersDenied => {
                 // said once: users_stop keeps every later trigger quiet

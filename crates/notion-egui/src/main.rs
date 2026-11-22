@@ -26,6 +26,7 @@ mod switcher;
 mod theme;
 mod undo;
 mod view;
+mod views;
 mod worker;
 // shared with notion-gui for now; a crate of their own later
 #[allow(dead_code)]

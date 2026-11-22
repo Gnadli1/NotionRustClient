@@ -232,6 +232,11 @@ pub struct App {
     pub(crate) db: Option<crate::grid::Db>,
     /// The sort of each data source this session: (column name, descending).
     pub(crate) db_sorts: HashMap<String, (String, bool)>,
+    /// F5: the chosen view (label) of each data source, read from the store
+    /// once; the saved views Notion sent; the data sources already asked.
+    pub(crate) db_views: HashMap<String, String>,
+    pub(crate) saved_views: HashMap<String, Vec<notion_core::views::SavedView>>,
+    pub(crate) views_asked: HashSet<String>,
     /// The selected blocks: first and last of a run of siblings (ids).
     pub(crate) sel: Option<(String, String)>,
     pub(crate) keys: Keymap,
@@ -446,6 +451,9 @@ impl App {
             focus: None,
             db: None,
             db_sorts: HashMap::new(),
+            db_views: HashMap::new(),
+            saved_views: HashMap::new(),
+            views_asked: HashSet::new(),
             keys: Keymap::default(),
             title_edit: None,
             title_editable: false,
