@@ -75,10 +75,10 @@ pub async fn run(
             continue;
         };
         let ev = match cmd {
-            Cmd::Pull { id, force } => sync::pull_page(client, store, &id, force)
+            Cmd::Pull { id, force } => sync::pull_any(client, store, &id, force)
                 .await
                 .map(|report| Event::Pulled { id, report }),
-            Cmd::Poll { id, skip } => sync::pull_page_skip(client, store, &id, skip)
+            Cmd::Poll { id, skip } => sync::poll_any(client, store, &id, skip)
                 .await
                 .map(|report| Event::Pulled { id, report }),
             Cmd::Push => sync::push(client, store).await.map(Event::Pushed),

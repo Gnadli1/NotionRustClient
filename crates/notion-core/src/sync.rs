@@ -17,7 +17,7 @@ use crate::model::{
 };
 use crate::ops::{CommentTarget, Op, OpKind, OpStatus};
 use crate::store::{ts, Store};
-use crate::{Error, Result};
+use crate::{props, Error, Result};
 use rusqlite::OptionalExtension;
 
 #[derive(Debug, Default, PartialEq)]
@@ -300,6 +300,24 @@ pub async fn pull_data_source(client: &Client, store: &Store, ds_id: &str) -> Re
     let ds = client.get_data_source(ds_id).await?;
     store.upsert_data_source(&ds)?;
     let rows = client.query_data_source(&ds.id, json!({})).await?;
+    let ids: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
+    let report = merge_rows(store, rows)?;
+    // a row trashed or moved away in Notion is absent from the full query: mark it trashed
+    let mut queued = HashSet::new();
+    for op in store.queued_ops()? {
+        queued.insert(store.resolve_id(op.kind.target_id())?);
+    }
+    for mut row in store.rows(&ds.id)? {
+        if !row.id.starts_with("local-") && !row.in_trash && !ids.contains(&row.id) && !queued.contains(&row.id) {
+            row.in_trash = true;
+            store.upsert_page(&row)?;
+        }
+    }
+    Ok(report)
+}
+
+/// Caches the rows that are new or changed (edit time or properties).
+fn merge_rows(store: &Store, rows: Vec<Page>) -> Result<PullReport> {
     let mut report = PullReport {
         fetched: rows.len(),
         ..Default::default()
@@ -309,18 +327,88 @@ pub async fn pull_data_source(client: &Client, store: &Store, ds_id: &str) -> Re
     store.put_users(&dedupe_users(found))?;
     for mut row in rows {
         let cached = store.get_page(&row.id)?;
-        if cached.as_ref().map(|c| c.last_edited_time) != Some(row.last_edited_time) {
-            keep_queued_props(store, &mut row)?;
-            // cached blocks are stale now: keep the old time, so the next page
-            // pull refetches them instead of skipping the row as unchanged
-            if let Some(c) = cached.filter(|_| !store.children(&row.id).is_ok_and(|b| b.is_empty())) {
-                row.last_edited_time = c.last_edited_time;
-            }
+        keep_queued_props(store, &mut row)?;
+        // cached blocks are stale now: keep the old time, so the next page
+        // pull refetches them instead of skipping the row as unchanged
+        // (the time has minute precision: a same-minute edit shows in the properties)
+        if let Some(c) = cached.as_ref().filter(|_| !store.children(&row.id).is_ok_and(|b| b.is_empty())) {
+            row.last_edited_time = c.last_edited_time;
+        }
+        // raw lags the struct fields until serialized: compare the typed properties
+        // (a local 9 and a remote 9.0 are one number) and the rest of what would be stored
+        let rest = |p: &Page| -> Result<Value> {
+            let mut v = serde_json::to_value(p)?;
+            v["properties"] = Value::Null;
+            Ok(v)
+        };
+        let same = match &cached {
+            Some(c) => c.properties == row.properties && rest(c)? == rest(&row)?,
+            None => false,
+        };
+        if !same {
             store.upsert_page(&row)?;
             report.updated += 1;
         }
     }
     Ok(report)
+}
+
+/// The open table's cheap refresh: one request for the rows edited since the
+/// newest cached one (Notion's time is rounded to the minute, so `on_or_after`
+/// also re-reads that minute). Nothing cached yet: a full pull. `skipped` if
+/// nothing changed. A row trashed or moved away in Notion stays cached until
+/// the next full pull.
+pub async fn poll_data_source(client: &Client, store: &Store, ds_id: &str) -> Result<PullReport> {
+    let newest = store.rows(ds_id)?.iter().filter(|r| !r.id.starts_with("local-")).map(|r| r.last_edited_time).max();
+    let Some(newest) = newest else {
+        return pull_data_source(client, store, ds_id).await;
+    };
+    let q = json!({ "filter": { "timestamp": "last_edited_time",
+        "last_edited_time": { "on_or_after": newest.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) } } });
+    let mut report = merge_rows(store, client.query_data_source(ds_id, q).await?)?;
+    report.skipped = report.updated == 0;
+    Ok(report)
+}
+
+/// A database id: caches its data sources (the first with its rows, so it can open).
+pub async fn pull_database(client: &Client, store: &Store, db_id: &str) -> Result<PullReport> {
+    let db = client.get_database(db_id).await?;
+    let ids: Vec<String> = db["data_sources"].as_array().into_iter().flatten().filter_map(|d| d["id"].as_str().map(str::to_string)).collect();
+    let Some((first, rest)) = ids.split_first() else {
+        return Err(Error::Invalid("this database has no data source".into()));
+    };
+    let report = pull_data_source(client, store, first).await?;
+    for id in rest {
+        store.upsert_data_source(&client.get_data_source(id).await?)?;
+    }
+    Ok(report)
+}
+
+/// [`pull_page`] for any id the app opens: a cached data source pulls its
+/// rows; a `child_database` block's id, or an id Notion says is no page,
+/// is a database.
+pub async fn pull_any(client: &Client, store: &Store, id: &str, force: bool) -> Result<PullReport> {
+    if store.data_source(id)?.is_some() {
+        return pull_data_source(client, store, id).await;
+    }
+    if matches!(store.get_block(id)?.map(|b| b.kind), Some(BlockKind::ChildDatabase { .. })) {
+        return pull_database(client, store, id).await;
+    }
+    match pull_page(client, store, id, force).await {
+        Err(e @ Error::Api { status: 400 | 404, .. }) => match pull_database(client, store, id).await {
+            Err(Error::Api { status: 400 | 404, .. }) => Err(e),
+            r => r,
+        },
+        r => r,
+    }
+}
+
+/// [`pull_page_skip`], or [`poll_data_source`] for a data source.
+pub async fn poll_any(client: &Client, store: &Store, id: &str, skip: Skip) -> Result<PullReport> {
+    if store.data_source(id)?.is_some() {
+        return poll_data_source(client, store, id).await;
+    }
+    pull_page_skip(client, store, id, skip).await
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -616,7 +704,10 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
                 return Ok(Outcome::Failed("its parent page was never created".into()));
             }
             let mut req = body.clone();
-            req["parent"] = json!({ "type": "page_id", "page_id": parent });
+            // a row of a data source carries its own parent
+            if req.get("parent").is_none() {
+                req["parent"] = json!({ "type": "page_id", "page_id": parent });
+            }
             let resp = match client.create_page(&req).await {
                 // Never reached Notion (or it said no): safe to retry or fail as usual.
                 Err(e @ (Error::Api { .. } | Error::RetriesExhausted)) => return Err(e),
@@ -1487,6 +1578,93 @@ pub fn local_create_page(
                 local_id: id.clone(),
                 parent_id: parent_id.to_string(),
                 body: json!({ "properties": { "title": { "title": title_body(&runs) } } }),
+            },
+            None,
+            None,
+        )?;
+        Ok(())
+    })?;
+    Ok(id)
+}
+
+/// Sets property `name` of a cached database row to `text` (see
+/// [`props::encode`]; the data source's schema says its type) and queues
+/// `{"<name>": value}`, merged into the row's queued property update; an
+/// unpushed row's create carries it instead. Returns the op id.
+pub fn local_set_property(store: &Store, page_id: &str, name: &str, text: &str) -> Result<i64> {
+    let base = store
+        .get_page(page_id)?
+        .ok_or_else(|| Error::Invalid(format!("page {page_id} not cached")))?;
+    let Parent::DataSource { id: ds, .. } = &base.parent else {
+        return Err(Error::Invalid("not a database row".into()));
+    };
+    let schema = store.data_source(ds)?.map(|d| d.properties[name].clone()).unwrap_or_default();
+    if schema.is_null() {
+        return Err(Error::Invalid(format!("the database has no property {name}")));
+    }
+    let (sent, cached) = props::encode(&schema, text, &base.raw["properties"][name])?;
+    let mut raw = serde_json::to_value(&base)?;
+    raw["properties"][name] = cached;
+    let page: Page = serde_json::from_value(raw)?;
+    store.atomic(|| {
+        store.upsert_page(&page)?;
+        if let Some(op) = queued_create_page(store, page_id)? {
+            let OpKind::CreatePage { body, .. } = &op.kind else { unreachable!() };
+            let mut all = body["properties"].clone();
+            all[name] = sent;
+            return set_create_body(store, op, "properties", all);
+        }
+        if let Some(Op {
+            id,
+            kind: OpKind::UpdatePageProperties { page_id, mut properties },
+            ..
+        }) = queued_props(store, page_id)?
+        {
+            properties[name] = sent.clone();
+            store.update_op_kind(id, &OpKind::UpdatePageProperties { page_id, properties })?;
+            return Ok(id);
+        }
+        store.enqueue(
+            OpKind::UpdatePageProperties { page_id: page_id.to_string(), properties: json!({ name: sent }) },
+            Some(base.last_edited_time),
+            Some(serde_json::to_value(&base)?),
+        )
+    })
+}
+
+/// Caches a new empty row of the cached data source with a temporary
+/// `local-…` id and queues its creation under `{"data_source_id": …}`.
+/// Returns the row's id; edit it with [`local_set_property`] before the push.
+pub fn local_create_row(store: &Store, ds_id: &str) -> Result<String> {
+    let ds = store
+        .data_source(ds_id)?
+        .ok_or_else(|| Error::Invalid("the data source isn't cached".into()))?;
+    let title = ds
+        .properties
+        .as_object()
+        .into_iter()
+        .flatten()
+        .find(|(_, p)| p["type"] == "title")
+        .map(|(k, _)| k.clone())
+        .ok_or_else(|| Error::Invalid("the data source has no title property".into()))?;
+    let id = local_stamp("local");
+    let now = ts(&Utc::now());
+    let parent = json!({ "type": "data_source_id", "data_source_id": ds_id, "database_id": ds.database_id });
+    let page: Page = serde_json::from_value(json!({
+        "object": "page", "id": id, "parent": parent, "created_time": now,
+        "last_edited_time": now, "in_trash": false, "url": "", "icon": null, "cover": null,
+        "properties": { &title: { "id": "title", "type": "title", "title": [] } },
+    }))?;
+    store.atomic(|| {
+        store.upsert_page(&page)?;
+        store.enqueue(
+            OpKind::CreatePage {
+                local_id: id.clone(),
+                parent_id: ds_id.to_string(),
+                body: json!({
+                    "parent": { "type": "data_source_id", "data_source_id": ds_id },
+                    "properties": { title: { "title": [] } },
+                }),
             },
             None,
             None,
@@ -6076,6 +6254,325 @@ mod tests {
         local_trash_page(&store, "c", false).unwrap();
         assert!(local_set_icon(&store, "p", Some("🦄")).is_ok());
         assert!(local_set_icon(&store, "p", Some("a🦄")).is_err());
+    }
+
+    // ---------------------------------------------------------- databases (F4)
+
+    fn ds_parent() -> Value {
+        json!({ "type": "data_source_id", "data_source_id": "ds", "database_id": "db" })
+    }
+
+    fn prop(id: &str, name: &str, kind: &str, config: Value) -> Value {
+        json!({ "id": id, "name": name, "type": kind, kind: config })
+    }
+
+    fn ds_json() -> Value {
+        let mut props = serde_json::Map::new();
+        let mut add = |name: &str, kind: &str, config: Value| {
+            let id = if kind == "title" { "title".to_string() } else { format!("id-{name}") };
+            props.insert(name.into(), prop(&id, name, kind, config));
+        };
+        add("Name", "title", json!({}));
+        add("Notes", "rich_text", json!({}));
+        add("Qty", "number", json!({ "format": "number" }));
+        add("Kind", "select", json!({ "options": [{ "id": "o1", "name": "A", "color": "red" }] }));
+        add("Tags", "multi_select", json!({ "options": [] }));
+        add("State", "status", json!({ "options": [{ "id": "s1", "name": "Done", "color": "green" }] }));
+        add("Due", "date", json!({}));
+        add("Done", "checkbox", json!({}));
+        add("Site", "url", json!({}));
+        add("Mail", "email", json!({}));
+        add("Tel", "phone_number", json!({}));
+        add("Who", "people", json!({}));
+        add("Calc", "formula", json!({ "expression": "1" }));
+        json!({ "object": "data_source", "id": "ds", "parent": { "type": "database_id", "database_id": "db" },
+            "title": [{ "type": "text", "text": { "content": "Tasks" }, "plain_text": "Tasks", "annotations": {} }],
+            "last_edited_time": T, "properties": props })
+    }
+
+    fn row(id: &str, time: &str) -> Value {
+        let mut v = page(id, ds_parent(), time);
+        v["properties"]["Qty"] = json!({ "id": "id-Qty", "type": "number", "number": null });
+        v["properties"]["Done"] = json!({ "id": "id-Done", "type": "checkbox", "checkbox": false });
+        v
+    }
+
+    /// A store with the data source "ds" and its row "r1" (at time T).
+    fn rows_store() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_data_source(&serde_json::from_value(ds_json()).unwrap()).unwrap();
+        store.upsert_page(&serde_json::from_value(row("r1", T)).unwrap()).unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn each_property_type_pushes_its_own_body() {
+        let cases = [
+            ("Name", "Hi", json!({ "title": [{ "type": "text", "text": { "content": "Hi" } }] })),
+            ("Notes", "x", json!({ "rich_text": [{ "type": "text", "text": { "content": "x" } }] })),
+            ("Qty", "3", json!({ "number": 3 })),
+            ("Kind", "A", json!({ "select": { "name": "A" } })),
+            ("Tags", "x,y", json!({ "multi_select": [{ "name": "x" }, { "name": "y" }] })),
+            ("State", "Done", json!({ "status": { "name": "Done" } })),
+            ("Due", "2025-01-01/2025-01-02", json!({ "date": { "start": "2025-01-01", "end": "2025-01-02", "time_zone": null } })),
+            ("Done", "true", json!({ "checkbox": true })),
+            ("Site", "https://a.at", json!({ "url": "https://a.at" })),
+            ("Mail", "a@b.at", json!({ "email": "a@b.at" })),
+            ("Tel", "+43 1", json!({ "phone_number": "+43 1" })),
+            ("Who", "u1", json!({ "people": [{ "object": "user", "id": "u1" }] })),
+        ];
+        for (name, text, sent) in cases {
+            let s = MockServer::start().await;
+            let store = rows_store();
+            local_set_property(&store, "r1", name, text).unwrap();
+            assert_eq!(store.get_page("r1").unwrap().unwrap().raw["properties"][name]["type"], ds_json()["properties"][name]["type"], "{name} cached");
+            get(&s, "/v1/pages/r1", ok(row("r1", T))).await;
+            Mock::given(method("PATCH"))
+                .and(path("/v1/pages/r1"))
+                .and(wiremock::matchers::body_json(json!({ "properties": { name: sent } })))
+                .respond_with(ok(row("r1", T2)))
+                .expect(1)
+                .mount(&s)
+                .await;
+            assert_eq!(push(&client(&s), &store).await.unwrap(), report(1, 0), "{name}");
+            s.verify().await;
+        }
+    }
+
+    #[test]
+    fn property_edits_are_refused_for_read_only_types_and_non_rows() {
+        let store = rows_store();
+        for bad in [("Calc", "1"), ("Qty", "abc"), ("State", "Nope"), ("Site", "ftp://a"), ("Nope", "x")] {
+            assert!(local_set_property(&store, "r1", bad.0, bad.1).is_err(), "{bad:?}");
+        }
+        page_in_store(&store);
+        assert!(local_set_property(&store, "pg", "Name", "x").is_err());
+        assert!(store.queued_ops().unwrap().is_empty());
+    }
+
+    fn page_in_store(store: &Store) {
+        store.upsert_page(&serde_json::from_value(page("pg", pp("root"), T)).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn several_cell_edits_on_one_row_are_one_op_and_other_rows_get_their_own() {
+        let s = MockServer::start().await;
+        let store = rows_store();
+        store.upsert_page(&serde_json::from_value(row("r2", T)).unwrap()).unwrap();
+        local_set_property(&store, "r1", "Qty", "3").unwrap();
+        local_set_property(&store, "r1", "Name", "Hi").unwrap();
+        local_set_property(&store, "r1", "Qty", "4").unwrap();
+        local_set_property(&store, "r2", "Qty", "9").unwrap();
+        assert_eq!(store.queued_ops().unwrap().len(), 2);
+        for id in ["r1", "r2"] {
+            get(&s, &format!("/v1/pages/{id}"), ok(row(id, T))).await;
+        }
+        patch(&s, "/v1/pages/r1", json!({ "properties": { "Qty": { "number": 4 }, "Name": { "title": [{ "text": { "content": "Hi" } }] } } }), ok(row("r1", T2))).await;
+        patch(&s, "/v1/pages/r2", json!({ "properties": { "Qty": { "number": 9 } } }), ok(row("r2", T2))).await;
+        assert_eq!(push(&client(&s), &store).await.unwrap(), report(2, 0));
+        s.verify().await;
+    }
+
+    #[tokio::test]
+    async fn only_a_remote_change_to_an_edited_property_conflicts() {
+        let remote = |qty: Value, done: bool| {
+            let mut v = row("r1", T2);
+            v["properties"]["Qty"]["number"] = qty;
+            v["properties"]["Done"]["checkbox"] = json!(done);
+            v
+        };
+        for (remote, applied, conflicts) in [(remote(json!(5), false), 0, 1), (remote(json!(null), true), 1, 0)] {
+            let s = MockServer::start().await;
+            let store = rows_store();
+            local_set_property(&store, "r1", "Qty", "3").unwrap();
+            get(&s, "/v1/pages/r1", ok(remote)).await;
+            Mock::given(method("PATCH")).and(path("/v1/pages/r1")).respond_with(ok(row("r1", T2))).mount(&s).await;
+            assert_eq!(push(&client(&s), &store).await.unwrap(), report(applied, conflicts));
+            if conflicts == 1 {
+                let c = store.ops_by_status(OpStatus::Conflict).unwrap();
+                assert_eq!(c[0].error.as_deref(), Some("remote changed Qty"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_row_is_created_under_its_data_source_and_its_id_mapped() {
+        let s = MockServer::start().await;
+        let store = rows_store();
+        let id = local_create_row(&store, "ds").unwrap();
+        assert!(id.starts_with("local-"));
+        assert_eq!(store.rows("ds").unwrap().len(), 2);
+        // edits before the push go into the create, not into a second op
+        local_set_property(&store, &id, "Name", "Hello").unwrap();
+        local_set_property(&store, &id, "Qty", "2").unwrap();
+        assert_eq!(store.queued_ops().unwrap().len(), 1);
+        let mut made = row("real1", T2);
+        made["properties"]["Name"]["title"] = json!([{ "type": "text", "text": { "content": "Hello" }, "plain_text": "Hello", "annotations": {} }]);
+        Mock::given(method("POST"))
+            .and(path("/v1/pages"))
+            .and(wiremock::matchers::body_json(json!({
+                "parent": { "type": "data_source_id", "data_source_id": "ds" },
+                "properties": { "Name": { "title": [{ "type": "text", "text": { "content": "Hello" } }] }, "Qty": { "number": 2 } },
+            })))
+            .respond_with(ok(made))
+            .expect(1)
+            .mount(&s)
+            .await;
+        assert_eq!(push(&client(&s), &store).await.unwrap(), report(1, 0));
+        s.verify().await;
+        assert_eq!(store.resolve_id(&id).unwrap(), "real1");
+        let mut ids: Vec<_> = store.rows("ds").unwrap().into_iter().map(|p| p.id).collect();
+        ids.sort();
+        assert_eq!(ids, ["r1", "real1"]);
+        assert_eq!(store.get_page("real1").unwrap().unwrap().title(), "Hello");
+        assert!(store.queued_ops().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_row_is_trashed_with_one_patch_and_stays_out_of_a_pull() {
+        let s = MockServer::start().await;
+        let store = rows_store();
+        local_trash_page(&store, "r1", true).unwrap();
+        assert!(store.get_page("r1").unwrap().unwrap().in_trash);
+        // a pull before the push keeps the queued trash
+        get(&s, "/v1/data_sources/ds", ok(ds_json())).await;
+        post(&s, "/v1/data_sources/ds/query", list(vec![row("r1", T2)]), 1).await;
+        pull_data_source(&client(&s), &store, "ds").await.unwrap();
+        assert!(store.get_page("r1").unwrap().unwrap().in_trash);
+        s.reset().await;
+        get(&s, "/v1/pages/r1", ok(row("r1", T2))).await;
+        let mut done = row("r1", T2);
+        done["in_trash"] = json!(true);
+        patch(&s, "/v1/pages/r1", json!({ "in_trash": true }), ok(done)).await;
+        assert_eq!(push(&client(&s), &store).await.unwrap(), report(1, 0));
+    }
+
+    #[tokio::test]
+    async fn pulling_a_database_caches_its_data_sources_and_the_first_ones_rows() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        get(&s, "/v1/databases/db", ok(json!({ "object": "database", "id": "db",
+            "data_sources": [{ "id": "ds", "name": "Tasks" }, { "id": "ds2", "name": "More" }] }))).await;
+        get(&s, "/v1/data_sources/ds", ok(ds_json())).await;
+        let mut two = ds_json();
+        two["id"] = json!("ds2");
+        two["title"] = json!([]);
+        get(&s, "/v1/data_sources/ds2", ok(two)).await;
+        post(&s, "/v1/data_sources/ds/query", list(vec![row("r1", T), row("r2", T)]), 1).await;
+        post(&s, "/v1/data_sources/ds2/query", list(vec![]), 0).await;
+        let r = pull_database(&client(&s), &store, "db").await.unwrap();
+        assert_eq!(r.updated, 2);
+        assert_eq!(store.data_sources_of("db").unwrap().iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), ["ds2", "ds"]);
+        assert_eq!(store.rows("ds").unwrap().len(), 2);
+        s.verify().await;
+    }
+
+    async fn setup(s: &MockServer) {
+        get(s, "/v1/data_sources/ds", ok(ds_json())).await;
+        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query")).respond_with(list(vec![row("r1", T)])).mount(s).await;
+    }
+
+    #[tokio::test]
+    async fn pull_any_tells_data_sources_databases_and_pages_apart() {
+        let err = |status: u16| ResponseTemplate::new(status).set_body_json(json!({ "object": "error", "status": status, "code": "x", "message": "m" }));
+        let db = || ok(json!({ "object": "database", "id": "x", "data_sources": [{ "id": "ds", "name": "T" }] }));
+        // a cached data source: its rows, no page request
+        let s = MockServer::start().await;
+        let store = rows_store();
+        setup(&s).await;
+        get(&s, "/v1/pages/ds", err(500)).await;
+        assert_eq!(pull_any(&client(&s), &store, "ds", false).await.unwrap().fetched, 1);
+        // a child_database block's id is a database, without asking for a page
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        setup(&s).await;
+        get(&s, "/v1/databases/cd", db()).await;
+        get(&s, "/v1/pages/cd", err(500)).await;
+        let blk: Block = serde_json::from_value(json!({ "object": "block", "id": "cd", "parent": pp("p"), "type": "child_database",
+            "child_database": { "title": "T" }, "has_children": false, "in_trash": false, "created_time": T, "last_edited_time": T })).unwrap();
+        store.put_block(&blk).unwrap();
+        assert_eq!(pull_any(&client(&s), &store, "cd", false).await.unwrap().fetched, 1);
+        // Notion says the id is a database, not a page
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        setup(&s).await;
+        get(&s, "/v1/pages/x", err(400)).await;
+        get(&s, "/v1/databases/x", db()).await;
+        assert_eq!(pull_any(&client(&s), &store, "x", false).await.unwrap().fetched, 1);
+        // neither: the page's error
+        let s = MockServer::start().await;
+        get(&s, "/v1/pages/x", err(404)).await;
+        get(&s, "/v1/databases/x", err(404)).await;
+        let e = pull_any(&client(&s), &Store::open_in_memory().unwrap(), "x", false).await.unwrap_err();
+        assert!(matches!(e, Error::Api { status: 404, .. }));
+        // anything else is a page
+        let s = MockServer::start().await;
+        get(&s, "/v1/pages/p", ok(page("p", pp("root"), T))).await;
+        get(&s, "/v1/blocks/p/children", list(vec![])).await;
+        assert!(!pull_any(&client(&s), &Store::open_in_memory().unwrap(), "p", false).await.unwrap().skipped);
+    }
+
+    #[tokio::test]
+    async fn polling_a_data_source_asks_only_for_rows_edited_since_the_newest() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let c = client(&s);
+        get(&s, "/v1/data_sources/ds", ok(ds_json())).await;
+        let rows_at = |v: Vec<Value>| list(v);
+        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query")).respond_with(rows_at(vec![row("r1", T), row("r2", T2)])).mount(&s).await;
+        // nothing cached: a full pull (and the schema)
+        assert!(!poll_data_source(&c, &store, "ds").await.unwrap().skipped);
+        assert_eq!(store.rows("ds").unwrap().len(), 2);
+        s.reset().await;
+        // nothing changed: one request, skipped
+        let q = json!({ "filter": { "timestamp": "last_edited_time", "last_edited_time": { "on_or_after": "2025-01-02T00:00:00.000Z" } } });
+        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query")).and(body_partial_json(q.clone()))
+            .respond_with(rows_at(vec![row("r2", T2)])).expect(1).mount(&s).await;
+        let r = poll_data_source(&c, &store, "ds").await.unwrap();
+        assert!(r.skipped && r.updated == 0, "{r:?}");
+        // a same-minute edit of another row is seen through its properties
+        s.reset().await;
+        let mut edited = row("r2", T2);
+        edited["properties"]["Qty"]["number"] = json!(7);
+        let new = row("r3", "2025-01-03T00:00:00.000Z");
+        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query")).and(body_partial_json(q))
+            .respond_with(rows_at(vec![edited, new])).expect(1).mount(&s).await;
+        let r = poll_data_source(&c, &store, "ds").await.unwrap();
+        assert!(!r.skipped && r.updated == 2, "{r:?}");
+        assert_eq!(store.get_page("r2").unwrap().unwrap().raw["properties"]["Qty"]["number"], 7);
+        assert_eq!(store.rows("ds").unwrap().len(), 3);
+        // only the filtered queries were sent (no second data source GET)
+        assert!(s.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "POST"));
+    }
+
+    #[tokio::test]
+    async fn a_poll_with_a_queued_prop_edit_updates_nothing() {
+        let s = MockServer::start().await;
+        let store = rows_store();
+        local_set_property(&store, "r1", "Qty", "9").unwrap();
+        get(&s, "/v1/data_sources/ds", ok(ds_json())).await;
+        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query")).respond_with(list(vec![row("r1", T2)])).mount(&s).await;
+        for _ in 0..2 {
+            let r = poll_data_source(&client(&s), &store, "ds").await.unwrap();
+            assert!(r.skipped && r.updated == 0, "{r:?}");
+        }
+        assert_eq!(store.queued_ops().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_full_pull_trashes_rows_missing_from_the_query_except_local_and_queued_ones() {
+        let s = MockServer::start().await;
+        let store = rows_store();
+        let local = local_create_row(&store, "ds").unwrap();
+        for id in ["r2", "r3"] {
+            store.upsert_page(&serde_json::from_value(row(id, T)).unwrap()).unwrap();
+        }
+        local_set_property(&store, "r3", "Qty", "1").unwrap();
+        get(&s, "/v1/data_sources/ds", ok(ds_json())).await;
+        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query")).respond_with(list(vec![row("r1", T)])).mount(&s).await;
+        pull_data_source(&client(&s), &store, "ds").await.unwrap();
+        let trashed = |id: &str| store.get_page(id).unwrap().unwrap().in_trash;
+        assert!(trashed("r2") && !trashed("r1") && !trashed("r3") && !trashed(&local));
     }
 
     fn ts_parse(t: &str) -> DateTime<Utc> {

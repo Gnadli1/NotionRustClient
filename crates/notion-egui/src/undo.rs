@@ -62,12 +62,16 @@ impl App {
             .filter(|f| f.cell.is_none())
             .map(|f| f.block_id);
         self.title_edit = None;
+        if let Some(d) = &mut self.db {
+            d.edit = None;
+        }
         match sync::restore(&self.store, &c) {
             Ok(true) => {
                 let inv = (page.clone(), c.inverse());
                 if back { &mut self.redo } else { &mut self.undo }.push(inv);
                 // not into a trashed page (redoing a trash, undoing a restore)
-                let trashed = self.store.get_page(&page).ok().flatten().is_none_or(|p| p.in_trash);
+                let is_table = self.store.data_source(&page).ok().flatten().is_some();
+                let trashed = !is_table && self.store.get_page(&page).ok().flatten().is_none_or(|p| p.in_trash);
                 if self.current.as_deref() != Some(page.as_str()) && !trashed {
                     self.pending_open = None;
                     self.set_current(&page);

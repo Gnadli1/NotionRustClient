@@ -10,6 +10,7 @@ mod comments;
 #[allow(dead_code)]
 mod edit;
 mod editing;
+mod grid;
 mod keys;
 mod links;
 mod md;

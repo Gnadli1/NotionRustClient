@@ -101,12 +101,7 @@ fn tree_row(ui: &mut Ui, c: &Colors, r: &TreeRow, current: Option<&str>) -> Opti
         c.text,
     );
     if act.is_none() && resp.clicked() {
-        // a database has no view until F4: the click expands it instead
-        act = Some(if r.entry.database {
-            Action::ToggleTree(r.entry.id.clone())
-        } else {
-            Action::Open(r.entry.id.clone())
-        });
+        act = Some(Action::Open(r.entry.id.clone()));
     }
     act
 }

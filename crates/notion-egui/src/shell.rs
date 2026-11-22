@@ -31,7 +31,7 @@ pub const POLL_BG: Duration = Duration::from_secs(60);
 const FOCUS_GAP: Duration = Duration::from_secs(5);
 /// Notion's edit time has minute precision, so a poll of a recently edited
 /// page pulls in full even if the time is unchanged: at most this often per page.
-const FULL_MIN: Duration = Duration::from_secs(60);
+pub(crate) const FULL_MIN: Duration = Duration::from_secs(60);
 /// How long a block a poll changed stays tinted.
 pub const FLASH: Duration = Duration::from_secs(2);
 /// The workspace's users are pulled again this often (they rarely change).
@@ -52,11 +52,12 @@ impl App {
             session::touch(&mut self.recent, id);
             self.visited.insert(id.clone(), crate::comments::now_secs());
         }
+        // the table's cells show user names
+        self.load_users();
         if let Err(e) = self.load_page().and_then(|()| self.load_ops()) {
             self.last_error = Some(e.to_string());
         }
         self.load_comments();
-        self.load_users();
         // a push may have renamed the edited local-* block
         if let Some(f) = &mut self.focus {
             match self.store.resolve_id(&f.block_id) {
@@ -124,8 +125,13 @@ impl App {
             self.page_head = None;
             self.block_edits.clear();
             self.rows.clear();
+            self.db = None;
             return Ok(());
         };
+        if self.store.data_source(id)?.is_some() {
+            return self.load_db(&id.clone());
+        }
+        self.db = None;
         let page = self.store.get_page(id)?;
         self.page_edit = page
             .as_ref()
@@ -183,8 +189,9 @@ impl App {
         Ok(())
     }
 
+    /// A cached page or data source.
     pub(crate) fn cached(&self, id: &str) -> bool {
-        matches!(self.store.get_page(id), Ok(Some(_)))
+        matches!(self.store.get_page(id), Ok(Some(_))) || matches!(self.store.data_source(id), Ok(Some(_)))
     }
 
     /// Expands the sidebar pages above the current one.
@@ -203,6 +210,10 @@ impl App {
     /// (one op, through core, one undo step), keeping the editor open. False
     /// if the write failed. Locked and non-editable rows are never written.
     pub(crate) fn flush(&mut self) -> bool {
+        // a table has no block or title editor, only a cell
+        if self.db.is_some() {
+            return self.db_flush();
+        }
         let dirty = self.title_edit.as_ref().is_some_and(|t| t.text != t.original)
             || self.focus.as_ref().is_some_and(|f| f.text != f.original);
         if !dirty {
@@ -275,7 +286,7 @@ impl App {
     /// [`flush`](Self::flush), then stop editing; the editor stays if the
     /// write failed.
     pub(crate) fn commit(&mut self) -> bool {
-        let ok = self.flush();
+        let ok = if self.db.is_some() { self.db_commit(true) } else { self.flush() && self.db_commit(true) };
         if ok {
             self.focus = None;
             self.title_edit = None;
@@ -452,7 +463,10 @@ impl App {
                 let opened = self.pending_open.as_ref() == Some(&id) && self.commit();
                 if opened {
                     self.pending_open = None;
-                    self.set_current(&id);
+                    // a database opens as its first data source
+                    let to = self.db_target(&id).unwrap_or_else(|| id.clone());
+                    self.full_at.insert(to.clone(), Instant::now());
+                    self.set_current(&to);
                 }
                 self.last_error = None;
                 self.info = Some(if report.skipped {
@@ -707,15 +721,15 @@ impl App {
         if !self.commit() {
             return;
         }
-        if self.tree.iter().any(|e| e.database && e.id == id) {
-            self.info = Some("databases open in F4".into());
-            return;
-        }
+        // a database (a child_database block, a link) is its first data source
+        let id = self.db_target(id).unwrap_or_else(|| id.to_string());
+        let id = id.as_str();
         if self.cached(id) {
             self.pending_open = None;
             self.set_current(id);
             self.refresh();
             self.reveal_current();
+            self.db_pull_if_stale();
         } else {
             self.pending_open = Some(id.to_string());
             self.send(Cmd::Pull {
@@ -1107,6 +1121,11 @@ impl App {
             Command::Back => self.go_history(true),
             Command::Forward => self.go_history(false),
             Command::Parent => self.open_parent(),
+            Command::Find if self.db.is_some() => {
+                if let Some(d) = &mut self.db {
+                    d.focus_filter = true;
+                }
+            }
             Command::Find if self.current.is_some() => {
                 self.find.get_or_insert_with(Find::default).focus = true;
             }
@@ -1129,6 +1148,9 @@ impl App {
             Command::CloseTab => self.close_tab(self.active),
             Command::Undo => self.undo_redo(true),
             Command::Redo => self.undo_redo(false),
+            Command::Comments if self.db.is_some() => {
+                self.info = Some("comments: open a row as a page (Ctrl+Shift+O)".into());
+            }
             Command::Comments => self.toggle_comments(),
             _ => {}
         }
@@ -1179,6 +1201,10 @@ impl App {
     /// flush with no other step in between replaces that step: it is redone
     /// from the older checkpoint.
     fn poll_flush(&mut self) -> bool {
+        // a cell's text box is left alone: half-typed values would be refused
+        if self.db.is_some() {
+            return true;
+        }
         let focus = self.focus.as_ref().filter(|f| f.text != f.original);
         let key = self.current.clone().zip(focus).map(|(p, f)| (p, f.block_id.clone(), f.cell.clone()));
         let Some(key) = key.filter(|_| !self.stepping) else {
@@ -1252,6 +1278,7 @@ impl App {
         }
         let shortcuts = self.shortcuts(&ctx);
         self.selection_keys(&ctx);
+        self.db_keys(&ctx);
         self.switcher_keys(&ctx);
         if let Some(d) = self.dlg_keys(&ctx) {
             self.dlg_done(d);
@@ -1347,7 +1374,9 @@ impl App {
         }
         let page = egui::CentralPanel::default()
             .show(ui, |ui| {
-                if self.current.is_some() {
+                if self.db.is_some() {
+                    self.db_ui(ui)
+                } else if self.current.is_some() {
                     self.page_ui(ui)
                 } else {
                     view::empty_tab(ui, c);
@@ -2616,10 +2645,11 @@ mod tests {
         w.answer(Event::Error("notion 401 unauthorized: bad".into()));
         assert!(w.app.sent.is_empty() && w.app.progress.is_none());
         assert!(w.app.last_error.as_deref().unwrap().contains("401"));
-        // a database has no view yet
+        // a database opens as a table, and is pulled
         w.app.apply(Action::Open("ds".into()));
-        assert_eq!(w.app.current.as_deref(), Some("p"));
-        assert!(w.cmds().iter().all(|c| *c != Cmd::Pull { id: "ds".into(), force: false }));
+        assert_eq!(w.app.current.as_deref(), Some("ds"));
+        assert!(w.app.db.is_some());
+        assert!(w.cmds().contains(&Cmd::Pull { id: "ds".into(), force: false }));
     }
 
     #[test]

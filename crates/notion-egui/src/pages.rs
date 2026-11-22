@@ -173,7 +173,7 @@ impl App {
     /// the tab closes.
     fn trash_page(&mut self, id: String) {
         let parent = match self.store.get_page(&id) {
-            Ok(Some(Page { parent: Parent::Page(p), .. })) => Some(p),
+            Ok(Some(Page { parent: Parent::Page(p) | Parent::DataSource { id: p, .. }, .. })) => Some(p),
             _ => None,
         };
         if !self.page_edit(Some(id.clone()), vec![], |st, id| sync::local_trash_page(st, id, true)) {
@@ -215,6 +215,9 @@ impl App {
     /// A key-map command of the pages feature (see `run_shortcut`).
     pub(crate) fn page_command(&mut self, c: crate::keys::Command) {
         use crate::keys::Command as C;
+        if self.db.is_some() {
+            return self.db_command(c);
+        }
         if c == C::NewPage {
             return self.new_page(None);
         }
@@ -254,6 +257,10 @@ impl App {
             Done::Close => true,
             Done::Icon(e) => self.set_icon(e),
             Done::Cover(u) => self.set_cover(u),
+            Done::Trash(id) if self.db_has_row(&id) => {
+                self.trash_row(id);
+                true
+            }
             Done::Trash(id) => {
                 self.trash_page(id);
                 true
@@ -416,6 +423,9 @@ impl App {
         self.recent.iter_mut().for_each(|p| *p = r(p));
         self.tree_open = self.tree_open.drain().map(|p| r(&p)).collect();
         self.hists.iter_mut().for_each(|h| h.remap(r));
+        if let Some(d) = &mut self.db {
+            d.remap(r);
+        }
     }
 }
 

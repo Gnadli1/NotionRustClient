@@ -182,6 +182,8 @@ pub(crate) enum Action {
     NewPage(Option<String>),
     /// Opens a page dialog (icon, cover, trash view).
     Dlg(Dlg),
+    /// A click on the open database table.
+    Db(crate::grid::Act),
     /// A slash pick or Markdown shortcut on the edited row: `text` is the
     /// editor's text without the trigger, `typed` as it was before, `at` the
     /// cursor (a char index into `text`).
@@ -224,6 +226,10 @@ pub struct App {
     /// Table cells by (row, table row, column).
     pub(crate) table_jobs: HashMap<(usize, usize, usize), LayoutJob>,
     pub(crate) focus: Option<Focus>,
+    /// The open data source as a table (then `rows` is empty).
+    pub(crate) db: Option<crate::grid::Db>,
+    /// The sort of each data source this session: (column name, descending).
+    pub(crate) db_sorts: HashMap<String, (String, bool)>,
     /// The selected blocks: first and last of a run of siblings (ids).
     pub(crate) sel: Option<(String, String)>,
     pub(crate) keys: Keymap,
@@ -431,6 +437,8 @@ impl App {
             jobs: HashMap::new(),
             table_jobs: HashMap::new(),
             focus: None,
+            db: None,
+            db_sorts: HashMap::new(),
             keys: Keymap::default(),
             title_edit: None,
             title_editable: false,
@@ -630,6 +638,7 @@ impl App {
                     self.dlg = Some(d);
                 }
             }
+            Action::Db(a) => self.db_act(a),
             Action::Link { link, new_tab } => self.open_link(link, new_tab),
             Action::EditTitle => self.start_title(),
             Action::TitleCommit => {
@@ -878,7 +887,7 @@ impl App {
                     let page = matches!(marker, Marker::ChildPage(_));
                     let text = format!("{} {t}", if page { "📄" } else { "🗄" });
                     let r = ui.add(Label::new(text).sense(Sense::click()));
-                    if let Some(new_tab) = page.then(|| clicked_new_tab(ui, &r)).flatten() {
+                    if let Some(new_tab) = clicked_new_tab(ui, &r) {
                         let link = Link::Page(self.rows[idx].block_id.clone());
                         act = Some(Action::Link { link, new_tab });
                     }
@@ -886,7 +895,7 @@ impl App {
                 Marker::LinkToPage {
                     id,
                     title,
-                    database,
+                    ..
                 } => {
                     let text = if title.is_empty() {
                         "→ (page)".to_string()
@@ -894,7 +903,7 @@ impl App {
                         format!("→ {title}")
                     };
                     let r = ui.add(Label::new(text).sense(Sense::click()));
-                    if let Some(new_tab) = (!database).then(|| clicked_new_tab(ui, &r)).flatten() {
+                    if let Some(new_tab) = clicked_new_tab(ui, &r) {
                         act = Some(Action::Link {
                             link: Link::Page(id.clone()),
                             new_tab,

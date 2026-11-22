@@ -618,6 +618,15 @@ impl Store {
         Ok(())
     }
 
+    pub fn data_source(&self, id: &str) -> Result<Option<DataSource>> {
+        self.get("SELECT raw FROM data_sources WHERE id = ?1", id)
+    }
+
+    /// The cached data sources of a database, by title.
+    pub fn data_sources_of(&self, database_id: &str) -> Result<Vec<DataSource>> {
+        self.list("SELECT raw FROM data_sources WHERE database_id = ?1 ORDER BY title, id", database_id)
+    }
+
     pub fn rows(&self, data_source_id: &str) -> Result<Vec<Page>> {
         self.list(
             "SELECT raw FROM pages WHERE parent_type = 'data_source_id' AND parent_id = ?1 ORDER BY id",

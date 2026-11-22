@@ -201,6 +201,11 @@ impl Client {
             .await
     }
 
+    /// `GET /v1/databases/{id}`: its `data_sources` are `[{id, name}]`. Raw.
+    pub async fn get_database(&self, id: &str) -> Result<Value> {
+        self.send(Method::GET, &format!("/v1/databases/{id}"), &[], None).await
+    }
+
     pub async fn get_data_source(&self, id: &str) -> Result<DataSource> {
         self.call(Method::GET, &format!("/v1/data_sources/{id}"), None)
             .await
@@ -689,11 +694,12 @@ mod tests {
     async fn query_data_source_paginates() {
         let s = MockServer::start().await;
         let p = "/v1/data_sources/ds/query";
-        let filter = json!({"filter": {"property": "Done", "checkbox": {"equals": true}}});
+        let filter = json!({"filter": {"property": "Done", "checkbox": {"equals": true}},
+            "sorts": [{"property": "Name", "direction": "ascending"}]});
         Mock::given(method("POST"))
             .and(path(p))
             .and(body_partial_json(
-                json!({"page_size": 100, "filter": filter["filter"]}),
+                json!({"page_size": 100, "filter": filter["filter"], "sorts": filter["sorts"]}),
             ))
             .and(no_cursor)
             .respond_with(list(vec![page("p1")], Some("c1")))
@@ -712,6 +718,20 @@ mod tests {
         let ps = client(&s, 0).query_data_source("ds", filter).await.unwrap();
         let got: Vec<_> = ps.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(got, ["p1", "p2", "p3"]);
+    }
+
+    #[tokio::test]
+    async fn get_database_returns_its_data_sources() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/databases/db"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"object": "database", "id": "db", "data_sources": [{"id": "ds", "name": "T"}]}),
+            ))
+            .mount(&s)
+            .await;
+        let v = client(&s, 0).get_database("db").await.unwrap();
+        assert_eq!(v["data_sources"][0]["id"], "ds");
     }
 
     #[tokio::test]
