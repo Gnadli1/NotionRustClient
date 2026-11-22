@@ -117,6 +117,8 @@ pub enum Pick {
     Color(String),
     /// `/page`: a new subpage at the cursor.
     NewPage,
+    /// `/image`, `/file`: the upload path box.
+    Upload,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +154,9 @@ pub fn entries(menu: &Menu, q: &str, src: Sources) -> Vec<Entry> {
             // not in "Turn into": a block can't become a page
             if menu.kind == Kind::Slash && (slash::word_prefix(q, "Page") || slash::word_prefix(q, "Seite")) {
                 out.push(Entry { label: "Page".into(), hint: "A new subpage".into(), pick: Pick::NewPage });
+            }
+            if menu.kind == Kind::Slash && ["Image", "File", "Bild", "Datei"].iter().any(|w| slash::word_prefix(q, w)) {
+                out.push(Entry { label: "Image or file".into(), hint: "Upload from a path".into(), pick: Pick::Upload });
             }
             out.extend(color_entries(q));
             out
@@ -570,5 +575,15 @@ mod tests {
     #[test]
     fn testkit_pages_have_their_id_as_title() {
         assert_eq!(page_in("Home", None).title(), "Home");
+    }
+
+    #[test]
+    fn image_or_file_entry_matches_its_words_in_slash_only() {
+        for q in ["image", "file", "bild", "datei", "IMA", "Dat"] {
+            assert!(slash_entries(q).iter().any(|e| matches!(e.pick, Pick::Upload)), "{q}");
+        }
+        assert!(!slash_entries("heading").iter().any(|e| matches!(e.pick, Pick::Upload)));
+        let tt = entries(&menu(Kind::TurnInto), "image", Sources { tree: &[], recent: &[], users: &[] });
+        assert!(!tt.iter().any(|e| matches!(e.pick, Pick::Upload)), "a block can't turn into an upload");
     }
 }

@@ -48,6 +48,7 @@ impl App {
 
     /// Reloads sidebar, outline and op counts from the store.
     pub(crate) fn refresh(&mut self) {
+        self.media.forget_srcs();
         if let Some(id) = &self.current {
             session::touch(&mut self.recent, id);
             self.visited.insert(id.clone(), crate::comments::now_secs());
@@ -309,6 +310,25 @@ impl App {
         }
     }
 
+    /// Asks the worker for the pictures the last frame wanted, a few at a time.
+    fn media_pump(&mut self) {
+        for id in self.media.take_bad() {
+            let _ = notion_core::media::forget(&self.store, &id); // a retry downloads again
+        }
+        if self.worker_gone || self.cmds.is_none() {
+            return;
+        }
+        let out = self.sent.iter().filter(|c| matches!(c, Cmd::Media { .. })).count();
+        for (id, page) in self.media.take_wants(crate::media::IN_FLIGHT.saturating_sub(out)) {
+            self.send(Cmd::Media { id, page });
+        }
+    }
+
+    /// A command other than a picture download is in flight (those never block).
+    fn busy(&self) -> bool {
+        self.sent.iter().any(|c| !matches!(c, Cmd::Media { .. }))
+    }
+
     /// A push is queued or running: editing is paused.
     pub(crate) fn pushing(&self) -> bool {
         self.sent.contains(&Cmd::Push)
@@ -351,7 +371,7 @@ impl App {
     /// when nothing else is in flight: never ahead of the restore page pull.
     pub(crate) fn users_tick(&mut self, now: Instant) {
         let due = self.users_at.is_none_or(|t| now.saturating_duration_since(t) >= USERS_EVERY);
-        if due && !self.users_stop && !self.worker_gone && self.sent.is_empty() {
+        if due && !self.users_stop && !self.worker_gone && !self.busy() {
             self.users_at = Some(now);
             self.send(Cmd::PullUsers);
         }
@@ -362,7 +382,7 @@ impl App {
     /// does not block it.
     fn poll_blocked(&self) -> bool {
         self.worker_gone
-            || !self.sent.is_empty()
+            || self.busy()
             || self.title_edit.is_some()
             || self.switcher.is_some()
             || self.focus.as_ref().is_some_and(|f| f.menu.is_some())
@@ -413,7 +433,7 @@ impl App {
 
     /// The status bar's "pushing…" / "syncing 12/164…" while a command is in flight.
     pub(crate) fn busy_label(&self) -> Option<String> {
-        match (self.pushing(), self.sent.is_empty(), self.progress) {
+        match (self.pushing(), !self.busy(), self.progress) {
             (true, ..) => Some("pushing…".into()),
             (false, false, Some((done, total @ 1..))) => Some(format!("syncing {done}/{total}…")),
             (false, false, _) => Some("syncing…".into()),
@@ -429,6 +449,7 @@ impl App {
                 Err(TryRecvError::Disconnected) => {
                     if !self.worker_gone {
                         self.worker_gone = true;
+                        self.media.worker_stopped();
                         self.sent.clear();
                         self.progress = None;
                         self.last_error.get_or_insert("sync worker stopped".into());
@@ -445,6 +466,14 @@ impl App {
         if let Event::Progress { done, total } = ev {
             self.progress = Some((done, total));
             return;
+        }
+        if let Event::Media { id, path } = ev {
+            self.sent.pop_front();
+            self.media.downloaded(id, path);
+            return;
+        }
+        if matches!(ev, Event::Pulled { .. } | Event::Pushed(_) | Event::SyncedAll(_)) {
+            self.media.retry_failed();
         }
         // pushed ops can't be undone, nor edits a pull rewrote under them; a
         // poll clears only what it changed (see `on_poll`)
@@ -561,6 +590,7 @@ impl App {
                     sw.results = r;
                 }
             }
+            Event::Media { .. } => {} // taken above
             Event::Error(e) => {
                 if answered == Some(Cmd::SyncAll) {
                     self.progress = None;
@@ -1118,6 +1148,7 @@ impl App {
             | Command::TrashPage
             | Command::PageIcon
             | Command::PageCover
+            | Command::UploadFile
             | Command::MovePage
             | Command::ToggleLock
             | Command::TrashView
@@ -1126,6 +1157,7 @@ impl App {
             | Command::TrashPage
             | Command::PageIcon
             | Command::PageCover
+            | Command::UploadFile
             | Command::MovePage
             | Command::ToggleLock
             | Command::TrashView => self.page_command(c),
@@ -1293,6 +1325,7 @@ impl App {
             ctx.input(|i| keys::log(&i.raw.events));
         }
         self.drain_events();
+        self.media_pump();
         if let Some(r) = ctx.input(|i| i.viewport().inner_rect) {
             self.window = (r.width(), r.height());
         }

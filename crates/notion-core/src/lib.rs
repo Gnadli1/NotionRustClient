@@ -4,6 +4,7 @@ pub mod activity;
 pub mod api;
 pub mod error;
 pub mod markdown;
+pub mod media;
 pub mod model;
 pub mod ops;
 pub mod props;

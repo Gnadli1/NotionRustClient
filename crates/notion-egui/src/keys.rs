@@ -240,6 +240,8 @@ pub enum Command {
     /// The icon picker, the cover URL box, Move to…, lock, the Trash view.
     PageIcon,
     PageCover,
+    /// Ctrl+Shift+F: upload an image or file as a block (path box).
+    UploadFile,
     MovePage,
     ToggleLock,
     TrashView,
@@ -276,6 +278,7 @@ impl Command {
                 | Command::TrashPage
                 | Command::PageIcon
                 | Command::PageCover
+                | Command::UploadFile
                 | Command::MovePage
                 | Command::ToggleLock
                 | Command::TrashView
@@ -336,6 +339,7 @@ const NAMES: &[(&str, Command)] = &[
     ("trash_page", Command::TrashPage),
     ("page_icon", Command::PageIcon),
     ("page_cover", Command::PageCover),
+    ("upload_file", Command::UploadFile),
     ("move_page", Command::MovePage),
     ("toggle_lock", Command::ToggleLock),
     ("trash_view", Command::TrashView),
@@ -403,6 +407,7 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("ctrl+shift+backspace", "trash_page"),
     ("ctrl+shift+i", "page_icon"),
     ("ctrl+shift+c", "page_cover"),
+    ("ctrl+shift+f", "upload_file"),
     ("ctrl+shift+p", "move_page"),
     ("ctrl+shift+l", "toggle_lock"),
     ("ctrl+shift+delete", "trash_view"),
@@ -1097,5 +1102,15 @@ mod tests {
         assert_eq!(t, "~~x~~");
         let (t, _) = wrap("x", (0, 1), Mark::Italic);
         assert_eq!(t, "*x*");
+    }
+
+    #[test]
+    fn upload_file_is_bound_and_parses_by_name() {
+        let k = Keymap::default();
+        assert_eq!(k.get(&ch("ctrl+shift+f")), Some(Command::UploadFile));
+        assert_eq!(DEFAULTS.iter().filter(|(_, n)| *n == "upload_file").count(), 1);
+        assert!(NAMES.iter().any(|(n, c)| *n == "upload_file" && *c == Command::UploadFile));
+        let mut chords = std::collections::HashSet::new();
+        assert!(DEFAULTS.iter().all(|(c, _)| chords.insert(*c)), "duplicate default chord");
     }
 }

@@ -788,11 +788,24 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
                 return Ok(Outcome::Failed("its page was never created".into()));
             }
             let after = after.as_deref().map(|a| store.resolve_id(a)).transpose()?;
-            let new = first(
-                client
-                    .append_children(&parent, std::slice::from_ref(&local), after.as_deref())
-                    .await?,
-            )?;
+            let new = if let Some(path) = block["_upload"]["path"].as_str() {
+                // an image/file picked offline: upload it now, then attach (see `media`)
+                let ty = block["type"].as_str().unwrap_or("file");
+                // ponytail: a retry after a failed attach re-uploads; the orphan upload expires in 1 h
+                let up = match client.upload_file(std::path::Path::new(path)).await {
+                    // file gone, moved or too big: fail this op, don't abort the push
+                    Err(Error::Invalid(m)) => return Ok(Outcome::Failed(m)),
+                    r => r?,
+                };
+                let body = json!({ "type": ty, ty: { "type": "file_upload", "file_upload": { "id": up } } });
+                client.append_raw(&parent, &body, after.as_deref()).await?
+            } else {
+                first(
+                    client
+                        .append_children(&parent, std::slice::from_ref(&local), after.as_deref())
+                        .await?,
+                )?
+            };
             // A create kept for a locally deleted block (see local_delete_block)
             // must not bring it back into the cache; its DeleteBlock follows.
             if store.get_block(&local.id)?.is_some() {
@@ -2046,6 +2059,11 @@ pub fn local_create_block(
     after: Option<&str>,
     kind: BlockKind,
 ) -> Result<String> {
+    local_create_json(store, parent_id, after, kind.to_request_json()?) // rejects unwritable kinds up front
+}
+
+/// [`local_create_block`] for a request-shaped block `v` (`{type, <type>: …}`).
+pub(crate) fn local_create_json(store: &Store, parent_id: &str, after: Option<&str>, mut v: Value) -> Result<String> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let now = Utc::now();
     let id = format!(
@@ -2058,7 +2076,6 @@ pub fn local_create_block(
     } else {
         Parent::Block(parent_id.to_string())
     };
-    let mut v = kind.to_request_json()?; // rejects unwritable kinds up front
     v["object"] = json!("block");
     v["id"] = json!(id);
     v["parent"] = serde_json::to_value(&parent)?;

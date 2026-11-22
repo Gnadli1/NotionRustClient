@@ -5,6 +5,7 @@
 use notion_core::sync;
 
 use crate::app::{App, Grab};
+use crate::worker::Cmd;
 
 const UNDO_MAX: usize = 100;
 
@@ -49,7 +50,7 @@ impl App {
     /// command is in flight (a pull writes rows it read before the undo) or
     /// the switcher is open; refused once the edit's op was completed.
     pub(crate) fn undo_redo(&mut self, back: bool) {
-        if !self.sent.is_empty() || self.switcher.is_some() || self.dlg.is_some() || self.inbox.is_some() || !self.flush() {
+        if self.sent.iter().any(|c| !matches!(c, Cmd::Media { .. })) || self.switcher.is_some() || self.dlg.is_some() || self.inbox.is_some() || !self.flush() {
             return;
         }
         let Some((page, c)) = (if back { &mut self.undo } else { &mut self.redo }).pop() else {

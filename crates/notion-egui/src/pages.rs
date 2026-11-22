@@ -4,6 +4,7 @@
 //! the switcher's.
 
 use eframe::egui::{self, Align2, Color32, Context, Id, Key, Label, Modal, Modifiers, RichText, Sense, TextEdit, Ui, Vec2};
+use notion_core::media::{self, MediaKind};
 use notion_core::model::{Page, Parent};
 use notion_core::sync;
 
@@ -22,9 +23,13 @@ pub(crate) const EMOJI: [&str; 60] = [
 ];
 const COLS: usize = 10;
 
+use crate::media::Shown;
+
 pub(crate) enum Dlg {
     Icon { text: String, sel: usize },
     Cover { text: String },
+    /// A file path to upload as an image or file block.
+    Upload { text: String },
     /// Trash page (id, title): Enter = yes, Esc = no.
     Trash(String, String),
     /// The Trash view: cached pages in the trash, Enter restores the selected one.
@@ -36,6 +41,7 @@ pub(crate) enum Done {
     Close,
     Icon(Option<String>),
     Cover(Option<String>),
+    Upload(String),
     Trash(String),
     Restore(String),
 }
@@ -59,11 +65,18 @@ impl Meta {
     }
 }
 
-/// The cover band (no image: that is F7; a colour from the host), the icon
-/// and the lock mark.
-pub(crate) fn header(ui: &mut Ui, c: &Colors, m: &Meta) -> Option<Action> {
+/// The cover (its picture once loaded, else a band in a colour from the host),
+/// the icon and the lock mark.
+pub(crate) fn header(ui: &mut Ui, c: &Colors, m: &Meta, pic: Option<Shown>) -> Option<Action> {
     let mut act = None;
-    if let Some(url) = &m.cover {
+    if let (Some(url), Some(Shown::Tex(t))) = (&m.cover, &pic) {
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 200.0), Sense::click());
+        crate::media::paint_cover(ui, t, rect, 6.0);
+        if r.on_hover_text("Click to change the cover").clicked() {
+            act = Some(Action::Dlg(Dlg::Cover { text: url.clone() }));
+        }
+        ui.add_space(6.0);
+    } else if let Some(url) = &m.cover {
         let host = sync::cover_host(url).unwrap_or_else(|_| "image".into());
         let hue = host.bytes().fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)) % 360;
         let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 72.0), Sense::click());
@@ -96,6 +109,13 @@ pub(crate) fn header(ui: &mut Ui, c: &Colors, m: &Meta) -> Option<Action> {
 }
 
 impl App {
+    /// The open page's cover picture, if it has a cover.
+    pub(crate) fn cover_shown(&self, ui: &Ui, id: &str) -> Option<Shown> {
+        self.meta.cover.as_ref()?;
+        let src = self.media.src(&self.store, id, true)?;
+        Some(self.media.show(ui.ctx(), id, true, &src))
+    }
+
     /// Runs a page edit as one undo step. Not while a push runs.
     fn page_edit(&mut self, page: Option<String>, also: Vec<String>, f: impl FnOnce(&notion_core::store::Store, &str) -> notion_core::Result<i64>) -> bool {
         let Some(id) = page.or_else(|| self.current.clone()) else { return false };
@@ -153,6 +173,52 @@ impl App {
         });
         if let Err(e) = made {
             self.last_error = Some(e.to_string());
+        }
+    }
+
+    /// Queues the file at `path` as an image (png, jpg, gif, webp) or file
+    /// block after the edited row's top-level block, else at the end of the page.
+    pub(crate) fn upload_media(&mut self, path: &str) -> bool {
+        let Some(parent) = self.current.clone() else {
+            self.last_error = Some("open a page first".into());
+            return false;
+        };
+        if self.db.is_some() {
+            self.last_error = Some("close the database view to upload a file".into());
+            return false;
+        }
+        if self.pushing() {
+            self.last_error = Some("editing is paused while a push runs".into());
+            return false;
+        }
+        let at = self.focus.as_ref().filter(|f| f.cell.is_none()).map(|f| f.idx);
+        if !self.flush() {
+            return false;
+        }
+        let after = at.and_then(|i| {
+            let top = outline::ancestors(&self.rows, i).last().copied().unwrap_or(&self.rows[i].block_id).to_string();
+            self.store.resolve_id(&top).ok()
+        });
+        let p = path.trim().trim_matches(['"', '\'']);
+        let p = match (p.strip_prefix("~/"), std::env::var_os("HOME")) {
+            (Some(rest), Some(home)) => std::path::Path::new(&home).join(rest),
+            _ => p.into(),
+        };
+        let kind = match p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+            Some("png" | "jpg" | "jpeg" | "gif" | "webp") => MediaKind::Image,
+            _ => MediaKind::File,
+        };
+        let made = self.step(|s| media::local_create_media(&s.store, &parent, after.as_deref(), &p, kind));
+        self.refresh();
+        match made {
+            Ok(_) => {
+                self.info = Some("queued (Ctrl+S to upload and push)".into());
+                true
+            }
+            Err(e) => {
+                self.last_error = Some(e.to_string());
+                false
+            }
         }
     }
 
@@ -236,6 +302,7 @@ impl App {
             C::TrashView => self.dlg = Some(Dlg::Bin { sel: 0 }),
             C::PageIcon => self.dlg = Some(Dlg::Icon { text: String::new(), sel: 0 }),
             C::PageCover => self.dlg = Some(Dlg::Cover { text: self.meta.cover.clone().unwrap_or_default() }),
+            C::UploadFile => self.dlg = Some(Dlg::Upload { text: String::new() }),
             C::ToggleLock => self.toggle_lock(),
             C::TrashPage if id.starts_with("local-") => {
                 self.last_error = Some("this page isn't pushed yet: push it (Ctrl+S) first".into());
@@ -257,6 +324,7 @@ impl App {
             Done::Close => true,
             Done::Icon(e) => self.set_icon(e),
             Done::Cover(u) => self.set_cover(u),
+            Done::Upload(p) => self.upload_media(&p),
             Done::Trash(id) if self.db_has_row(&id) => {
                 self.trash_row(id);
                 true
@@ -316,6 +384,7 @@ impl App {
                 }
                 enter.then(|| Done::Cover(Some(text.trim().to_string())))
             }
+            Dlg::Upload { text } => enter.then(|| Done::Upload(text.clone())),
             Dlg::Trash(id, _) => enter.then(|| Done::Trash(id.clone())),
             Dlg::Bin { sel } => {
                 *sel = (*sel as isize + d as isize - u as isize).clamp(0, bin.len().max(1) as isize - 1) as usize;
@@ -367,6 +436,13 @@ impl App {
                             out = Some(Done::Cover(None));
                         }
                     });
+                }
+                Dlg::Upload { text } => {
+                    ui.label(RichText::new("Upload an image or file (up to 20 MB): type or paste its path. Enter uploads.").small().color(c.secondary));
+                    let f = ui.add(TextEdit::singleline(text).hint_text("/home/you/picture.png").desired_width(f32::INFINITY));
+                    if !f.has_focus() {
+                        f.request_focus();
+                    }
                 }
                 Dlg::Trash(id, title) => {
                     ui.label(RichText::new(format!("Trash '{}'? Enter = yes, Esc = no", crate::view::untitled(title))).size(16.0));
@@ -534,6 +610,36 @@ mod tests {
         // one undo step each
         w.press(Key::Z, Modifiers::CTRL);
         assert_eq!(w.app.meta.icon.as_deref(), Some("🦄"));
+    }
+
+    #[test]
+    fn upload_queues_an_image_block_shows_it_and_undoes() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("pic.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 255, 255])).save(&f).unwrap();
+        let mut w = Win::with_texts(&["a"]);
+        w.press(Key::F, CS);
+        w.type_text(&format!("  \"{}\"", f.display()));
+        w.press(Key::Enter, Modifiers::NONE);
+        assert_eq!((w.queued(), w.app.rows.len()), (1, 2));
+        assert_eq!(w.app.rows[1].marker, crate::outline::Marker::Unsupported("image".into()));
+        w.frames(vec![]);
+        w.frames(vec![]);
+        let asked: Vec<_> = w.cmds().into_iter().filter(|c| matches!(c, crate::worker::Cmd::Media { page: false, .. })).collect();
+        assert_eq!(asked.len(), 1, "the picture is asked for once: {asked:?}");
+        // the worker answers with the file itself: no cache, no network
+        let crate::worker::Cmd::Media { id, .. } = asked[0].clone() else { unreachable!() };
+        w.answer(crate::worker::Event::Media { id, path: Ok(f.clone()) });
+        assert!(w.app.sent.iter().all(|c| !matches!(c, crate::worker::Cmd::Media { .. })));
+        // a refused file queues nothing and says why
+        w.press(Key::F, CS);
+        w.type_text("/nonexistent/x.png");
+        w.press(Key::Enter, Modifiers::NONE);
+        assert!(w.app.last_error.as_deref().is_some_and(|e| e.contains("cannot read")));
+        assert_eq!(w.queued(), 1);
+        w.press(Key::Escape, Modifiers::NONE);
+        w.press(Key::Z, Modifiers::CTRL);
+        assert_eq!((w.queued(), w.app.rows.len()), (0, 1));
     }
 
     #[test]

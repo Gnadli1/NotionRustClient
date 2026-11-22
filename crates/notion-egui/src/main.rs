@@ -15,6 +15,7 @@ mod inbox;
 mod keys;
 mod links;
 mod md;
+mod media;
 mod menu;
 mod nav;
 mod pages;

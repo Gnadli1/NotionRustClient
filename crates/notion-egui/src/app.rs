@@ -276,6 +276,8 @@ pub struct App {
     /// One entry per command sent and not yet answered (the worker answers
     /// each with one event, in order).
     pub(crate) sent: VecDeque<Cmd>,
+    /// F7: pictures (textures, downloads asked for).
+    pub(crate) media: crate::media::Media,
     /// (done, total) of the sync-all in flight; total 0 until the first report.
     pub(crate) progress: Option<(usize, usize)>,
     /// Page waiting for its pull, to be opened when it arrives.
@@ -474,6 +476,7 @@ impl App {
             window: session::Session::default().window,
             session_dir: None,
             sent: VecDeque::new(),
+            media: Default::default(),
             progress: None,
             pending_open: None,
             last_error: None,
@@ -746,7 +749,7 @@ impl App {
                 ui.vertical(|ui| {
                     ui.set_max_width(col);
                     ui.add_space(16.0);
-                    acts.extend(crate::pages::header(ui, c, &self.meta));
+                    acts.extend(crate::pages::header(ui, c, &self.meta, self.current.as_deref().and_then(|id| self.cover_shown(ui, id))));
                     acts.extend(crate::view::breadcrumb(ui, c, &crumbs, &title));
                     ui.add_space(8.0);
                     acts.extend(self.title_ui(ui, &title));
@@ -939,6 +942,15 @@ impl App {
                 }
                 Marker::Synced | Marker::ColumnList | Marker::Column | Marker::Breadcrumb => {
                     ui.label(RichText::new(marker.label()).color(grey));
+                }
+                Marker::Unsupported(t) if t == "image" => {
+                    let id = &self.rows[idx].block_id;
+                    match self.media.src(&self.store, id, false) {
+                        Some(src) => crate::media::block_image(ui, &self.media.show(ui.ctx(), id, false, &src), grey),
+                        None => {
+                            ui.label(RichText::new("[image]").color(grey));
+                        }
+                    }
                 }
                 Marker::Unsupported(t) => {
                     ui.label(RichText::new(format!("[{t}]")).color(grey));
@@ -1276,6 +1288,7 @@ impl App {
         let mut convert = None;
         let mut color = None;
         let mut new_page = false;
+        let mut upload = false;
         let mut want_users = false;
         let was_picked = picked.is_some();
         let pick_in = picked.and_then(|p| f.menu.take().map(|m| (p, m)));
@@ -1305,6 +1318,11 @@ impl App {
                     f.text = m.replace(&f.text, col, "");
                     new_cursor = Some(trigger_chars(&f.text));
                     new_page = true;
+                }
+                Pick::Upload => {
+                    f.text = m.replace(&f.text, col, "");
+                    new_cursor = Some(trigger_chars(&f.text));
+                    upload = true;
                 }
                 // a mention goes in as its Markdown token and is committed
                 // with the row
@@ -1362,6 +1380,9 @@ impl App {
         f.prev_len = f.text.len();
         if let Some(color) = color {
             act = Some(Action::Color { text: f.text.clone(), color });
+        }
+        if upload {
+            act = Some(Action::Dlg(crate::pages::Dlg::Upload { text: String::new() }));
         }
         if new_page {
             act = Some(Action::NewPage(Some(f.text.clone())));

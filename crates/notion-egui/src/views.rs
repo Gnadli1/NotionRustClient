@@ -255,7 +255,7 @@ const CAL_LINE: f32 = 22.0;
 const MONTHS: [&str; 12] =
     ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
-pub(crate) fn body(ui: &mut Ui, c: &Colors, db: &mut Db, acts: &mut Vec<Action>) {
+pub(crate) fn body(ui: &mut Ui, c: &Colors, db: &mut Db, acts: &mut Vec<Action>, media: &crate::media::Media) {
     ui.add_space(4.0);
     match db.mode() {
         Kind::Board if group_col(&db.cols).is_none() => {
@@ -266,7 +266,7 @@ pub(crate) fn body(ui: &mut Ui, c: &Colors, db: &mut Db, acts: &mut Vec<Action>)
         }
         Kind::Board => board(ui, c, db, acts),
         Kind::List => list(ui, c, db, acts),
-        Kind::Gallery => gallery(ui, c, db, acts),
+        Kind::Gallery => gallery(ui, c, db, acts, media),
         Kind::Calendar => calendar(ui, c, db, acts),
         Kind::Table => {}
     }
@@ -374,7 +374,7 @@ fn gallery_h(n: usize, per: usize) -> f32 {
     (CARD_H + GAP) * n.div_ceil(per) as f32
 }
 
-fn gallery(ui: &mut Ui, c: &Colors, db: &mut Db, acts: &mut Vec<Action>) {
+fn gallery(ui: &mut Ui, c: &Colors, db: &mut Db, acts: &mut Vec<Action>, media: &crate::media::Media) {
     let avail = (ui.available_height() - 10.0).max(100.0);
     let per = ((ui.available_width() - 12.0) / (G_W + GAP)).floor().max(1.0) as usize;
     let salt = ("gallery", db.ds.clone());
@@ -383,7 +383,15 @@ fn gallery(ui: &mut Ui, c: &Colors, db: &mut Db, acts: &mut Vec<Action>) {
         let (rect, _) = ui.allocate_exact_size(vec2((G_W + GAP) * per as f32, gallery_h(r.len(), per)), Sense::hover());
         for (k, pos) in r.clone().enumerate() {
             let at = Rect::from_min_size(rect.min + gallery_at(k, per), vec2(G_W, CARD_H));
-            card(ui, c, db, db.lanes[0].rows[pos], at, (r.start / per + k / per) as u32, 3, None, acts);
+            let ri = db.lanes[0].rows[pos];
+            card(ui, c, db, ri, at, (r.start / per + k / per) as u32, 3, None, acts);
+            // the cover, as a thumbnail on the card's right (asked for only while the card is drawn)
+            if let Some(src) = &db.rows[ri].cover {
+                if let crate::media::Shown::Tex(t) = media.show(ui.ctx(), &db.rows[ri].id, true, src) {
+                    let thumb = Rect::from_min_size(at.right_top() + vec2(-(CARD_H - 8.0) - 4.0, 4.0), vec2(CARD_H - 8.0, CARD_H - 8.0 - GAP));
+                    crate::media::paint_cover(ui, &t, thumb, 4.0);
+                }
+            }
         }
     });
 }

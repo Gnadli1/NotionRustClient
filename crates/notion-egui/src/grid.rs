@@ -43,6 +43,8 @@ pub(crate) struct DbRow {
     /// What each column shows, folded for sorting, and all of it folded for
     /// the filter.
     pub cells: Vec<String>,
+    /// The cover's source key (F7: gallery pictures).
+    pub cover: Option<String>,
     keys: Vec<String>,
     nums: Vec<Option<f64>>,
     fold: String,
@@ -169,6 +171,7 @@ impl Db {
                 let cells: Vec<String> = cols.iter().map(|c| props::cell_text(&props[&c.name], &who)).collect();
                 DbRow {
                     id: p.id.clone(),
+                    cover: notion_core::media::page_source(&p.raw).map(|s| s.key),
                     keys: cells.iter().map(|c| fold(c)).collect(),
                     nums: cols.iter().map(|c| props::sort_num(&props[&c.name])).collect(),
                     fold: fold(&cells.join("\n")),
@@ -802,13 +805,13 @@ impl App {
             Some(e) if is_choice(&db.cols[e.col].kind) => db.choices(e.col, &self.users),
             _ => Vec::new(),
         };
-        let acts = grid_ui(ui, c, &mut db, &crumbs, &title, &choices);
+        let acts = grid_ui(ui, c, &mut db, &crumbs, &title, &choices, &self.media);
         self.db = Some(db);
         acts
     }
 }
 
-fn grid_ui(ui: &mut Ui, c: &Colors, db: &mut Db, crumbs: &[(String, String, String)], title: &str, choices: &[(String, String)]) -> Vec<Action> {
+fn grid_ui(ui: &mut Ui, c: &Colors, db: &mut Db, crumbs: &[(String, String, String)], title: &str, choices: &[(String, String)], media: &crate::media::Media) -> Vec<Action> {
     let mut acts = Vec::new();
     Frame::new().inner_margin(Margin::symmetric(16, 8)).show(ui, |ui| {
         acts.extend(crate::view::breadcrumb(ui, c, crumbs, title));
@@ -848,7 +851,7 @@ fn grid_ui(ui: &mut Ui, c: &Colors, db: &mut Db, crumbs: &[(String, String, Stri
         if db.mode() == Kind::Table {
             table(ui, c, db, choices, &mut acts);
         } else {
-            crate::views::body(ui, c, db, &mut acts);
+            crate::views::body(ui, c, db, &mut acts, media);
         }
     });
     acts

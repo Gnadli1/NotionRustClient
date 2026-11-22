@@ -8,6 +8,7 @@ use std::sync::mpsc;
 
 use eframe::egui;
 use notion_core::api::Client;
+use notion_core::media;
 use notion_core::model::SearchResult;
 use notion_core::store::Store;
 use notion_core::views::SavedView;
@@ -39,6 +40,8 @@ pub enum Cmd {
     SyncAll,
     /// The saved views of a data source (`Client::list_views`).
     Views { ds: String },
+    /// The local file of a block's image, or of a page's cover (`media::fetch`).
+    Media { id: String, page: bool },
 }
 
 #[derive(Debug, PartialEq)]
@@ -58,6 +61,9 @@ pub enum Event {
     Fetched { op: i64, what: sync::Fetched },
     Resolved(i64),
     Views { ds: String, views: Vec<SavedView> },
+    /// The answer to `Media`: the file, or why not. Errors stay here (not
+    /// `Error`): a missing picture says nothing about the page.
+    Media { id: String, path: Result<PathBuf, String> },
     SyncedAll(SyncAllReport),
     /// (done, total) of a running `SyncAll`. Not an answer: the app must not
     /// pop `sent` for it.
@@ -82,6 +88,10 @@ pub async fn run(
     let mut identity_try: Option<std::time::Instant> = None;
     while let Some(cmd) = cmds.recv().await {
         let Some(client) = client else {
+            if let Cmd::Media { id, .. } = cmd {
+                emit(Event::Media { id, path: Err("offline".into()) });
+                continue;
+            }
             emit(Event::Error("offline: NOTION_TOKEN not set".into()));
             continue;
         };
@@ -95,6 +105,11 @@ pub async fn run(
             }
         }
         let ev = match cmd {
+            Cmd::Media { id, page } => {
+                let owner = if page { media::Owner::Page } else { media::Owner::Block };
+                let path = media::fetch(client, store, &id, owner).await.map_err(|e| e.to_string());
+                Ok(Event::Media { id, path })
+            }
             Cmd::Pull { id, force } => sync::pull_any(client, store, &id, force)
                 .await
                 .map(|report| Event::Pulled { id, report }),

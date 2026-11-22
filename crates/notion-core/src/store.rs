@@ -59,6 +59,14 @@ INSERT OR IGNORE INTO meta VALUES ('activity_since', strftime('%Y-%m-%dT%H:%M:%f
 PRAGMA user_version = 4;
 ";
 
+/// Schema v5: the media cache index (files live next to the DB, see `media`).
+/// `url` is the source without its signed query string.
+const MIGRATE_5: &str = "
+CREATE TABLE IF NOT EXISTS media (owner_id TEXT PRIMARY KEY, url TEXT NOT NULL, fetched_at TEXT NOT NULL,
+  path TEXT NOT NULL, size INTEGER NOT NULL);
+PRAGMA user_version = 5;
+";
+
 /// One sidebar entry: a page, cached or known only from a `child_page` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageEntry {
@@ -111,6 +119,9 @@ impl Store {
         }
         if version < 4 {
             conn.execute_batch(&format!("BEGIN; {MIGRATE_4} COMMIT;"))?;
+        }
+        if version < 5 {
+            conn.execute_batch(&format!("BEGIN; {MIGRATE_5} COMMIT;"))?;
         }
         Ok(Store { conn })
     }
@@ -1182,7 +1193,7 @@ mod tests {
     #[test]
     fn fresh_store_has_the_comments_table_and_indexes() {
         let s = Store::open_in_memory().unwrap();
-        assert_eq!(version(&s), 4);
+        assert_eq!(version(&s), 5);
         assert_eq!(tables(&s), ["comments", "comments_discussion", "comments_parent"]);
         assert!(s.users().unwrap().is_empty(), "the users table exists");
     }
@@ -1198,13 +1209,13 @@ mod tests {
             c.execute("INSERT INTO id_map VALUES ('l', 'r')", []).unwrap();
         }
         let s = Store::open(&path).unwrap();
-        assert_eq!(version(&s), 4);
+        assert_eq!(version(&s), 5);
         assert_eq!(s.resolve_id("l").unwrap(), "r");
         assert_eq!(tables(&s).len(), 3);
         drop(s);
         // reopening is a no-op
         let s = Store::open(&path).unwrap();
-        assert_eq!((version(&s), tables(&s).len()), (4, 3));
+        assert_eq!((version(&s), tables(&s).len()), (5, 3));
     }
 
     #[test]
@@ -1224,14 +1235,30 @@ mod tests {
             assert_eq!(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
         }
         let s = Store::open(&path).unwrap();
-        assert_eq!(version(&s), 4);
+        assert_eq!(version(&s), 5);
         assert_eq!(s.resolve_id("l").unwrap(), "r");
         let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM comments", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
         s.put_users(&[user("u1", "Ada")]).unwrap();
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!((version(&s), s.users().unwrap().len()), (4, 1), "reopening keeps it");
+        assert_eq!((version(&s), s.users().unwrap().len()), (5, 1), "reopening keeps it");
+    }
+
+    #[test]
+    fn existing_v4_store_gets_the_media_table_and_keeps_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        {
+            // a cache.db as the C5 release left it
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(&format!("BEGIN; {SCHEMA} {MIGRATE_2} {MIGRATE_3} {MIGRATE_4} COMMIT;")).unwrap();
+            c.execute("INSERT INTO id_map VALUES ('l', 'r')", []).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(version(&s), 5);
+        assert_eq!(s.resolve_id("l").unwrap(), "r");
+        assert!(s.media_get("x").unwrap().is_none(), "the media table exists");
     }
 
     fn user(id: &str, name: &str) -> User {

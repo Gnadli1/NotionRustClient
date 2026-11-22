@@ -72,6 +72,13 @@ pub struct BlockNode {
     pub children: Vec<BlockNode>,
 }
 
+/// The file of a multipart request.
+struct FilePart {
+    filename: String,
+    mime: &'static str,
+    bytes: Vec<u8>,
+}
+
 pub struct Client {
     http: reqwest::Client,
     token: String,
@@ -165,6 +172,45 @@ impl Client {
             )?);
         }
         Ok(out)
+    }
+
+    /// Appends one request-shaped block (`{type, <type>: …}`) that
+    /// `BlockKind` can't write, e.g. an image from a file upload.
+    pub async fn append_raw(&self, parent: &str, block: &Value, after: Option<&str>) -> Result<Block> {
+        let mut body = json!({ "children": [block] });
+        if let Some(a) = after {
+            body["after"] = json!(a);
+        }
+        let path = format!("/v1/blocks/{parent}/children");
+        let resp = self.send(Method::PATCH, &path, &[], Some(&body)).await?;
+        results::<Block>(resp)?.into_iter().next().ok_or_else(|| Error::Invalid("Notion returned no block".into()))
+    }
+
+    /// Uploads a local file (single part, at most 20 MB) and returns the file
+    /// upload id to attach to a block: create the upload, then send the bytes
+    /// as multipart. Refuses a missing or too large file before any request.
+    pub async fn upload_file(&self, path: &std::path::Path) -> Result<String> {
+        let (filename, mime) = crate::media::check_upload(path)?;
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|f| f.take(crate::media::MAX_UPLOAD + 1).read_to_end(&mut bytes))
+            .map_err(|e| Error::Invalid(format!("cannot read {}: {e}", path.display())))?;
+        if bytes.len() as u64 > crate::media::MAX_UPLOAD {
+            return Err(Error::Invalid(format!("{} is over the 20 MB upload limit", path.display())));
+        }
+        let created = self
+            .send(
+                Method::POST,
+                "/v1/file_uploads",
+                &[],
+                Some(&json!({ "mode": "single_part", "filename": filename, "content_type": mime })),
+            )
+            .await?;
+        let id = created["id"].as_str().ok_or_else(|| Error::Invalid("file upload has no id".into()))?.to_string();
+        let part = FilePart { filename, mime, bytes };
+        self.send_with(Method::POST, &format!("/v1/file_uploads/{id}/send"), &[], None, Some(&part)).await?;
+        Ok(id)
     }
 
     pub async fn update_block(&self, id: &str, body: &Value) -> Result<Block> {
@@ -357,13 +403,25 @@ impl Client {
         }
     }
 
-    /// Single choke point: auth headers, rate limit, retry, error mapping.
     async fn send(
         &self,
         method: Method,
         path: &str,
         query: &[(&str, &str)],
         body: Option<&Value>,
+    ) -> Result<Value> {
+        self.send_with(method, path, query, body, None).await
+    }
+
+    /// Single choke point: auth headers, rate limit, retry, error mapping.
+    /// `file` makes the body multipart (field `file`) instead of JSON.
+    async fn send_with(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<&Value>,
+        file: Option<&FilePart>,
     ) -> Result<Value> {
         let url = format!("{}{path}", self.cfg.base_url.trim_end_matches('/'));
         let mut attempt = 0u32;
@@ -379,6 +437,12 @@ impl Client {
             }
             if let Some(b) = body {
                 req = req.json(b);
+            }
+            if let Some(f) = file {
+                let part = reqwest::multipart::Part::bytes(f.bytes.clone())
+                    .file_name(f.filename.clone())
+                    .mime_str(f.mime)?;
+                req = req.multipart(reqwest::multipart::Form::new().part("file", part));
             }
             let resp = req.send().await?;
             let status = resp.status().as_u16();
