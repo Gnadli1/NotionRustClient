@@ -43,7 +43,12 @@ impl App {
         let list = list
             .into_iter()
             .map(|e| {
-                let t = self.store.get_page(&e.page_id).ok().flatten().map_or_else(String::new, |p| p.title());
+                let t = self
+                    .store
+                    .get_page(&e.page_id)
+                    .ok()
+                    .flatten()
+                    .map_or_else(String::new, |p| p.title());
                 let t = crate::view::untitled(&t).to_string();
                 (e, t)
             })
@@ -68,7 +73,9 @@ impl App {
     /// The open page is being looked at: its entries are read. A failure is
     /// only reported, it must not stop the page from loading.
     pub(crate) fn mark_open_page_read(&mut self) {
-        let Some(id) = self.current.clone() else { return };
+        let Some(id) = self.current.clone() else {
+            return;
+        };
         if let Err(e) = self.store.mark_page_read(&id) {
             self.last_error = Some(e.to_string());
         }
@@ -80,7 +87,9 @@ impl App {
         let _ = self.store.mark_entry_read(&e.kind, &e.target);
         self.inbox = None;
         self.open_or_pull(&e.page_id);
-        if e.kind != notion_core::activity::PAGE && self.current.as_deref() == Some(e.page_id.as_str()) {
+        if e.kind != notion_core::activity::PAGE
+            && self.current.as_deref() == Some(e.page_id.as_str())
+        {
             self.open_comments((e.parent_id != e.page_id).then(|| e.parent_id.clone()));
         }
         self.refresh_unread();
@@ -88,7 +97,9 @@ impl App {
 
     /// The inbox's keys, taken before any widget sees them.
     pub(crate) fn inbox_keys(&mut self, ctx: &Context) {
-        let Some(ib) = self.inbox.as_mut() else { return };
+        let Some(ib) = self.inbox.as_mut() else {
+            return;
+        };
         let (esc, u, d, enter) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::NONE, Key::Escape),
@@ -102,14 +113,22 @@ impl App {
             self.inbox = None;
             return;
         }
-        ib.sel = (ib.sel as isize + d as isize - u as isize).clamp(0, ib.list.len().max(1) as isize - 1) as usize;
-        if let Some(e) = ib.list.get(ib.sel).map(|(e, _)| e.clone()).filter(|_| enter) {
+        ib.sel = (ib.sel as isize + d as isize - u as isize)
+            .clamp(0, ib.list.len().max(1) as isize - 1) as usize;
+        if let Some(e) = ib
+            .list
+            .get(ib.sel)
+            .map(|(e, _)| e.clone())
+            .filter(|_| enter)
+        {
             self.open_entry(&e);
         }
     }
 
     pub(crate) fn inbox_ui(&mut self, ctx: &Context, c: &Colors) {
-        let Some(ib) = self.inbox.as_ref() else { return };
+        let Some(ib) = self.inbox.as_ref() else {
+            return;
+        };
         let (sel, list, hint) = (ib.sel, &ib.list, self.no_person);
         let now = crate::comments::now_secs();
         let (mut clicked, mut all) = (None, false);
@@ -165,7 +184,11 @@ mod tests {
     use notion_core::model::Comment;
     use serde_json::json;
 
-    const CS: Modifiers = Modifiers { ctrl: true, shift: true, ..Modifiers::NONE };
+    const CS: Modifiers = Modifiers {
+        ctrl: true,
+        shift: true,
+        ..Modifiers::NONE
+    };
 
     fn comment(id: &str, by: &str) -> Comment {
         serde_json::from_value(json!({
@@ -181,22 +204,49 @@ mod tests {
     fn the_inbox_lists_updates_enter_opens_and_ctrl_shift_a_marks_all_read() {
         let mut w = Win::with_texts(&["a"]);
         w.app.store.set_identity("bot", None, Some("me")).unwrap();
-        w.app.store.note_comments("p", &[comment("c1", "u1"), comment("c2", "u1"), comment("mine", "me")]).unwrap();
+        w.app
+            .store
+            .note_comments(
+                "p",
+                &[
+                    comment("c1", "u1"),
+                    comment("c2", "u1"),
+                    comment("mine", "me"),
+                ],
+            )
+            .unwrap();
         w.app.refresh();
-        assert_eq!(w.app.unread, 0, "the open page's entries are read as it is viewed");
-        w.app.store.note_comments("p", &[comment("c3", "u1")]).unwrap();
+        assert_eq!(
+            w.app.unread, 0,
+            "the open page's entries are read as it is viewed"
+        );
+        w.app
+            .store
+            .note_comments("p", &[comment("c3", "u1")])
+            .unwrap();
         w.app.refresh_unread();
         assert_eq!(w.app.unread, 1);
         w.press(Key::J, CS);
         w.frames(vec![]);
         assert!(w.app.inbox.is_some());
-        assert!(w.shown.contains("Updates") && w.shown.contains("hi there"), "{}", w.shown);
+        assert!(
+            w.shown.contains("Updates") && w.shown.contains("hi there"),
+            "{}",
+            w.shown
+        );
         w.press(Key::A, CS);
         assert_eq!(w.app.unread, 0);
-        assert_eq!(w.app.store.activity().unwrap().len(), 3, "read entries stay listed");
+        assert_eq!(
+            w.app.store.activity().unwrap().len(),
+            3,
+            "read entries stay listed"
+        );
         w.press(Key::Enter, Modifiers::NONE);
         assert!(w.app.inbox.is_none());
-        assert!(w.app.comments.is_some(), "a comment entry opens the thread panel");
+        assert!(
+            w.app.comments.is_some(),
+            "a comment entry opens the thread panel"
+        );
         // Esc closes the view; the same chord reopens it
         w.press(Key::J, CS);
         assert!(w.app.inbox.is_some());
@@ -208,7 +258,10 @@ mod tests {
     fn an_open_inbox_keeps_the_keys_from_the_selected_block_and_never_reads_while_unfocused() {
         let mut w = Win::with_texts(&["a", "b"]);
         w.app.store.set_identity("bot", None, Some("me")).unwrap();
-        w.app.store.note_comments("p", &[comment("c1", "u1")]).unwrap();
+        w.app
+            .store
+            .note_comments("p", &[comment("c1", "u1")])
+            .unwrap();
         w.app.refresh_unread();
         assert_eq!(w.app.unread, 1);
         w.app.was_focused = false;
@@ -216,7 +269,10 @@ mod tests {
         assert_eq!(w.app.unread, 1, "an unfocused window doesn't read the page");
         w.app.mark_open_page_read();
         assert_eq!(w.app.unread, 0);
-        w.app.store.note_comments("p", &[comment("c2", "u1")]).unwrap();
+        w.app
+            .store
+            .note_comments("p", &[comment("c2", "u1")])
+            .unwrap();
         w.app.sel = Some(("p-0".into(), "p-0".into()));
         w.press(Key::J, CS);
         assert!(w.app.inbox.is_some());
@@ -232,7 +288,10 @@ mod tests {
     fn without_a_person_identity_the_hint_shows_and_nothing_is_recorded() {
         let mut w = Win::with_texts(&["a"]);
         w.app.store.set_identity("bot", None, None).unwrap();
-        w.app.store.note_comments("p", &[comment("c1", "u1")]).unwrap();
+        w.app
+            .store
+            .note_comments("p", &[comment("c1", "u1")])
+            .unwrap();
         w.app.refresh_unread();
         assert!(w.app.no_person && w.app.unread == 0);
         w.press(Key::J, CS);

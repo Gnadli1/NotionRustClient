@@ -32,13 +32,19 @@ impl Store {
     pub fn view_pref(&self, ds: &str) -> Result<Option<String>> {
         Ok(self
             .conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", [format!("view:{ds}")], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [format!("view:{ds}")],
+                |r| r.get(0),
+            )
             .optional()?)
     }
 
     pub fn set_view_pref(&self, ds: &str, label: &str) -> Result<()> {
-        self.conn
-            .execute("INSERT OR REPLACE INTO meta VALUES (?1, ?2)", params![format!("view:{ds}"), label])?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta VALUES (?1, ?2)",
+            params![format!("view:{ds}"), label],
+        )?;
         Ok(())
     }
 }
@@ -52,9 +58,16 @@ mod tests {
     fn a_saved_view_needs_an_id_and_a_type_and_the_choice_persists() {
         assert_eq!(
             SavedView::from_value(&json!({"id": "v", "name": "Board", "type": "board"})),
-            Some(SavedView { id: "v".into(), name: "Board".into(), kind: "board".into() })
+            Some(SavedView {
+                id: "v".into(),
+                name: "Board".into(),
+                kind: "board".into()
+            })
         );
-        assert_eq!(SavedView::from_value(&json!({"name": "x", "type": "board"})), None);
+        assert_eq!(
+            SavedView::from_value(&json!({"name": "x", "type": "board"})),
+            None
+        );
         let s = Store::open_in_memory().unwrap();
         assert_eq!(s.view_pref("ds").unwrap(), None);
         s.set_view_pref("ds", "Board").unwrap();

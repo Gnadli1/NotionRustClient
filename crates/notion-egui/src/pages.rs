@@ -3,7 +3,9 @@
 //! step). The dialogs are modals whose keys are taken before any widget, like
 //! the switcher's.
 
-use eframe::egui::{self, Align2, Color32, Context, Id, Key, Label, Modal, Modifiers, RichText, Sense, TextEdit, Ui, Vec2};
+use eframe::egui::{
+    self, Align2, Color32, Context, Id, Key, Modal, Modifiers, RichText, Sense, TextEdit, Ui, Vec2,
+};
 use notion_core::media::{self, MediaKind};
 use notion_core::model::{Page, Parent};
 use notion_core::sync;
@@ -14,26 +16,33 @@ use crate::outline;
 use crate::theme::Colors;
 
 pub(crate) const EMOJI: [&str; 60] = [
-    "📄", "📝", "📚", "📌", "📎", "📅", "📊", "📈", "📁", "📂",
-    "💡", "🔥", "⭐", "✅", "❗", "❓", "🎯", "🚀", "🧪", "🔧",
-    "💻", "🖥", "📱", "🔒", "🔑", "🌍", "🏠", "🏫", "🎓", "🧠",
-    "❤", "💬", "📧", "📞", "🕐", "💰", "🛒", "🍎", "☕", "🍕",
-    "🎵", "🎮", "🎬", "📷", "🎨", "✏", "🔬", "⚙", "🧩", "🏆",
-    "🌱", "🌞", "🌙", "⚡", "❄", "🐱", "🐶", "🦊", "🐍", "🦀",
+    "📄", "📝", "📚", "📌", "📎", "📅", "📊", "📈", "📁", "📂", "💡", "🔥", "⭐", "✅", "❗", "❓",
+    "🎯", "🚀", "🧪", "🔧", "💻", "🖥", "📱", "🔒", "🔑", "🌍", "🏠", "🏫", "🎓", "🧠", "❤", "💬",
+    "📧", "📞", "🕐", "💰", "🛒", "🍎", "☕", "🍕", "🎵", "🎮", "🎬", "📷", "🎨", "✏", "🔬", "⚙",
+    "🧩", "🏆", "🌱", "🌞", "🌙", "⚡", "❄", "🐱", "🐶", "🦊", "🐍", "🦀",
 ];
 const COLS: usize = 10;
 
 use crate::media::Shown;
 
 pub(crate) enum Dlg {
-    Icon { text: String, sel: usize },
-    Cover { text: String },
+    Icon {
+        text: String,
+        sel: usize,
+    },
+    Cover {
+        text: String,
+    },
     /// A file path to upload as an image or file block.
-    Upload { text: String },
+    Upload {
+        text: String,
+    },
     /// Trash page (id, title): Enter = yes, Esc = no.
     Trash(String, String),
     /// The Trash view: cached pages in the trash, Enter restores the selected one.
-    Bin { sel: usize },
+    Bin {
+        sel: usize,
+    },
 }
 
 /// What a dialog decided.
@@ -59,7 +68,8 @@ impl Meta {
         let s = |v: &serde_json::Value| v.as_str().map(String::from);
         Meta {
             icon: s(&p.raw["icon"]["emoji"]),
-            cover: s(&p.raw["cover"]["external"]["url"]).or_else(|| s(&p.raw["cover"]["file"]["url"])),
+            cover: s(&p.raw["cover"]["external"]["url"])
+                .or_else(|| s(&p.raw["cover"]["file"]["url"])),
             locked: p.raw["is_locked"].as_bool().unwrap_or(false),
         }
     }
@@ -70,7 +80,8 @@ impl Meta {
 pub(crate) fn header(ui: &mut Ui, c: &Colors, m: &Meta, pic: Option<Shown>) -> Option<Action> {
     let mut act = None;
     if let (Some(url), Some(Shown::Tex(t))) = (&m.cover, &pic) {
-        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 200.0), Sense::click());
+        let (rect, r) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 200.0), Sense::click());
         crate::media::paint_cover(ui, t, rect, 6.0);
         if r.on_hover_text("Click to change the cover").clicked() {
             act = Some(Action::Dlg(Dlg::Cover { text: url.clone() }));
@@ -78,9 +89,19 @@ pub(crate) fn header(ui: &mut Ui, c: &Colors, m: &Meta, pic: Option<Shown>) -> O
         ui.add_space(6.0);
     } else if let Some(url) = &m.cover {
         let host = sync::cover_host(url).unwrap_or_else(|_| "image".into());
-        let hue = host.bytes().fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)) % 360;
-        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 72.0), Sense::click());
-        let fill: Color32 = egui::ecolor::Hsva::new(hue as f32 / 360.0, 0.35, if ui.visuals().dark_mode { 0.35 } else { 0.9 }, 1.0).into();
+        let hue = host
+            .bytes()
+            .fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32))
+            % 360;
+        let (rect, r) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 72.0), Sense::click());
+        let fill: Color32 = egui::ecolor::Hsva::new(
+            hue as f32 / 360.0,
+            0.35,
+            if ui.visuals().dark_mode { 0.35 } else { 0.9 },
+            1.0,
+        )
+        .into();
         ui.painter().rect_filled(rect, 6.0, fill);
         ui.painter().text(
             rect.center(),
@@ -94,18 +115,67 @@ pub(crate) fn header(ui: &mut Ui, c: &Colors, m: &Meta, pic: Option<Shown>) -> O
         }
         ui.add_space(6.0);
     }
-    ui.horizontal(|ui| {
-        ui.add_space(crate::theme::TEXT_INSET);
-        let icon = m.icon.as_deref().unwrap_or("＋");
-        let size = if m.icon.is_some() { 44.0 } else { 16.0 };
-        let l = Label::new(RichText::new(icon).size(size).color(if m.icon.is_some() { c.text } else { c.secondary })).sense(Sense::click());
-        if ui.add(l).on_hover_text("Page icon (Ctrl+Shift+I); cover: Ctrl+Shift+C").clicked() {
-            act = Some(Action::Dlg(Dlg::Icon { text: String::new(), sel: 0 }));
+    match &m.icon {
+        Some(icon) => {
+            ui.horizontal(|ui| {
+                ui.add_space(crate::theme::TEXT_INSET);
+                let (rect, r) = ui.allocate_exact_size(egui::vec2(78.0, 78.0), Sense::click());
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    icon,
+                    egui::FontId::proportional(64.0),
+                    c.text,
+                );
+                if r.on_hover_text("Page icon (Ctrl+Shift+I); cover: Ctrl+Shift+C")
+                    .clicked()
+                {
+                    act = Some(Action::Dlg(Dlg::Icon {
+                        text: String::new(),
+                        sel: 0,
+                    }));
+                }
+            });
+            ui.add_space(6.0);
         }
-        if m.locked {
-            ui.label(RichText::new("🔒 locked").small().color(c.secondary));
+        None => {
+            // Notion's "+ Add icon" ghost button, where an icon would be.
+            ui.horizontal(|ui| {
+                ui.add_space(crate::theme::TEXT_INSET);
+                let (rect, r) = ui.allocate_exact_size(egui::vec2(104.0, 24.0), Sense::click());
+                let tint = if r.hovered() { c.text } else { c.secondary };
+                if r.hovered() {
+                    ui.painter().rect_filled(rect, 4.0, c.hover);
+                }
+                let plus = egui::Rect::from_center_size(
+                    egui::pos2(rect.left() + 10.0, rect.center().y),
+                    egui::vec2(14.0, 14.0),
+                );
+                crate::icons::paint(ui, plus, crate::icons::Icon::Plus, tint);
+                ui.painter().text(
+                    egui::pos2(rect.left() + 21.0, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    "Add icon",
+                    egui::FontId::proportional(12.0),
+                    tint,
+                );
+                if r.on_hover_text("Page icon (Ctrl+Shift+I); cover: Ctrl+Shift+C")
+                    .clicked()
+                {
+                    act = Some(Action::Dlg(Dlg::Icon {
+                        text: String::new(),
+                        sel: 0,
+                    }));
+                }
+            });
         }
-    });
+    }
+    if m.locked {
+        ui.horizontal(|ui| {
+            ui.add_space(crate::theme::TEXT_INSET);
+            ui.label(RichText::new("Locked").size(12.0).color(c.secondary));
+        });
+    }
     act
 }
 
@@ -118,8 +188,15 @@ impl App {
     }
 
     /// Runs a page edit as one undo step. Not while a push runs.
-    fn page_edit(&mut self, page: Option<String>, also: Vec<String>, f: impl FnOnce(&notion_core::store::Store, &str) -> notion_core::Result<i64>) -> bool {
-        let Some(id) = page.or_else(|| self.current.clone()) else { return false };
+    fn page_edit(
+        &mut self,
+        page: Option<String>,
+        also: Vec<String>,
+        f: impl FnOnce(&notion_core::store::Store, &str) -> notion_core::Result<i64>,
+    ) -> bool {
+        let Some(id) = page.or_else(|| self.current.clone()) else {
+            return false;
+        };
         if self.pushing() {
             self.last_error = Some("editing is paused while a push runs".into());
             return false;
@@ -151,7 +228,11 @@ impl App {
             self.last_error = Some("editing is paused while a push runs".into());
             return;
         }
-        let at = self.focus.as_ref().filter(|f| f.cell.is_none()).map(|f| f.idx);
+        let at = self
+            .focus
+            .as_ref()
+            .filter(|f| f.cell.is_none())
+            .map(|f| f.idx);
         if let (Some(t), Some(f)) = (text, &mut self.focus) {
             f.text = t;
         }
@@ -159,7 +240,11 @@ impl App {
             return;
         }
         let after = at.and_then(|i| {
-            let top = outline::ancestors(&self.rows, i).last().copied().unwrap_or(&self.rows[i].block_id).to_string();
+            let top = outline::ancestors(&self.rows, i)
+                .last()
+                .copied()
+                .unwrap_or(&self.rows[i].block_id)
+                .to_string();
             self.store.resolve_id(&top).ok()
         });
         let made = self.step(|s| {
@@ -192,12 +277,20 @@ impl App {
             self.last_error = Some("editing is paused while a push runs".into());
             return false;
         }
-        let at = self.focus.as_ref().filter(|f| f.cell.is_none()).map(|f| f.idx);
+        let at = self
+            .focus
+            .as_ref()
+            .filter(|f| f.cell.is_none())
+            .map(|f| f.idx);
         if !self.flush() {
             return false;
         }
         let after = at.and_then(|i| {
-            let top = outline::ancestors(&self.rows, i).last().copied().unwrap_or(&self.rows[i].block_id).to_string();
+            let top = outline::ancestors(&self.rows, i)
+                .last()
+                .copied()
+                .unwrap_or(&self.rows[i].block_id)
+                .to_string();
             self.store.resolve_id(&top).ok()
         });
         let p = path.trim().trim_matches(['"', '\'']);
@@ -205,11 +298,17 @@ impl App {
             (Some(rest), Some(home)) => std::path::Path::new(&home).join(rest),
             _ => p.into(),
         };
-        let kind = match p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+        let kind = match p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
             Some("png" | "jpg" | "jpeg" | "gif" | "webp") => MediaKind::Image,
             _ => MediaKind::File,
         };
-        let made = self.step(|s| media::local_create_media(&s.store, &parent, after.as_deref(), &p, kind));
+        let made =
+            self.step(|s| media::local_create_media(&s.store, &parent, after.as_deref(), &p, kind));
         self.refresh();
         match made {
             Ok(_) => {
@@ -224,11 +323,15 @@ impl App {
     }
 
     pub(crate) fn set_icon(&mut self, emoji: Option<String>) -> bool {
-        self.page_edit(None, vec![], |st, id| sync::local_set_icon(st, id, emoji.as_deref()))
+        self.page_edit(None, vec![], |st, id| {
+            sync::local_set_icon(st, id, emoji.as_deref())
+        })
     }
 
     pub(crate) fn set_cover(&mut self, url: Option<String>) -> bool {
-        self.page_edit(None, vec![], |st, id| sync::local_set_cover(st, id, url.as_deref()))
+        self.page_edit(None, vec![], |st, id| {
+            sync::local_set_cover(st, id, url.as_deref())
+        })
     }
 
     pub(crate) fn toggle_lock(&mut self) {
@@ -240,10 +343,15 @@ impl App {
     /// the tab closes.
     fn trash_page(&mut self, id: String) {
         let parent = match self.store.get_page(&id) {
-            Ok(Some(Page { parent: Parent::Page(p) | Parent::DataSource { id: p, .. }, .. })) => Some(p),
+            Ok(Some(Page {
+                parent: Parent::Page(p) | Parent::DataSource { id: p, .. },
+                ..
+            })) => Some(p),
             _ => None,
         };
-        if !self.page_edit(Some(id.clone()), vec![], |st, id| sync::local_trash_page(st, id, true)) {
+        if !self.page_edit(Some(id.clone()), vec![], |st, id| {
+            sync::local_trash_page(st, id, true)
+        }) {
             return;
         }
         self.info = Some("trashed: restore it from the Trash view".into());
@@ -261,7 +369,9 @@ impl App {
     }
 
     fn restore_page(&mut self, id: String) {
-        if self.page_edit(Some(id), vec![], |st, id| sync::local_trash_page(st, id, false)) {
+        if self.page_edit(Some(id), vec![], |st, id| {
+            sync::local_trash_page(st, id, false)
+        }) {
             self.info = Some("restored".into());
         }
     }
@@ -270,10 +380,15 @@ impl App {
     pub(crate) fn move_page(&mut self, page: &str, parent: &str) {
         // the page's rows in the old and the new parent move with it
         let old = match self.store.get_page(page) {
-            Ok(Some(Page { parent: Parent::Page(p), .. })) => vec![p, parent.to_string()],
+            Ok(Some(Page {
+                parent: Parent::Page(p),
+                ..
+            })) => vec![p, parent.to_string()],
             _ => vec![parent.to_string()],
         };
-        if self.page_edit(Some(page.to_string()), old, |st, id| sync::local_move_page(st, id, parent)) {
+        if self.page_edit(Some(page.to_string()), old, |st, id| {
+            sync::local_move_page(st, id, parent)
+        }) {
             self.info = Some("moved (Ctrl+S to push)".into());
             self.reveal_current();
         }
@@ -301,9 +416,22 @@ impl App {
         };
         match c {
             C::TrashView => self.dlg = Some(Dlg::Bin { sel: 0 }),
-            C::PageIcon => self.dlg = Some(Dlg::Icon { text: String::new(), sel: 0 }),
-            C::PageCover => self.dlg = Some(Dlg::Cover { text: self.meta.cover.clone().unwrap_or_default() }),
-            C::UploadFile => self.dlg = Some(Dlg::Upload { text: String::new() }),
+            C::PageIcon => {
+                self.dlg = Some(Dlg::Icon {
+                    text: String::new(),
+                    sel: 0,
+                })
+            }
+            C::PageCover => {
+                self.dlg = Some(Dlg::Cover {
+                    text: self.meta.cover.clone().unwrap_or_default(),
+                })
+            }
+            C::UploadFile => {
+                self.dlg = Some(Dlg::Upload {
+                    text: String::new(),
+                })
+            }
             C::ToggleLock => self.toggle_lock(),
             C::TrashPage if id.starts_with("local-") => {
                 self.last_error = Some("this page isn't pushed yet: push it (Ctrl+S) first".into());
@@ -377,7 +505,11 @@ impl App {
                     return Some(Done::Icon(None));
                 }
                 let typed = text.trim();
-                enter.then(|| Done::Icon(Some(if typed.is_empty() { EMOJI[*sel] } else { typed }.to_string())))
+                enter.then(|| {
+                    Done::Icon(Some(
+                        if typed.is_empty() { EMOJI[*sel] } else { typed }.to_string(),
+                    ))
+                })
             }
             Dlg::Cover { text } => {
                 if rm {
@@ -388,7 +520,8 @@ impl App {
             Dlg::Upload { text } => enter.then(|| Done::Upload(text.clone())),
             Dlg::Trash(id, _) => enter.then(|| Done::Trash(id.clone())),
             Dlg::Bin { sel } => {
-                *sel = (*sel as isize + d as isize - u as isize).clamp(0, bin.len().max(1) as isize - 1) as usize;
+                *sel = (*sel as isize + d as isize - u as isize)
+                    .clamp(0, bin.len().max(1) as isize - 1) as usize;
                 let id = bin.get(*sel).map(|p| p.id.clone());
                 id.filter(|_| enter).map(Done::Restore)
             }
@@ -492,7 +625,13 @@ impl App {
     /// were re-keyed in the store).
     pub(crate) fn remap_ids(&mut self) {
         let store = &self.store;
-        let r = |id: &str| if id.starts_with("local-") { store.resolve_id(id).unwrap_or_else(|_| id.into()) } else { id.into() };
+        let r = |id: &str| {
+            if id.starts_with("local-") {
+                store.resolve_id(id).unwrap_or_else(|_| id.into())
+            } else {
+                id.into()
+            }
+        };
         self.current = self.current.take().map(|p| r(&p));
         for t in &mut self.tabs {
             t.page = t.page.take().map(|p| r(&p));
@@ -515,10 +654,20 @@ mod tests {
     use notion_core::ops::OpKind;
     use notion_core::store::Store;
 
-    const CS: Modifiers = Modifiers { ctrl: true, shift: true, ..Modifiers::NONE };
+    const CS: Modifiers = Modifiers {
+        ctrl: true,
+        shift: true,
+        ..Modifiers::NONE
+    };
 
     fn child_rows(w: &Win, parent: &str) -> Vec<String> {
-        w.app.store.children(parent).unwrap().into_iter().map(|b| b.id).collect()
+        w.app
+            .store
+            .children(parent)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect()
     }
 
     #[test]
@@ -528,9 +677,15 @@ mod tests {
         let id = w.app.current.clone().unwrap();
         assert!(id.starts_with("local-"));
         assert!(w.app.title_edit.is_some(), "the title is being edited");
-        assert_eq!(child_rows(&w, "p"), ["p-0", id.as_str()], "a child_page row");
+        assert_eq!(
+            child_rows(&w, "p"),
+            ["p-0", id.as_str()],
+            "a child_page row"
+        );
         let ops = w.app.store.queued_ops().unwrap();
-        assert!(matches!(&ops[..], [o] if matches!(&o.kind, OpKind::CreatePage { parent_id, .. } if parent_id == "p")));
+        assert!(
+            matches!(&ops[..], [o] if matches!(&o.kind, OpKind::CreatePage { parent_id, .. } if parent_id == "p"))
+        );
         // typing the title rewrites the one create
         w.type_text("Ideas");
         w.frames(vec![key(Key::Enter)]);
@@ -552,7 +707,12 @@ mod tests {
     fn ctrl_n_without_a_page_says_why() {
         let mut w = Win::new(Store::open_in_memory().unwrap());
         w.press(Key::N, Modifiers::CTRL);
-        assert!(w.app.last_error.as_deref().unwrap().contains("open a page first"));
+        assert!(w
+            .app
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("open a page first"));
         assert_eq!(w.queued(), 0);
     }
 
@@ -569,8 +729,14 @@ mod tests {
         assert!(id.starts_with("local-"), "the new page is open");
         assert!(w.app.title_edit.is_some());
         let rows = w.app.store.children("p").unwrap();
-        assert_eq!(rows.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["p-0", id.as_str(), "p-1"]);
-        assert!(matches!(rows[1].kind, notion_core::model::BlockKind::ChildPage { .. }));
+        assert_eq!(
+            rows.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            ["p-0", id.as_str(), "p-1"]
+        );
+        assert!(matches!(
+            rows[1].kind,
+            notion_core::model::BlockKind::ChildPage { .. }
+        ));
         assert_eq!(w.queued(), 1, "the row text was unchanged: only the create");
         // German alias
         let mut w = Win::with_texts(&[""]);
@@ -618,23 +784,43 @@ mod tests {
         use crate::outline::tests::blk;
         let store = Store::open_in_memory().unwrap();
         add_page(&store, "p", None, &[]);
-        let file = blk("imf", "p", "image", serde_json::json!({ "type": "file", "caption": [],
-            "file": { "url": "https://s3.test/a.png?sig=1", "expiry_time": "2099-01-01T00:00:00.000Z" } }));
-        let ext = blk("ime", "p", "image", serde_json::json!({ "type": "external", "caption": [],
-            "external": { "url": "https://x.test/b.png" } }));
+        let file = blk(
+            "imf",
+            "p",
+            "image",
+            serde_json::json!({ "type": "file", "caption": [],
+            "file": { "url": "https://s3.test/a.png?sig=1", "expiry_time": "2099-01-01T00:00:00.000Z" } }),
+        );
+        let ext = blk(
+            "ime",
+            "p",
+            "image",
+            serde_json::json!({ "type": "external", "caption": [],
+            "external": { "url": "https://x.test/b.png" } }),
+        );
         store.replace_children("p", "p", &[file, ext]).unwrap();
         let mut w = Win::new(store);
         w.app.apply(crate::app::Action::Open("p".into()));
         w.frames(vec![]);
         w.frames(vec![]);
         for id in ["imf", "ime"] {
-            assert!(w.app.media.src(&w.app.store, id, false).is_some(), "{id} has a source");
+            assert!(
+                w.app.media.src(&w.app.store, id, false).is_some(),
+                "{id} has a source"
+            );
         }
-        let asked: Vec<_> = w.cmds().into_iter().filter_map(|c| match c {
-            crate::worker::Cmd::Media { id, .. } => Some(id),
-            _ => None,
-        }).collect();
-        assert!(asked.contains(&"imf".to_string()) && asked.contains(&"ime".to_string()), "asked: {asked:?}");
+        let asked: Vec<_> = w
+            .cmds()
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::worker::Cmd::Media { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            asked.contains(&"imf".to_string()) && asked.contains(&"ime".to_string()),
+            "asked: {asked:?}"
+        );
         assert!(!w.shown.contains("[image]"), "no link label: {}", w.shown);
     }
 
@@ -642,26 +828,48 @@ mod tests {
     fn upload_queues_an_image_block_shows_it_and_undoes() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("pic.png");
-        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 255, 255])).save(&f).unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 255, 255]))
+            .save(&f)
+            .unwrap();
         let mut w = Win::with_texts(&["a"]);
         w.press(Key::F, CS);
         w.type_text(&format!("  \"{}\"", f.display()));
         w.press(Key::Enter, Modifiers::NONE);
         assert_eq!((w.queued(), w.app.rows.len()), (1, 2));
-        assert_eq!(w.app.rows[1].marker, crate::outline::Marker::Unsupported("image".into()));
+        assert_eq!(
+            w.app.rows[1].marker,
+            crate::outline::Marker::Unsupported("image".into())
+        );
         w.frames(vec![]);
         w.frames(vec![]);
-        let asked: Vec<_> = w.cmds().into_iter().filter(|c| matches!(c, crate::worker::Cmd::Media { page: false, .. })).collect();
+        let asked: Vec<_> = w
+            .cmds()
+            .into_iter()
+            .filter(|c| matches!(c, crate::worker::Cmd::Media { page: false, .. }))
+            .collect();
         assert_eq!(asked.len(), 1, "the picture is asked for once: {asked:?}");
         // the worker answers with the file itself: no cache, no network
-        let crate::worker::Cmd::Media { id, .. } = asked[0].clone() else { unreachable!() };
-        w.answer(crate::worker::Event::Media { id, path: Ok(f.clone()) });
-        assert!(w.app.sent.iter().all(|c| !matches!(c, crate::worker::Cmd::Media { .. })));
+        let crate::worker::Cmd::Media { id, .. } = asked[0].clone() else {
+            unreachable!()
+        };
+        w.answer(crate::worker::Event::Media {
+            id,
+            path: Ok(f.clone()),
+        });
+        assert!(w
+            .app
+            .sent
+            .iter()
+            .all(|c| !matches!(c, crate::worker::Cmd::Media { .. })));
         // a refused file queues nothing and says why
         w.press(Key::F, CS);
         w.type_text("/nonexistent/x.png");
         w.press(Key::Enter, Modifiers::NONE);
-        assert!(w.app.last_error.as_deref().is_some_and(|e| e.contains("cannot read")));
+        assert!(w
+            .app
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("cannot read")));
         assert_eq!(w.queued(), 1);
         w.press(Key::Escape, Modifiers::NONE);
         w.press(Key::Z, Modifiers::CTRL);
@@ -675,14 +883,20 @@ mod tests {
         w.type_text("ftp://x.example/a.png");
         w.press(Key::Enter, Modifiers::NONE);
         assert!(w.app.last_error.is_some());
-        assert!(matches!(w.app.dlg, Some(Dlg::Cover { .. })), "the box stays open");
+        assert!(
+            matches!(w.app.dlg, Some(Dlg::Cover { .. })),
+            "the box stays open"
+        );
         assert_eq!(w.queued(), 0);
         if let Some(Dlg::Cover { text }) = &mut w.app.dlg {
             text.clear();
         }
         w.type_text("https://img.example.com/a.png");
         w.press(Key::Enter, Modifiers::NONE);
-        assert_eq!(w.app.meta.cover.as_deref(), Some("https://img.example.com/a.png"));
+        assert_eq!(
+            w.app.meta.cover.as_deref(),
+            Some("https://img.example.com/a.png")
+        );
         assert!(w.shown.contains("img.example.com"), "{}", w.shown);
         w.press(Key::C, CS);
         w.press(Key::Delete, Modifiers::CTRL);
@@ -695,7 +909,11 @@ mod tests {
         w.press(Key::Backspace, CS);
         w.frames(vec![]);
         assert!(matches!(w.app.dlg, Some(Dlg::Trash(..))));
-        assert!(w.shown.contains("Trash 'p'? Enter = yes, Esc = no"), "{}", w.shown);
+        assert!(
+            w.shown.contains("Trash 'p'? Enter = yes, Esc = no"),
+            "{}",
+            w.shown
+        );
         w.press(Key::Escape, Modifiers::NONE);
         assert!(w.app.dlg.is_none());
         assert_eq!(w.queued(), 0);
@@ -746,9 +964,21 @@ mod tests {
         w.app.apply(Action::Open("p".into()));
         w.frames(vec![]);
         w.press(Key::P, CS);
-        assert_eq!(w.app.switcher.as_ref().and_then(|s| s.moving.clone()).as_deref(), Some("p"));
+        assert_eq!(
+            w.app
+                .switcher
+                .as_ref()
+                .and_then(|s| s.moving.clone())
+                .as_deref(),
+            Some("p")
+        );
         w.app.pick("c", false);
-        assert!(w.app.last_error.as_deref().unwrap().contains("itself or its own subpages"));
+        assert!(w
+            .app
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("itself or its own subpages"));
         w.app.last_error = None;
         w.app.move_page("p", "p");
         assert!(w.app.last_error.is_some());
@@ -777,7 +1007,13 @@ mod tests {
         w.answer(WEvent::Pushed(Default::default()));
         assert_eq!(w.app.current.as_deref(), Some("real1"));
         assert!(!w.app.recent.contains(&local) && w.app.recent.iter().any(|r| r == "real1"));
-        assert_eq!(w.cmds(), [crate::worker::Cmd::Pull { id: "real1".into(), force: true }]);
+        assert_eq!(
+            w.cmds(),
+            [crate::worker::Cmd::Pull {
+                id: "real1".into(),
+                force: true
+            }]
+        );
     }
 
     #[test]
@@ -799,7 +1035,10 @@ mod tests {
         assert_eq!(w.app.rows.len(), 2, "Delete deleted nothing");
         assert_eq!(w.queued(), 0);
         w.press(Key::Enter, Modifiers::NONE);
-        assert!(w.app.dlg.is_none() && w.app.focus.is_none(), "Enter confirmed the dialog, edited no block");
+        assert!(
+            w.app.dlg.is_none() && w.app.focus.is_none(),
+            "Enter confirmed the dialog, edited no block"
+        );
         assert!(w.app.store.get_page("p").unwrap().unwrap().in_trash);
     }
 
@@ -809,7 +1048,10 @@ mod tests {
         w.press(Key::N, Modifiers::CTRL);
         let id = w.app.current.clone().unwrap();
         let op = w.app.store.queued_ops().unwrap()[0].id;
-        w.app.store.mark_op(op, notion_core::ops::OpStatus::Failed, Some("400")).unwrap();
+        w.app
+            .store
+            .mark_op(op, notion_core::ops::OpStatus::Failed, Some("400"))
+            .unwrap();
         w.app.refresh();
         w.cmds();
         w.app.apply(Action::Discard(op));
@@ -817,7 +1059,11 @@ mod tests {
         assert!(w.app.store.get_page(&id).unwrap().is_none());
         assert_eq!(child_rows(&w, "p"), ["p-0"]);
         assert!(w.cmds().is_empty(), "no pull of a page Notion never saw");
-        assert!(w.app.tabs.iter().all(|t| t.page.as_deref() != Some(id.as_str())));
+        assert!(w
+            .app
+            .tabs
+            .iter()
+            .all(|t| t.page.as_deref() != Some(id.as_str())));
     }
 
     #[test]
@@ -826,9 +1072,12 @@ mod tests {
         add_page(&store, "p", None, &["a", "b"]);
         add_page(&store, "q", None, &["y"]);
         add_page(&store, "c", Some("p"), &[]);
-        let row = crate::outline::tests::blk("c", "p", "child_page", serde_json::json!({ "title": "c" }));
+        let row =
+            crate::outline::tests::blk("c", "p", "child_page", serde_json::json!({ "title": "c" }));
         let kids = store.children("p").unwrap();
-        store.replace_children("p", "p", &[kids[0].clone(), row, kids[1].clone()]).unwrap();
+        store
+            .replace_children("p", "p", &[kids[0].clone(), row, kids[1].clone()])
+            .unwrap();
         let mut w = Win::new(store);
         w.app.apply(Action::Open("p".into()));
         w.frames(vec![]);

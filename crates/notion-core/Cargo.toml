@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 tokio.workspace = true
+futures.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -12,6 +13,7 @@ thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 rusqlite.workspace = true
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

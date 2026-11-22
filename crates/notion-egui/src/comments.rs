@@ -12,7 +12,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eframe::egui::{self, Align, Frame, Id, Key, Layout, Margin, Modifiers, RichText, ScrollArea, Sense, TextEdit, Ui};
+use eframe::egui::{
+    self, Align, Frame, Id, Key, Layout, Margin, Modifiers, RichText, ScrollArea, Sense, TextEdit,
+    Ui,
+};
 use notion_core::markdown::{from_markdown, to_markdown};
 use notion_core::model::{plain_text, Comment, User};
 use notion_core::ops::CommentTarget;
@@ -52,7 +55,10 @@ pub(crate) struct Panel {
 pub(crate) fn threads(cs: &[Comment]) -> Vec<Vec<&Comment>> {
     let mut out: Vec<Vec<&Comment>> = Vec::new();
     for c in cs {
-        match out.iter_mut().find(|t| t[0].discussion_id == c.discussion_id) {
+        match out
+            .iter_mut()
+            .find(|t| t[0].discussion_id == c.discussion_id)
+        {
             Some(t) => t.push(c),
             None => out.push(vec![c]),
         }
@@ -105,14 +111,22 @@ impl App {
         if self.comments.is_some() {
             self.close_comments(true);
         } else {
-            let block = self.focus.as_ref().filter(|f| f.cell.is_none()).map(|f| f.block_id.clone());
+            let block = self
+                .focus
+                .as_ref()
+                .filter(|f| f.cell.is_none())
+                .map(|f| f.block_id.clone());
             self.open_comments(block);
         }
     }
 
     /// Opens the panel, on `block` if given. A 💬 click comes here too.
     pub(crate) fn open_comments(&mut self, block: Option<String>) {
-        let back = self.focus.as_ref().filter(|f| f.cell.is_none()).map(|f| f.block_id.clone());
+        let back = self
+            .focus
+            .as_ref()
+            .filter(|f| f.cell.is_none())
+            .map(|f| f.block_id.clone());
         if !self.commit() {
             return;
         }
@@ -120,7 +134,10 @@ impl App {
         self.comments = Some(Panel {
             block: block.clone(),
             back,
-            new_text: keep.as_ref().map(|p| p.new_text.clone()).unwrap_or_default(),
+            new_text: keep
+                .as_ref()
+                .map(|p| p.new_text.clone())
+                .unwrap_or_default(),
             on_page: false,
             replies: keep.map(|p| p.replies).unwrap_or_default(),
             edit: None,
@@ -146,7 +163,9 @@ impl App {
     }
 
     pub(crate) fn close_comments(&mut self, back: bool) {
-        let Some(p) = self.comments.take() else { return };
+        let Some(p) = self.comments.take() else {
+            return;
+        };
         if back {
             self.edit_row(p.back.as_deref());
         }
@@ -161,7 +180,11 @@ impl App {
 
     fn edit_row(&mut self, id: Option<&str>) {
         let found = id
-            .and_then(|id| self.rows.iter().position(|r| r.block_id == id && r.editable))
+            .and_then(|id| {
+                self.rows
+                    .iter()
+                    .position(|r| r.block_id == id && r.editable)
+            })
             .filter(|&i| self.shown[i]);
         if let Some(i) = found {
             self.start_edit(i, Grab::End);
@@ -169,7 +192,9 @@ impl App {
     }
 
     pub(crate) fn offline(&self) -> bool {
-        self.last_error.as_deref().is_some_and(|e| e.starts_with("offline"))
+        self.last_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("offline"))
     }
 
     /// Asks the worker for the threads of a page or block, once per panel
@@ -178,7 +203,11 @@ impl App {
         if id.starts_with("local-") || self.offline() {
             return;
         }
-        if self.comments.as_mut().is_some_and(|p| p.asked.insert(id.to_string())) {
+        if self
+            .comments
+            .as_mut()
+            .is_some_and(|p| p.asked.insert(id.to_string()))
+        {
             self.send(Cmd::PullComments { id: id.to_string() });
         }
     }
@@ -186,10 +215,19 @@ impl App {
     /// The panel follows the edited row. Clicking a box ends the row's edit
     /// but the panel keeps its row.
     pub(crate) fn comments_follow_focus(&mut self) {
-        let Some(id) = self.focus.as_ref().filter(|f| f.cell.is_none()).map(|f| f.block_id.clone()) else {
+        let Some(id) = self
+            .focus
+            .as_ref()
+            .filter(|f| f.cell.is_none())
+            .map(|f| f.block_id.clone())
+        else {
             return;
         };
-        if self.comments.as_ref().is_some_and(|p| p.block.as_ref() != Some(&id)) {
+        if self
+            .comments
+            .as_ref()
+            .is_some_and(|p| p.block.as_ref() != Some(&id))
+        {
             if let Some(p) = &mut self.comments {
                 p.block = Some(id.clone());
                 p.on_page = false;
@@ -316,12 +354,20 @@ impl App {
             ui.add_space(4.0);
             if let Some(l) = &label {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("New comment on").size(12.0).color(c.secondary));
+                    ui.label(
+                        RichText::new("New comment on")
+                            .size(12.0)
+                            .color(c.secondary),
+                    );
                     ui.selectable_value(&mut p.on_page, false, l.as_str());
                     ui.selectable_value(&mut p.on_page, true, "page");
                 });
             } else {
-                ui.label(RichText::new("New comment on the page").size(12.0).color(c.secondary));
+                ui.label(
+                    RichText::new("New comment on the page")
+                        .size(12.0)
+                        .color(c.secondary),
+                );
             }
             let target = match (&p.block, p.on_page) {
                 (Some(b), false) => CommentTarget::Block(b.clone()),
@@ -331,7 +377,12 @@ impl App {
             if std::mem::take(&mut p.focus_new) {
                 ui.memory_mut(|m| m.request_focus(id));
             }
-            if let Some(a) = draft_box(ui, id, &mut p.new_text, "Write a comment…  (Ctrl+Enter sends, Esc leaves)") {
+            if let Some(a) = draft_box(
+                ui,
+                id,
+                &mut p.new_text,
+                "Write a comment…  (Ctrl+Enter sends, Esc leaves)",
+            ) {
                 acts.push(match a {
                     Draft::Send => Action::CommentSend(target, p.new_text.clone()),
                     Draft::Leave => Action::CommentsBack,
@@ -347,44 +398,56 @@ impl App {
             focus_edit,
             ..
         } = &mut p;
-        ScrollArea::vertical().id_salt("comments").auto_shrink(false).show(ui, |ui| {
-            let mut section = |ui: &mut Ui, head: String, cs: &[Comment]| {
-                ui.label(RichText::new(head).size(12.0).color(c.secondary));
-                if cs.is_empty() {
-                    ui.label(RichText::new("No comments yet.").color(c.secondary));
+        ScrollArea::vertical()
+            .id_salt("comments")
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                let mut section = |ui: &mut Ui, head: String, cs: &[Comment]| {
+                    ui.label(RichText::new(head).size(12.0).color(c.secondary));
+                    if cs.is_empty() {
+                        ui.label(RichText::new("No comments yet.").color(c.secondary));
+                    }
+                    for t in threads(cs) {
+                        Frame::new()
+                            .stroke(egui::Stroke::new(1.0, c.border))
+                            .corner_radius(6.0)
+                            .inner_margin(Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                for cm in &t {
+                                    let mine = mine(me.as_deref(), cm);
+                                    comment_ui(
+                                        ui,
+                                        c,
+                                        (cm, mine),
+                                        (users, now),
+                                        (&mut *edit, &mut *focus_edit),
+                                        &mut acts,
+                                    );
+                                }
+                                let disc = &t[0].discussion_id;
+                                let draft = replies.entry(disc.clone()).or_default();
+                                if let Some(a) =
+                                    draft_box(ui, box_id("reply", disc), draft, "Reply…")
+                                {
+                                    acts.push(match a {
+                                        Draft::Send => Action::CommentSend(
+                                            CommentTarget::Discussion(disc.clone()),
+                                            draft.clone(),
+                                        ),
+                                        Draft::Leave => Action::CommentsBack,
+                                    });
+                                }
+                            });
+                        ui.add_space(6.0);
+                    }
+                };
+                section(ui, format!("Page: {title}"), page_comments);
+                if let Some(l) = &label {
+                    ui.add_space(8.0);
+                    section(ui, format!("Block: {l}"), block_comments);
                 }
-                for t in threads(cs) {
-                    Frame::new()
-                        .stroke(egui::Stroke::new(1.0, c.border))
-                        .corner_radius(6.0)
-                        .inner_margin(Margin::same(8))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            for cm in &t {
-                                let mine = mine(me.as_deref(), cm);
-                                comment_ui(ui, c, (cm, mine), (users, now), (&mut *edit, &mut *focus_edit), &mut acts);
-                            }
-                            let disc = &t[0].discussion_id;
-                            let draft = replies.entry(disc.clone()).or_default();
-                            if let Some(a) = draft_box(ui, box_id("reply", disc), draft, "Reply…") {
-                                acts.push(match a {
-                                    Draft::Send => Action::CommentSend(
-                                        CommentTarget::Discussion(disc.clone()),
-                                        draft.clone(),
-                                    ),
-                                    Draft::Leave => Action::CommentsBack,
-                                });
-                            }
-                        });
-                    ui.add_space(6.0);
-                }
-            };
-            section(ui, format!("Page: {title}"), page_comments);
-            if let Some(l) = &label {
-                ui.add_space(8.0);
-                section(ui, format!("Block: {l}"), block_comments);
-            }
-        });
+            });
         self.comments = Some(p);
         acts
     }
@@ -455,7 +518,11 @@ fn comment_ui(
         // our own keep one colour, whether pushed (bot id) or still local
         let by = if mine { "you" } else { cm.created_by.as_str() };
         crate::people::avatar(ui, by, &who, 18.0);
-        ui.label(RichText::new(format!("{who} · {when}")).size(12.0).color(c.secondary));
+        ui.label(
+            RichText::new(format!("{who} · {when}"))
+                .size(12.0)
+                .color(c.secondary),
+        );
         if mine {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.small_button("Delete").clicked() {
@@ -513,7 +580,8 @@ pub(crate) fn badge(ui: &mut Ui, c: &Colors, row: egui::Rect, id: Id, n: usize) 
         egui::FontId::proportional(12.0),
         c.secondary,
     );
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
 }
 
 #[cfg(test)]
@@ -555,7 +623,13 @@ mod tests {
     }
 
     fn ops(w: &Win) -> Vec<OpKind> {
-        w.app.store.queued_ops().unwrap().into_iter().map(|o| o.kind).collect()
+        w.app
+            .store
+            .queued_ops()
+            .unwrap()
+            .into_iter()
+            .map(|o| o.kind)
+            .collect()
     }
 
     #[test]
@@ -581,7 +655,10 @@ mod tests {
     fn only_the_integrations_own_and_unpushed_comments_are_mine() {
         assert!(mine(Some("bot"), &cm_on("c", "d", "p", "bot", "")));
         assert!(!mine(Some("bot"), &cm_on("c", "d", "p", "someone", "")));
-        assert!(!mine(None, &cm_on("c", "d", "p", "bot", "")), "bot id not known yet");
+        assert!(
+            !mine(None, &cm_on("c", "d", "p", "bot", "")),
+            "bot id not known yet"
+        );
         assert!(mine(None, &cm_on("local-1", "d", "p", "local", "")));
     }
 
@@ -598,7 +675,11 @@ mod tests {
         w.press(Key::M, CTRL_SHIFT);
         assert!(w.app.comments.is_none(), "again closes it");
         open_panel(&mut w);
-        assert_eq!(w.cmds(), [Cmd::PullComments { id: "p".into() }], "Me is asked once");
+        assert_eq!(
+            w.cmds(),
+            [Cmd::PullComments { id: "p".into() }],
+            "Me is asked once"
+        );
     }
 
     #[test]
@@ -619,11 +700,22 @@ mod tests {
         w.send(key_mod(Key::Enter, Modifiers::CTRL));
         let got = ops(&w);
         assert_eq!(got.len(), 1, "{got:?}");
-        let OpKind::CreateComment { parent, rich_text, .. } = &got[0] else { panic!("{got:?}") };
+        let OpKind::CreateComment {
+            parent, rich_text, ..
+        } = &got[0]
+        else {
+            panic!("{got:?}")
+        };
         assert_eq!(*parent, CommentTarget::Page("p".into()));
-        assert_eq!(rich_text[1]["annotations"]["bold"], true, "Markdown became rich text");
+        assert_eq!(
+            rich_text[1]["annotations"]["bold"], true,
+            "Markdown became rich text"
+        );
         assert_eq!(w.app.counts[0], 1, "the status bar counts it");
-        assert!(w.app.comments.as_ref().unwrap().new_text.is_empty(), "the draft is cleared");
+        assert!(
+            w.app.comments.as_ref().unwrap().new_text.is_empty(),
+            "the draft is cleared"
+        );
         let shown = &w.app.comments.as_ref().unwrap().page_comments;
         assert_eq!(shown.len(), 1);
         assert!(shown[0].id.starts_with("local-"));
@@ -646,14 +738,22 @@ mod tests {
         w.type_text("on b");
         w.send(key_mod(Key::Enter, Modifiers::CTRL));
         let got = ops(&w);
-        let OpKind::CreateComment { parent, .. } = &got[0] else { panic!("{got:?}") };
+        let OpKind::CreateComment { parent, .. } = &got[0] else {
+            panic!("{got:?}")
+        };
         assert_eq!(*parent, CommentTarget::Block("p-1".into()));
-        assert!(w.app.queued_ids.contains("p-1"), "the row gets its sync dot");
+        assert!(
+            w.app.queued_ids.contains("p-1"),
+            "the row gets its sync dot"
+        );
         assert_eq!(w.app.comment_counts["p-1"], 1);
 
         // focusing another row moves the panel there (and fetches its threads)
         w.edit(0);
-        assert_eq!(w.app.comments.as_ref().unwrap().block.as_deref(), Some("p-0"));
+        assert_eq!(
+            w.app.comments.as_ref().unwrap().block.as_deref(),
+            Some("p-0")
+        );
         assert!(w.cmds().contains(&Cmd::PullComments { id: "p-0".into() }));
     }
 
@@ -664,16 +764,29 @@ mod tests {
         open_panel(&mut w);
         w.type_text("draft");
         w.send(key(Key::Escape));
-        assert_eq!(w.app.focus.as_ref().map(|f| f.block_id.as_str()), Some("p-0"));
-        assert_eq!(w.app.comments.as_ref().unwrap().new_text, "draft", "the draft is kept");
+        assert_eq!(
+            w.app.focus.as_ref().map(|f| f.block_id.as_str()),
+            Some("p-0")
+        );
+        assert_eq!(
+            w.app.comments.as_ref().unwrap().new_text,
+            "draft",
+            "the draft is kept"
+        );
         assert!(ops(&w).is_empty());
     }
 
     #[test]
     fn a_reply_goes_to_its_own_discussion() {
         let mut w = Win::with_texts(&["a"]);
-        w.app.store.put_comment(&cm_on("c1", "d1", "p", "u", "first")).unwrap();
-        w.app.store.put_comment(&cm_on("c2", "d2", "p", "u", "second")).unwrap();
+        w.app
+            .store
+            .put_comment(&cm_on("c1", "d1", "p", "u", "first"))
+            .unwrap();
+        w.app
+            .store
+            .put_comment(&cm_on("c2", "d2", "p", "u", "second"))
+            .unwrap();
         w.app.refresh();
         open_panel(&mut w);
         let id = box_id("reply", "d2");
@@ -683,34 +796,68 @@ mod tests {
         w.send(key_mod(Key::Enter, Modifiers::CTRL));
         let got = ops(&w);
         assert_eq!(got.len(), 1, "{got:?}");
-        let OpKind::CreateComment { parent, .. } = &got[0] else { panic!("{got:?}") };
+        let OpKind::CreateComment { parent, .. } = &got[0] else {
+            panic!("{got:?}")
+        };
         assert_eq!(*parent, CommentTarget::Discussion("d2".into()));
         let c = w.app.store.comments_for("p").unwrap();
         let reply = c.iter().find(|c| c.id.starts_with("local-")).unwrap();
-        assert_eq!((reply.discussion_id.as_str(), plain_text(&reply.rich_text).as_str()), ("d2", "re"));
-        assert!(w.app.comments.as_ref().unwrap().replies.get("d2").is_none_or(String::is_empty), "its draft is cleared");
+        assert_eq!(
+            (
+                reply.discussion_id.as_str(),
+                plain_text(&reply.rich_text).as_str()
+            ),
+            ("d2", "re")
+        );
+        assert!(
+            w.app
+                .comments
+                .as_ref()
+                .unwrap()
+                .replies
+                .get("d2")
+                .is_none_or(String::is_empty),
+            "its draft is cleared"
+        );
     }
 
     #[test]
     fn row_badge_counts_cached_comments_and_a_click_opens_the_panel_on_the_row() {
         let mut w = Win::with_texts(&["a", "b"]);
         let store = &w.app.store;
-        store.put_comment(&cm_on("c1", "d1", "p-1", "u", "x")).unwrap();
-        store.put_comment(&cm_on("c2", "d1", "p-1", "u", "y")).unwrap();
+        store
+            .put_comment(&cm_on("c1", "d1", "p-1", "u", "x"))
+            .unwrap();
+        store
+            .put_comment(&cm_on("c2", "d1", "p-1", "u", "y"))
+            .unwrap();
         w.app.refresh();
         w.frames(vec![]);
         assert_eq!(w.app.comment_counts.get("p-1"), Some(&2));
         assert_eq!(w.app.comment_counts.get("p-0"), None);
         let id = Id::unique(("comments-badge", "p-1"));
         let r = w.ctx.read_response(id).expect("the badge was drawn").rect;
-        assert!(w.ctx.read_response(Id::unique(("comments-badge", "p-0"))).is_none(), "no badge without comments");
+        assert!(
+            w.ctx
+                .read_response(Id::unique(("comments-badge", "p-0")))
+                .is_none(),
+            "no badge without comments"
+        );
         let pos = r.center();
-        let ev = |pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        let ev = |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
         w.frames(vec![Event::PointerMoved(pos)]);
         w.frames(vec![ev(true)]);
         w.frames(vec![ev(false)]);
         w.frames(vec![]);
-        assert_eq!(w.app.comments.as_ref().and_then(|p| p.block.as_deref()), Some("p-1"));
+        assert_eq!(
+            w.app.comments.as_ref().and_then(|p| p.block.as_deref()),
+            Some("p-1")
+        );
         assert_eq!(w.app.comments.as_ref().unwrap().block_comments.len(), 2);
         assert!(w.cmds().contains(&Cmd::PullComments { id: "p-1".into() }));
     }
@@ -719,16 +866,28 @@ mod tests {
     fn edit_and_delete_queue_ops_and_undo_takes_them_back() {
         let mut w = Win::with_texts(&["a"]);
         w.app.me = Some("bot".into());
-        w.app.store.put_comment(&cm_on("c1", "d1", "p", "bot", "old")).unwrap();
-        w.app.store.put_comment(&cm_on("c2", "d2", "p", "bot", "gone")).unwrap();
+        w.app
+            .store
+            .put_comment(&cm_on("c1", "d1", "p", "bot", "old"))
+            .unwrap();
+        w.app
+            .store
+            .put_comment(&cm_on("c2", "d2", "p", "bot", "gone"))
+            .unwrap();
         w.app.refresh();
         open_panel(&mut w);
         w.app.sent.clear(); // the fetches are answered; undo waits for them
         w.app.apply(Action::CommentSave("c1".into(), "new".into()));
         w.app.apply(Action::CommentDelete("c2".into()));
         let got = ops(&w);
-        assert!(matches!(&got[0], OpKind::UpdateComment { comment_id, .. } if comment_id == "c1"), "{got:?}");
-        assert!(matches!(&got[1], OpKind::DeleteComment { comment_id } if comment_id == "c2"), "{got:?}");
+        assert!(
+            matches!(&got[0], OpKind::UpdateComment { comment_id, .. } if comment_id == "c1"),
+            "{got:?}"
+        );
+        assert!(
+            matches!(&got[1], OpKind::DeleteComment { comment_id } if comment_id == "c2"),
+            "{got:?}"
+        );
         assert_eq!(w.app.counts[0], 2);
         let shown = &w.app.comments.as_ref().unwrap().page_comments;
         assert_eq!(shown.len(), 1);
@@ -743,26 +902,54 @@ mod tests {
         w.app.sent.push_back(Cmd::Push);
         w.app.apply(Action::CommentDelete("c2".into()));
         assert!(ops(&w).is_empty());
-        assert!(w.app.last_error.as_deref().is_some_and(|e| e.contains("paused")));
+        assert!(w
+            .app
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("paused")));
     }
 
     #[test]
     fn failed_comment_ops_are_listed_and_discard_drops_the_unpushed_comment() {
         let mut w = Win::with_texts(&["a"]);
         open_panel(&mut w);
-        w.app.apply(Action::CommentSend(CommentTarget::Block("p-0".into()), "oops".into()));
+        w.app.apply(Action::CommentSend(
+            CommentTarget::Block("p-0".into()),
+            "oops".into(),
+        ));
         let op = w.app.store.queued_ops().unwrap()[0].id;
-        w.app.store.mark_op(op, notion_core::ops::OpStatus::Failed, Some("403 restricted_resource")).unwrap();
+        w.app
+            .store
+            .mark_op(
+                op,
+                notion_core::ops::OpStatus::Failed,
+                Some("403 restricted_resource"),
+            )
+            .unwrap();
         w.app.refresh();
         assert_eq!(w.app.counts, [0, 0, 1]);
         let p = &w.app.problems[0];
-        assert_eq!((p.kind, p.label.as_str(), p.block.as_str(), p.page.as_deref()), ("comment", "oops", "p-0", Some("p")));
+        assert_eq!(
+            (
+                p.kind,
+                p.label.as_str(),
+                p.block.as_str(),
+                p.page.as_deref()
+            ),
+            ("comment", "oops", "p-0", Some("p"))
+        );
         assert!(w.app.problem_ids.contains("p-0"));
         w.cmds();
         w.app.apply(Action::Discard(op));
-        assert!(w.app.store.comments_for("p-0").unwrap().is_empty(), "no ghost comment");
+        assert!(
+            w.app.store.comments_for("p-0").unwrap().is_empty(),
+            "no ghost comment"
+        );
         assert!(w.app.problems.is_empty());
-        assert!(w.cmds().contains(&Cmd::Pull { id: "p".into(), force: true }));
+        assert!(w.cmds().contains(&Cmd::Pull {
+            id: "p".into(),
+            force: true
+        }));
     }
 
     #[test]
@@ -770,7 +957,10 @@ mod tests {
         let mut w = Win::with_texts(&["a"]);
         open_panel(&mut w);
         w.cmds();
-        w.app.store.put_comment(&cm_on("c1", "d1", "p", "bot", "x")).unwrap();
+        w.app
+            .store
+            .put_comment(&cm_on("c1", "d1", "p", "bot", "x"))
+            .unwrap();
         w.answer(crate::worker::Event::CommentsPulled);
         w.answer(crate::worker::Event::Me("bot".into()));
         assert_eq!(w.app.me.as_deref(), Some("bot"));

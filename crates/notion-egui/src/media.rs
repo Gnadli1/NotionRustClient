@@ -7,7 +7,9 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use eframe::egui::{self, Color32, ColorImage, Context, Rect, RichText, TextureHandle, TextureOptions, Ui};
+use eframe::egui::{
+    self, Color32, ColorImage, Context, Rect, RichText, TextureHandle, TextureOptions, Ui,
+};
 use notion_core::media::{self, Owner};
 use notion_core::store::Store;
 
@@ -72,7 +74,13 @@ impl Inner {
     fn evict(&mut self) {
         // ponytail: scan per new texture; fine for a few hundred slots
         let now = self.pass;
-        while self.slots.values().filter(|(_, s)| matches!(s, Slot::Ready(..))).count() > MAX_TEX {
+        while self
+            .slots
+            .values()
+            .filter(|(_, s)| matches!(s, Slot::Ready(..)))
+            .count()
+            > MAX_TEX
+        {
             let old = self
                 .slots
                 .iter()
@@ -105,16 +113,27 @@ fn decode(path: &Path, max: u32) -> Result<ColorImage, String> {
     if path.ends_with("panic.png") {
         panic!("test: decoder panicked");
     }
-    let mut reader = image::ImageReader::open(path).and_then(|r| r.with_guessed_format()).map_err(|e| e.to_string())?;
+    let mut reader = image::ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| e.to_string())?;
     let mut lim = image::Limits::default();
     lim.max_image_width = Some(16384);
     lim.max_image_height = Some(16384);
     lim.max_alloc = Some(256 * 1024 * 1024);
     reader.limits(lim);
-    let img = reader.decode().map_err(|e| format!("can't show this picture: {e}"))?;
-    let img = if img.width().max(img.height()) > max { img.thumbnail(max, max) } else { img };
+    let img = reader
+        .decode()
+        .map_err(|e| format!("can't show this picture: {e}"))?;
+    let img = if img.width().max(img.height()) > max {
+        img.thumbnail(max, max)
+    } else {
+        img
+    };
     let rgba = img.to_rgba8();
-    Ok(ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()))
+    Ok(ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    ))
 }
 
 impl Media {
@@ -125,7 +144,9 @@ impl Media {
     /// Starts queued decodes while fewer than [`MAX_DECODE`] threads run.
     fn spawn_next(&self, g: &mut Inner, ctx: &Context) {
         while g.running < MAX_DECODE {
-            let Some((id, path, max)) = g.queue.pop_front() else { break };
+            let Some((id, path, max)) = g.queue.pop_front() else {
+                break;
+            };
             g.running += 1;
             #[cfg(test)]
             {
@@ -134,9 +155,12 @@ impl Media {
             let (me, ctx) = (self.clone(), ctx.clone());
             std::thread::spawn(move || {
                 // a panic in the image crate must still free this decode thread's place
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(&path, max)))
-                    .unwrap_or_else(|_| Err("can't show this picture".into()))
-                    .map(|img| ctx.load_texture(format!("media-{id}"), img, TextureOptions::LINEAR));
+                let r =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(&path, max)))
+                        .unwrap_or_else(|_| Err("can't show this picture".into()))
+                        .map(|img| {
+                            ctx.load_texture(format!("media-{id}"), img, TextureOptions::LINEAR)
+                        });
                 let mut g = me.lock();
                 g.running -= 1;
                 match r {
@@ -166,7 +190,9 @@ impl Media {
         if let Some(s) = self.lock().srcs.get(&k) {
             return s.clone();
         }
-        let s = media::current(store, id, if page { Owner::Page } else { Owner::Block }).ok().map(|s| s.key);
+        let s = media::current(store, id, if page { Owner::Page } else { Owner::Block })
+            .ok()
+            .map(|s| s.key);
         self.lock().srcs.insert(k, s.clone());
         s
     }
@@ -180,14 +206,21 @@ impl Media {
     pub fn retry_failed(&self) {
         let mut g = self.lock();
         let tries = std::mem::take(&mut g.tries);
-        g.slots.retain(|id, (_, s)| !matches!(s, Slot::Failed(_)) || tries.get(id).copied().unwrap_or(0) >= MAX_TRIES);
+        g.slots.retain(|id, (_, s)| {
+            !matches!(s, Slot::Failed(_)) || tries.get(id).copied().unwrap_or(0) >= MAX_TRIES
+        });
         g.tries = tries;
     }
 
     /// The worker is gone: what was asked will never answer.
     pub fn worker_stopped(&self) {
         let mut g = self.lock();
-        let ids: Vec<String> = g.slots.iter().filter(|(_, (_, s))| matches!(s, Slot::Sent(_))).map(|(id, _)| id.clone()).collect();
+        let ids: Vec<String> = g
+            .slots
+            .iter()
+            .filter(|(_, (_, s))| matches!(s, Slot::Sent(_)))
+            .map(|(id, _)| id.clone())
+            .collect();
         for id in ids {
             g.fail(&id, "sync worker stopped".into());
         }
@@ -226,11 +259,17 @@ impl Media {
         let tick = ctx.cumulative_pass_nr();
         g.pass = tick;
         for (done_id, res) in std::mem::take(&mut g.done) {
-            let Some((_, slot)) = g.slots.get_mut(&done_id) else { continue };
+            let Some((_, slot)) = g.slots.get_mut(&done_id) else {
+                continue;
+            };
             match res {
                 Err(e) => g.fail(&done_id, e),
                 Ok(path) => {
-                    let max = if matches!(slot, Slot::Sent(true)) { THUMB_SIDE } else { MAX_SIDE };
+                    let max = if matches!(slot, Slot::Sent(true)) {
+                        THUMB_SIDE
+                    } else {
+                        MAX_SIDE
+                    };
                     *slot = Slot::Decoding;
                     g.queue.push_back((done_id, path, max));
                 }
@@ -247,7 +286,8 @@ impl Media {
                 _ => Shown::Loading,
             };
         }
-        g.slots.insert(id.to_string(), (src.to_string(), Slot::Want(page)));
+        g.slots
+            .insert(id.to_string(), (src.to_string(), Slot::Want(page)));
         g.wants.push_back(id.to_string());
         // `media_pump` runs next frame: make sure there is one
         ctx.request_repaint();
@@ -268,7 +308,8 @@ pub(crate) fn block_image(ui: &mut Ui, shown: &Shown, grey: Color32) {
         Shown::Tex(t) => {
             let s = t.size_vec2();
             let k = (ui.available_width() / s.x).min(600.0 / s.y).min(1.0);
-            ui.image((t.id(), s * k));
+            ui.add_space(2.0);
+            ui.add(egui::Image::new((t.id(), s * k)).corner_radius(6.0));
         }
     }
 }
@@ -276,9 +317,19 @@ pub(crate) fn block_image(ui: &mut Ui, shown: &Shown, grey: Color32) {
 /// `tex` filling `rect`, cropped to its aspect from the centre.
 pub(crate) fn paint_cover(ui: &Ui, tex: &TextureHandle, rect: Rect, rounding: f32) {
     let (ra, ia) = (rect.aspect_ratio(), tex.aspect_ratio());
-    let (fx, fy) = if ia > ra { (ra / ia, 1.0) } else { (1.0, ia / ra) };
-    let uv = Rect::from_min_max(egui::pos2((1.0 - fx) / 2.0, (1.0 - fy) / 2.0), egui::pos2((1.0 + fx) / 2.0, (1.0 + fy) / 2.0));
-    egui::Image::new((tex.id(), rect.size())).uv(uv).corner_radius(rounding).paint_at(ui, rect);
+    let (fx, fy) = if ia > ra {
+        (ra / ia, 1.0)
+    } else {
+        (1.0, ia / ra)
+    };
+    let uv = Rect::from_min_max(
+        egui::pos2((1.0 - fx) / 2.0, (1.0 - fy) / 2.0),
+        egui::pos2((1.0 + fx) / 2.0, (1.0 + fy) / 2.0),
+    );
+    egui::Image::new((tex.id(), rect.size()))
+        .uv(uv)
+        .corner_radius(rounding)
+        .paint_at(ui, rect);
 }
 
 #[cfg(test)]
@@ -289,7 +340,9 @@ mod tests {
     fn one_request_per_picture_then_one_decode() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("a.png");
-        image::RgbaImage::from_pixel(4, 2, image::Rgba([255, 0, 0, 255])).save(&f).unwrap();
+        image::RgbaImage::from_pixel(4, 2, image::Rgba([255, 0, 0, 255]))
+            .save(&f)
+            .unwrap();
         let (m, ctx) = (Media::default(), Context::default());
         assert!(matches!(m.show(&ctx, "b", false, "k"), Shown::Loading));
         assert!(matches!(m.show(&ctx, "b", false, "k"), Shown::Loading));
@@ -300,7 +353,9 @@ mod tests {
         let tex = loop {
             match m.show(&ctx, "b", false, "k") {
                 Shown::Tex(t) => break t,
-                _ if t.elapsed().as_secs() < 5 => std::thread::sleep(std::time::Duration::from_millis(5)),
+                _ if t.elapsed().as_secs() < 5 => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
                 _ => panic!("never decoded"),
             }
         };
@@ -328,7 +383,9 @@ mod tests {
             match m.show(ctx, id, false, key) {
                 Shown::Tex(t) => return t,
                 Shown::Failed(e) => panic!("{e}"),
-                _ if t.elapsed().as_secs() < 5 => std::thread::sleep(std::time::Duration::from_millis(5)),
+                _ if t.elapsed().as_secs() < 5 => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
                 _ => panic!("never decoded"),
             }
         }
@@ -340,13 +397,20 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let px = image::RgbImage::from_pixel(6, 3, image::Rgb([10, 200, 30]));
         let jpg = d.path().join("j.bin"); // no telling extension: sniffed
-        image::codecs::jpeg::JpegEncoder::new(std::fs::File::create(&jpg).unwrap()).encode_image(&px).unwrap();
+        image::codecs::jpeg::JpegEncoder::new(std::fs::File::create(&jpg).unwrap())
+            .encode_image(&px)
+            .unwrap();
         let webp = d.path().join("w");
         image::codecs::webp::WebPEncoder::new_lossless(std::fs::File::create(&webp).unwrap())
             .write_image(px.as_raw(), 6, 3, image::ExtendedColorType::Rgb8)
             .unwrap();
         for f in [jpg, webp] {
-            assert_eq!(decode(&f, MAX_SIDE).unwrap().size, [6, 3], "{}", f.display());
+            assert_eq!(
+                decode(&f, MAX_SIDE).unwrap().size,
+                [6, 3],
+                "{}",
+                f.display()
+            );
         }
     }
 
@@ -354,7 +418,9 @@ mod tests {
     fn big_pictures_shrink_to_2048_and_garbage_fails_politely() {
         let d = tempfile::tempdir().unwrap();
         let big = d.path().join("big.png");
-        image::RgbaImage::from_pixel(4096, 8, image::Rgba([1, 2, 3, 255])).save(&big).unwrap();
+        image::RgbaImage::from_pixel(4096, 8, image::Rgba([1, 2, 3, 255]))
+            .save(&big)
+            .unwrap();
         let s = decode(&big, MAX_SIDE).unwrap().size;
         assert_eq!(s[0], 2048);
         assert!(s[1] >= 1);
@@ -368,7 +434,9 @@ mod tests {
     fn a_decoded_picture_is_reused_for_the_same_key_and_downloads_are_bounded() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("a.png");
-        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255])).save(&f).unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]))
+            .save(&f)
+            .unwrap();
         let (m, ctx) = (Media::default(), Context::default());
         for i in 0..5 {
             m.show(&ctx, &format!("b{i}"), false, "k");
@@ -407,7 +475,9 @@ mod tests {
         let (m, ctx) = (Media::default(), Context::default());
         let hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let h = hit.clone();
-        ctx.set_request_repaint_callback(move |_| h.store(true, std::sync::atomic::Ordering::Relaxed));
+        ctx.set_request_repaint_callback(move |_| {
+            h.store(true, std::sync::atomic::Ordering::Relaxed)
+        });
         m.show(&ctx, "b", false, "k");
         assert!(hit.load(std::sync::atomic::Ordering::Relaxed));
     }
@@ -416,10 +486,14 @@ mod tests {
     fn covers_decode_small_and_oversized_headers_are_refused() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("c.png");
-        image::RgbaImage::from_pixel(2000, 10, image::Rgba([1, 2, 3, 255])).save(&f).unwrap();
+        image::RgbaImage::from_pixel(2000, 10, image::Rgba([1, 2, 3, 255]))
+            .save(&f)
+            .unwrap();
         assert_eq!(decode(&f, THUMB_SIDE).unwrap().size[0], 512);
         let wide = d.path().join("w.png");
-        image::RgbaImage::from_pixel(20000, 1, image::Rgba([1, 2, 3, 255])).save(&wide).unwrap();
+        image::RgbaImage::from_pixel(20000, 1, image::Rgba([1, 2, 3, 255]))
+            .save(&wide)
+            .unwrap();
         assert!(decode(&wide, MAX_SIDE).unwrap_err().contains("can't show"));
     }
 
@@ -427,7 +501,9 @@ mod tests {
     fn textures_are_capped_least_recently_shown_first_and_decodes_bounded() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("a.png");
-        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255])).save(&f).unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]))
+            .save(&f)
+            .unwrap();
         let (m, ctx) = (Media::default(), Context::default());
         for i in 0..=MAX_TEX {
             next_pass(&ctx);
@@ -439,7 +515,11 @@ mod tests {
             let _ = wait_tex(&m, &ctx, &id, "k");
         }
         let g = m.lock();
-        let ready = g.slots.values().filter(|(_, s)| matches!(s, Slot::Ready(..))).count();
+        let ready = g
+            .slots
+            .values()
+            .filter(|(_, s)| matches!(s, Slot::Ready(..)))
+            .count();
         assert_eq!(ready, MAX_TEX);
         assert!(!g.slots.contains_key("b0") && g.slots.contains_key(&format!("b{MAX_TEX}")));
         assert!(g.peak <= MAX_DECODE);
@@ -462,7 +542,9 @@ mod tests {
     fn more_pictures_on_screen_than_the_cap_are_all_kept_and_settle() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("a.png");
-        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255])).save(&f).unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]))
+            .save(&f)
+            .unwrap();
         let (m, ctx) = (Media::default(), Context::default());
         let ids: Vec<String> = (0..MAX_TEX + 5).map(|i| format!("g{i}")).collect();
         for id in &ids {
@@ -478,7 +560,10 @@ mod tests {
         for _ in 0..3 {
             next_pass(&ctx);
             for id in &ids {
-                assert!(matches!(m.show(&ctx, id, true, "k"), Shown::Tex(_)), "{id} was evicted while on screen");
+                assert!(
+                    matches!(m.show(&ctx, id, true, "k"), Shown::Tex(_)),
+                    "{id} was evicted while on screen"
+                );
             }
             assert!(m.take_wants(usize::MAX).is_empty());
         }
@@ -486,7 +571,9 @@ mod tests {
 
     /// Ends one egui pass (the LRU clock), discarding its texture changes.
     fn next_pass(ctx: &Context) {
-        ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
     }
 
     fn wait_tex_page(m: &Media, ctx: &Context, id: &str) -> TextureHandle {
@@ -495,7 +582,9 @@ mod tests {
             match m.show(ctx, id, true, "k") {
                 Shown::Tex(t) => return t,
                 Shown::Failed(e) => panic!("{e}"),
-                _ if t.elapsed().as_secs() < 5 => std::thread::sleep(std::time::Duration::from_millis(5)),
+                _ if t.elapsed().as_secs() < 5 => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
                 _ => panic!("never decoded"),
             }
         }
@@ -507,7 +596,9 @@ mod tests {
         let bad = d.path().join("panic.png");
         std::fs::write(&bad, b"x").unwrap();
         let good = d.path().join("ok.png");
-        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255])).save(&good).unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]))
+            .save(&good)
+            .unwrap();
         let (m, ctx) = (Media::default(), Context::default());
         for i in 0..MAX_DECODE + 1 {
             let id = format!("p{i}");
@@ -519,7 +610,9 @@ mod tests {
         m.take_wants(1);
         m.downloaded("ok".into(), Ok(good));
         let _ = wait_tex(&m, &ctx, "ok", "k");
-        assert!(matches!(m.show(&ctx, "p0", false, "k"), Shown::Failed(e) if e.contains("can't show")));
+        assert!(
+            matches!(m.show(&ctx, "p0", false, "k"), Shown::Failed(e) if e.contains("can't show"))
+        );
         assert_eq!(m.lock().running, 0);
     }
 
@@ -542,7 +635,10 @@ mod tests {
         m.downloaded("b".into(), Err("offline".into()));
         assert!(matches!(m.show(&ctx, "b", false, "k"), Shown::Failed(_)));
         m.retry_failed();
-        assert!(matches!(m.show(&ctx, "b", false, "k"), Shown::Failed(_)), "two failures: no third try");
+        assert!(
+            matches!(m.show(&ctx, "b", false, "k"), Shown::Failed(_)),
+            "two failures: no third try"
+        );
     }
 
     #[test]
@@ -551,6 +647,8 @@ mod tests {
         m.show(&ctx, "b", false, "k");
         m.take_wants(1);
         m.worker_stopped();
-        assert!(matches!(m.show(&ctx, "b", false, "k"), Shown::Failed(e) if e == "sync worker stopped"));
+        assert!(
+            matches!(m.show(&ctx, "b", false, "k"), Shown::Failed(e) if e == "sync worker stopped")
+        );
     }
 }

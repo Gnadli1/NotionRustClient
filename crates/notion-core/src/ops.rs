@@ -98,8 +98,9 @@ impl OpKind {
             | OpKind::MovePage { page_id, .. } => page_id,
             OpKind::CreatePage { local_id, .. } => local_id,
             OpKind::CreateComment { parent, .. } => parent.id(),
-            OpKind::UpdateComment { comment_id, .. }
-            | OpKind::DeleteComment { comment_id } => comment_id,
+            OpKind::UpdateComment { comment_id, .. } | OpKind::DeleteComment { comment_id } => {
+                comment_id
+            }
         }
     }
 }

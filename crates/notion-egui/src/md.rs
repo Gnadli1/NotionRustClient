@@ -29,13 +29,26 @@ pub struct Style {
 }
 
 /// Registered in `main::setup_fonts` (falls back to the normal face).
+/// Semibold: Markdown bold and the headings.
 pub fn bold_family() -> FontFamily {
     FontFamily::Name("bold".into())
+}
+
+/// The page title's heavier face (bold rather than semibold).
+pub fn title_family() -> FontFamily {
+    FontFamily::Name("title".into())
+}
+
+/// The serif face of equations (falls back to the normal face).
+pub fn math_family() -> FontFamily {
+    FontFamily::Name("math".into())
 }
 
 pub fn format(size: f32, s: Style) -> TextFormat {
     let (family, size) = if s.code {
         (FontFamily::Monospace, size * 0.9)
+    } else if s.math {
+        (math_family(), size * 1.06)
     } else if s.bold {
         (bold_family(), size)
     } else {
@@ -43,6 +56,14 @@ pub fn format(size: f32, s: Style) -> TextFormat {
     };
     TextFormat {
         font_id: FontId::new(size, family),
+        // Notion's reading rhythm: 1.5 for body text, tighter for headings.
+        line_height: Some(if size >= 20.0 {
+            size * 1.2
+        } else if size >= 17.0 {
+            size * 1.25
+        } else {
+            size * 1.5
+        }),
         color: if s.link { LINK } else { Color32::PLACEHOLDER },
         background: if s.code {
             CODE_BG
@@ -205,7 +226,16 @@ pub fn md_job(src: &str, size: f32, bold: bool, dim: Color32) -> LayoutJob {
             if let Some((label, end)) = mention_span(rest) {
                 put(&mut job, st, start, i, false);
                 put(&mut job, st, i, i + 2, true);
-                put(&mut job, Style { mention: true, ..st }, i + 2, i + label, false);
+                put(
+                    &mut job,
+                    Style {
+                        mention: true,
+                        ..st
+                    },
+                    i + 2,
+                    i + label,
+                    false,
+                );
                 put(&mut job, st, i + label, i + end, true);
                 i += end;
                 start = i;
@@ -294,7 +324,11 @@ mod tests {
         let p = parts(&job);
         let get = |t: &str| p.iter().find(|(s, _)| *s == t).unwrap().1;
         assert_eq!(get("x\\]y").background, MENTION_BG);
-        assert_eq!(get("x\\]y").font_id.family, bold_family(), "marks around it apply");
+        assert_eq!(
+            get("x\\]y").font_id.family,
+            bold_family(),
+            "marks around it apply"
+        );
         assert_eq!(get("@[").color, dim);
         // egui merges equal neighbours: the closing `**` joins it
         assert_eq!(get("](page:p1)**").color, dim);
@@ -328,18 +362,30 @@ mod tests {
             plain_text: plain.into(),
             href: None,
             annotations: Default::default(),
-            kind: RichTextKind::Mention(json!({ "type": "user", "user": { "object": "user", "id": id } })),
+            kind: RichTextKind::Mention(
+                json!({ "type": "user", "user": { "object": "user", "id": id } }),
+            ),
         }
     }
 
     #[test]
     fn a_user_mention_shows_the_cached_name_with_an_at_sign() {
-        let ada = User::from_value(&json!({ "object": "user", "id": "u1", "type": "person", "name": "Ada" })).unwrap();
+        let ada = User::from_value(
+            &json!({ "object": "user", "id": "u1", "type": "person", "name": "Ada" }),
+        )
+        .unwrap();
         let text = |r: RichText, us: &[User]| rich_job(&[r], 16.0, false, us).text;
-        assert_eq!(text(user_mention("@Old Name", "u1"), std::slice::from_ref(&ada)), "@Ada", "the cache is newer");
+        assert_eq!(
+            text(user_mention("@Old Name", "u1"), std::slice::from_ref(&ada)),
+            "@Ada",
+            "the cache is newer"
+        );
         // not cached: what the API (or our own token) said, with one "@"
         assert_eq!(text(user_mention("@Bob", "u2"), &[]), "@Bob");
-        assert_eq!(text(user_mention("Bob", "u2"), std::slice::from_ref(&ada)), "@Bob");
+        assert_eq!(
+            text(user_mention("Bob", "u2"), std::slice::from_ref(&ada)),
+            "@Bob"
+        );
         assert_eq!(text(user_mention("", "0123456789"), &[]), "@01234567");
         // other mentions are as they were
         let page = RichText {
@@ -348,6 +394,9 @@ mod tests {
         };
         assert_eq!(text(page, std::slice::from_ref(&ada)), "Home");
         let job = rich_job(&[user_mention("", "u1")], 16.0, false, &[]);
-        assert!(job.sections[0].format.background != Color32::TRANSPARENT, "the mention pill");
+        assert!(
+            job.sections[0].format.background != Color32::TRANSPARENT,
+            "the mention pill"
+        );
     }
 }

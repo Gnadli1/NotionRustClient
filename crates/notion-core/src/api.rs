@@ -1,15 +1,17 @@
 //! Async Notion REST client: rate limiting, retry on 429/529, pagination,
 //! recursive block fetch. The only module that talks HTTP.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use reqwest::{header::RETRY_AFTER, Method};
 use serde::de::DeserializeOwned;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Instant};
 
 use crate::model::{Block, BlockKind, Comment, DataSource, Page, SearchResult, User};
+use crate::private::{self, PrivateAuth, Records};
 use crate::{Error, Result};
 
 pub const NOTION_VERSION: &str = "2025-09-03";
@@ -84,6 +86,20 @@ pub struct Client {
     token: String,
     cfg: ClientConfig,
     limiter: Limiter,
+    /// Set for a browser-session (`token_v2`) client.
+    private: Option<PrivateAuth>,
+    private_base: String,
+    private_state: std::sync::Mutex<PrivateState>,
+}
+
+#[derive(Default)]
+struct PrivateState {
+    users: HashMap<String, User>,
+    /// collection id -> database (collection_view_page/collection_view) block id
+    database_for_collection: HashMap<String, String>,
+    views_for_collection: HashMap<String, Vec<String>>,
+    /// Short-lived browser-file cookie from `GET /f/refresh`.
+    file_token: Option<String>,
 }
 
 impl std::fmt::Debug for Client {
@@ -105,7 +121,42 @@ impl Client {
             token,
             limiter: Limiter::new(cfg.requests_per_sec, cfg.burst),
             cfg,
+            private: None,
+            private_base: private::DEFAULT_BASE.into(),
+            private_state: std::sync::Mutex::new(PrivateState::default()),
         }
+    }
+
+    /// A client for the private web API, authenticated by the browser's
+    /// `token_v2` cookie and scoped to one workspace.
+    pub fn new_private(auth: PrivateAuth, cfg: ClientConfig) -> Self {
+        let base = std::env::var("NOTION_PRIVATE_BASE")
+            .ok()
+            .filter(|b| b.starts_with("http"))
+            .unwrap_or_else(|| private::DEFAULT_BASE.to_string());
+        Self::new_private_at(base, auth, cfg)
+    }
+
+    /// [`Client::new_private`] with an explicit base URL (tests, or
+    /// `https://app.notion.com`).
+    pub fn new_private_at(base: impl Into<String>, auth: PrivateAuth, cfg: ClientConfig) -> Self {
+        assert!(
+            cfg.requests_per_sec.is_finite() && cfg.requests_per_sec > 0.0,
+            "requests_per_sec must be finite and > 0"
+        );
+        Client {
+            http: reqwest::Client::new(),
+            token: String::new(),
+            limiter: Limiter::new(cfg.requests_per_sec, cfg.burst),
+            cfg,
+            private: Some(auth),
+            private_base: base.into(),
+            private_state: std::sync::Mutex::new(PrivateState::default()),
+        }
+    }
+
+    pub fn is_private(&self) -> bool {
+        self.private.is_some()
     }
 
     pub fn from_env() -> Result<Self> {
@@ -115,17 +166,410 @@ impl Client {
         }
     }
 
+    // ------------------------------------------------------ private transport
+
+    async fn private_post(&self, endpoint: &str, body: Value) -> Result<Value> {
+        let auth = self
+            .private
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("not a browser-session client".into()))?;
+        let url = format!(
+            "{}/api/v3/{endpoint}",
+            self.private_base.trim_end_matches('/')
+        );
+        let mut last = None;
+        for attempt in 0..=self.cfg.max_retries {
+            self.limiter.acquire().await;
+            let mut req = self
+                .http
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                     (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+                )
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header("Cookie", format!("token_v2={}", auth.token_v2))
+                .header("x-notion-space-id", &auth.space_id)
+                .json(&body);
+            if let Some(user) = &auth.user_id {
+                req = req.header("x-notion-active-user-header", user);
+            }
+            let resp = req.send().await?;
+            let status = resp.status().as_u16();
+            let wait = Self::retry_after(&resp);
+            let text = resp.text().await?;
+            if (200..300).contains(&status) {
+                return Ok(serde_json::from_str(&text)?);
+            }
+            if status == 429 || status >= 500 {
+                last = Some(status);
+                if attempt < self.cfg.max_retries {
+                    let backoff = wait
+                        .unwrap_or_else(|| Duration::from_millis(400 * 2u64.pow(attempt.min(6))));
+                    sleep(backoff.min(self.cfg.max_backoff)).await;
+                    continue;
+                }
+                break;
+            }
+            let err: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            let code = err
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| err.get("error").and_then(Value::as_str))
+                .unwrap_or("private_api_error");
+            let message = err
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| err.get("error_description").and_then(Value::as_str))
+                .unwrap_or(&text);
+            return Err(Error::Api {
+                status,
+                code: code.to_string(),
+                message: message.to_string(),
+            });
+        }
+        let _ = last;
+        Err(Error::RetriesExhausted)
+    }
+
+    async fn private_records(&self, root: &str) -> Result<Records> {
+        let mut records = Records::default();
+        // A page chunk returns the page and its descendants (and discussions).
+        let mut cursor = json!({ "stack": [] });
+        let mut chunk = 0u32;
+        let mut first: Option<Result<Value>> = None;
+        loop {
+            let body = json!({
+                "pageId": root,
+                "limit": 100,
+                "cursor": cursor,
+                "chunkNumber": chunk,
+                "verticalColumns": false,
+            });
+            let resp = self.private_post("loadPageChunk", body).await;
+            match resp {
+                Ok(resp) => {
+                    if first.is_none() {
+                        first = Some(Ok(resp.clone()));
+                    }
+                    records.merge_response(&resp);
+                    let stack = resp
+                        .pointer("/cursor/stack")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    if stack.is_empty() {
+                        break;
+                    }
+                    cursor = resp["cursor"].clone();
+                    chunk += 1;
+                    if chunk > 200 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if first.is_none() {
+                        first = Some(Err(e));
+                    }
+                    break;
+                }
+            }
+        }
+        if !records.blocks.contains_key(root) {
+            // A block (not a page): fetch the record directly.
+            let resp = self
+                .private_post(
+                    "syncRecordValues",
+                    json!({ "requests": [{ "pointer": { "table": "block", "id": root },
+                                          "version": -1 }] }),
+                )
+                .await?;
+            records.merge_response(&resp);
+        } else if let Some(Err(e)) = first {
+            if !records.blocks.contains_key(root) {
+                return Err(e);
+            }
+        }
+        for _ in 0..20 {
+            let missing = records.missing_content(root);
+            if missing.is_empty() {
+                break;
+            }
+            let requests: Vec<Value> = missing
+                .iter()
+                .take(200)
+                .map(|id| json!({ "pointer": { "table": "block", "id": id }, "version": -1 }))
+                .collect();
+            let resp = self
+                .private_post("syncRecordValues", json!({ "requests": requests }))
+                .await?;
+            records.merge_response(&resp);
+        }
+        self.remember(&records);
+        Ok(records)
+    }
+
+    fn remember(&self, records: &Records) {
+        let mut state = self.private_state.lock().unwrap();
+        for user in records.users() {
+            state.users.insert(user.id.clone(), user);
+        }
+        for (id, block) in &records.blocks {
+            let Some(collection) = block.get("collection_id").and_then(Value::as_str) else {
+                continue;
+            };
+            state
+                .database_for_collection
+                .entry(collection.to_string())
+                .or_insert_with(|| id.clone());
+            let views: Vec<String> = block
+                .get("view_ids")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+            if !views.is_empty() {
+                state
+                    .views_for_collection
+                    .entry(collection.to_string())
+                    .or_insert(views);
+            }
+        }
+        let databases: Vec<(String, String)> = state
+            .database_for_collection
+            .iter()
+            .map(|(collection, database)| (collection.clone(), database.clone()))
+            .collect();
+        for view in records.views.values() {
+            let Some(parent) = view.get("parent_id").and_then(Value::as_str) else {
+                continue;
+            };
+            for (collection, database) in &databases {
+                if database == parent {
+                    if let Some(id) = view.get("id").and_then(Value::as_str) {
+                        let views = state
+                            .views_for_collection
+                            .entry(collection.clone())
+                            .or_default();
+                        if !views.iter().any(|v| v == id) {
+                            views.push(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn private_auth(&self) -> Result<&PrivateAuth> {
+        self.private
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("not a browser-session client".into()))
+    }
+
+    /// Returns the cookie Notion's file host needs for private images.
+    /// `GET /f/refresh` exchanges the API session for a `file_token` cookie,
+    /// so no browser cookies beyond `token_v2` are needed.
+    pub async fn file_token(&self) -> Result<String> {
+        if let Some(token) = self
+            .private_state
+            .lock()
+            .ok()
+            .and_then(|s| s.file_token.clone())
+        {
+            return Ok(token);
+        }
+        let auth = self.private_auth()?;
+        let url = format!("{}/f/refresh", self.private_base.trim_end_matches('/'));
+        let resp = self
+            .http
+            .get(url)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+            )
+            .header("Cookie", format!("token_v2={}", auth.token_v2))
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let cookies: Vec<String> = resp
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(str::to_string)
+            .collect();
+        if !(200..300).contains(&status) {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                status,
+                code: "file_token_failed".into(),
+                message: text,
+            });
+        }
+        let token = cookies.iter().find_map(|c| {
+            c.strip_prefix("file_token=")
+                .and_then(|v| v.split(';').next())
+                .map(str::to_string)
+        });
+        let Some(token) = token.filter(|t| !t.is_empty()) else {
+            return Err(Error::Invalid(
+                "Notion did not return a file token (the cookie may be expired)".into(),
+            ));
+        };
+        if let Ok(mut state) = self.private_state.lock() {
+            state.file_token = Some(token.clone());
+        }
+        Ok(token)
+    }
+
+    /// Drops the cached file token so the next image retries `/f/refresh`.
+    pub fn clear_file_token(&self) {
+        if let Ok(mut state) = self.private_state.lock() {
+            state.file_token = None;
+        }
+    }
+
+    async fn private_transact(&self, operations: Vec<Value>) -> Result<Value> {
+        let space = self.private_auth()?.space_id.clone();
+        let body = private::fanout(&space, operations.clone());
+        match self.private_post("saveTransactionsFanout", body).await {
+            Ok(v) => Ok(v),
+            // An older web client base lacks the fanout endpoint; the plain
+            // endpoint takes the same transactions. A 400 is a bad operation,
+            // so retrying it elsewhere would only hide the real error.
+            Err(Error::Api { status: 404, .. }) => {
+                self.private_post("saveTransactions", private::fanout(&space, operations))
+                    .await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn private_discussions(&self, records: &mut Records, block_id: &str) -> Result<()> {
+        let Some(rec) = records.blocks.get(block_id) else {
+            return Ok(());
+        };
+        let discussions: Vec<String> = rec
+            .get("discussions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        if discussions.is_empty() {
+            return Ok(());
+        }
+        let requests: Vec<Value> = discussions
+            .iter()
+            .map(|id| json!({ "pointer": { "table": "discussion", "id": id }, "version": -1 }))
+            .collect();
+        let resp = self
+            .private_post("syncRecordValues", json!({ "requests": requests }))
+            .await?;
+        records.merge_response(&resp);
+        let comment_ids: Vec<String> = discussions
+            .iter()
+            .filter_map(|id| records.discussions.get(id))
+            .flat_map(|d| {
+                d.get("comments")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        if comment_ids.is_empty() {
+            return Ok(());
+        }
+        let requests: Vec<Value> = comment_ids
+            .iter()
+            .map(|id| json!({ "pointer": { "table": "comment", "id": id }, "version": -1 }))
+            .collect();
+        let resp = self
+            .private_post("syncRecordValues", json!({ "requests": requests }))
+            .await?;
+        records.merge_response(&resp);
+        Ok(())
+    }
+
+    async fn private_record(&self, id: &str) -> Result<Value> {
+        let resp = self
+            .private_post(
+                "syncRecordValues",
+                json!({ "requests": [{ "pointer": { "table": "block", "id": id },
+                                      "version": -1 }] }),
+            )
+            .await?;
+        let mut records = Records::default();
+        records.merge_response(&resp);
+        records
+            .blocks
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Error::Invalid(format!("block {id} is not in the record map")))
+    }
+
+    fn private_user_id(&self) -> Option<String> {
+        self.private.as_ref().and_then(|a| a.user_id.clone())
+    }
+
+    fn private_space_id(&self) -> Result<String> {
+        Ok(self.private_auth()?.space_id.clone())
+    }
+
     pub async fn get_page(&self, id: &str) -> Result<Page> {
+        if self.is_private() {
+            let records = self.private_records(id).await?;
+            if let Some(rec) = records.blocks.get(id) {
+                if matches!(
+                    rec.get("type").and_then(Value::as_str),
+                    Some("collection_view_page" | "collection_view")
+                ) {
+                    // Make callers fall back to the database path, as they do
+                    // when the public API says this id is a database.
+                    return Err(Error::Api {
+                        status: 400,
+                        code: "validation_error".into(),
+                        message: "object is a database".into(),
+                    });
+                }
+            }
+            return records.page(id);
+        }
         self.call(Method::GET, &format!("/v1/pages/{id}"), None)
             .await
     }
 
     pub async fn get_block(&self, id: &str) -> Result<Block> {
+        if self.is_private() {
+            let resp = self
+                .private_post(
+                    "syncRecordValues",
+                    json!({ "requests": [{ "pointer": { "table": "block", "id": id },
+                                          "version": -1 }] }),
+                )
+                .await?;
+            let mut records = Records::default();
+            records.merge_response(&resp);
+            self.remember(&records);
+            return records.block(id);
+        }
         self.call(Method::GET, &format!("/v1/blocks/{id}"), None)
             .await
     }
 
     pub async fn block_children(&self, id: &str) -> Result<Vec<Block>> {
+        if self.is_private() {
+            let records = self.private_records(id).await?;
+            return records.children(id);
+        }
         self.paginate(&format!("/v1/blocks/{id}/children"), None)
             .await
     }
@@ -133,6 +577,14 @@ impl Client {
     /// Children of `id`, recursively. child_page / child_database blocks are
     /// leaves: their "children" are another page or database.
     pub async fn block_tree(&self, id: &str) -> Result<Vec<BlockNode>> {
+        if self.is_private() {
+            let records = self.private_records(id).await?;
+            let mut nodes = Vec::new();
+            for child in records.children(id)? {
+                nodes.push(self.private_node(&records, child)?);
+            }
+            return Ok(nodes);
+        }
         let mut nodes = Vec::new();
         for block in self.block_children(id).await? {
             let leaf = matches!(
@@ -149,12 +601,40 @@ impl Client {
         Ok(nodes)
     }
 
+    fn private_node(&self, records: &Records, block: Block) -> Result<BlockNode> {
+        let leaf = matches!(
+            block.kind,
+            BlockKind::ChildPage { .. } | BlockKind::ChildDatabase { .. }
+        );
+        let children = if block.has_children && !leaf {
+            records
+                .children(&block.id)?
+                .into_iter()
+                .map(|child| self.private_node(records, child))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        Ok(BlockNode { block, children })
+    }
+
     pub async fn append_children(
         &self,
         parent: &str,
         children: &[Block],
         after: Option<&str>,
     ) -> Result<Vec<Block>> {
+        if self.is_private() {
+            let mut out = Vec::new();
+            let mut after = after.map(str::to_string);
+            for child in children {
+                let body = child.kind.to_request_json()?;
+                let block = self.append_raw(parent, &body, after.as_deref()).await?;
+                after = Some(block.id.clone());
+                out.push(block);
+            }
+            return Ok(out);
+        }
         let children = children
             .iter()
             .map(|b| b.kind.to_request_json())
@@ -176,20 +656,128 @@ impl Client {
 
     /// Appends one request-shaped block (`{type, <type>: …}`) that
     /// `BlockKind` can't write, e.g. an image from a file upload.
-    pub async fn append_raw(&self, parent: &str, block: &Value, after: Option<&str>) -> Result<Block> {
+    pub async fn append_raw(
+        &self,
+        parent: &str,
+        block: &Value,
+        after: Option<&str>,
+    ) -> Result<Block> {
+        if self.is_private() {
+            let space = self.private_space_id()?;
+            let user = self.private_user_id();
+            let id = private::new_id();
+            let rec = private::block_record_from_official(
+                &id,
+                block,
+                parent,
+                "block",
+                &space,
+                user.as_deref(),
+            )?;
+            let mut ops = vec![private::set_op(&id, &space, json!([]), rec.clone())];
+            let args = match after {
+                Some(after) => json!({ "id": &id, "after": after }),
+                None => json!({ "id": &id }),
+            };
+            ops.push(private::list_op(
+                parent,
+                &space,
+                "content",
+                "listAfter",
+                args,
+            ));
+            self.private_transact(ops).await?;
+            let v = private::official_block(&rec)?;
+            return crate::model::block_from_json(v);
+        }
         let mut body = json!({ "children": [block] });
         if let Some(a) = after {
             body["after"] = json!(a);
         }
         let path = format!("/v1/blocks/{parent}/children");
         let resp = self.send(Method::PATCH, &path, &[], Some(&body)).await?;
-        results::<Block>(resp)?.into_iter().next().ok_or_else(|| Error::Invalid("Notion returned no block".into()))
+        results::<Block>(resp)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invalid("Notion returned no block".into()))
+    }
+
+    /// Signs an `attachment:<id>:<name>` URL from a private block/page record.
+    /// The signed URL is short-lived and must not be stored.
+    pub async fn signed_file_url(&self, block_id: &str, url: &str) -> Result<String> {
+        if !self.is_private() {
+            return Err(Error::Invalid(
+                "attachments need a browser-session client".into(),
+            ));
+        }
+        let resp = self
+            .private_post(
+                "getSignedFileUrls",
+                json!({
+                    "urls": [{
+                        "url": url,
+                        "permissionRecord": { "table": "block", "id": block_id },
+                    }]
+                }),
+            )
+            .await?;
+        resp.get("signedUrls")
+            .and_then(Value::as_array)
+            .and_then(|urls| urls.first())
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| Error::Invalid("Notion did not sign the file URL".into()))
     }
 
     /// Uploads a local file (single part, at most 20 MB) and returns the file
     /// upload id to attach to a block: create the upload, then send the bytes
     /// as multipart. Refuses a missing or too large file before any request.
     pub async fn upload_file(&self, path: &std::path::Path) -> Result<String> {
+        if self.is_private() {
+            let (filename, mime) = crate::media::check_upload(path)?;
+            use std::io::Read as _;
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .and_then(|f| f.take(crate::media::MAX_UPLOAD + 1).read_to_end(&mut bytes))
+                .map_err(|e| Error::Invalid(format!("cannot read {}: {e}", path.display())))?;
+            if bytes.len() as u64 > crate::media::MAX_UPLOAD {
+                return Err(Error::Invalid(format!(
+                    "{} is over the 20 MB upload limit",
+                    path.display()
+                )));
+            }
+            let created = self
+                .private_post(
+                    "getUploadFileUrl",
+                    json!({ "bucket": "secure", "name": filename, "contentType": mime }),
+                )
+                .await?;
+            let put_url = created
+                .get("signedPutUrl")
+                .or_else(|| created.get("signedUploadUrl"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Invalid("upload URL has no signed PUT URL".into()))?;
+            self.limiter.acquire().await;
+            let resp = self
+                .http
+                .put(put_url)
+                .header("Content-Type", mime)
+                .body(bytes)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(Error::Invalid(format!(
+                    "upload failed with HTTP {}",
+                    resp.status().as_u16()
+                )));
+            }
+            return Ok(created
+                .get("signedGetUrl")
+                .or_else(|| created.get("url"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Invalid("upload URL has no file URL".into()))?
+                .to_string());
+        }
         let (filename, mime) = crate::media::check_upload(path)?;
         use std::io::Read as _;
         let mut bytes = Vec::new();
@@ -197,7 +785,10 @@ impl Client {
             .and_then(|f| f.take(crate::media::MAX_UPLOAD + 1).read_to_end(&mut bytes))
             .map_err(|e| Error::Invalid(format!("cannot read {}: {e}", path.display())))?;
         if bytes.len() as u64 > crate::media::MAX_UPLOAD {
-            return Err(Error::Invalid(format!("{} is over the 20 MB upload limit", path.display())));
+            return Err(Error::Invalid(format!(
+                "{} is over the 20 MB upload limit",
+                path.display()
+            )));
         }
         let created = self
             .send(
@@ -207,23 +798,196 @@ impl Client {
                 Some(&json!({ "mode": "single_part", "filename": filename, "content_type": mime })),
             )
             .await?;
-        let id = created["id"].as_str().ok_or_else(|| Error::Invalid("file upload has no id".into()))?.to_string();
-        let part = FilePart { filename, mime, bytes };
-        self.send_with(Method::POST, &format!("/v1/file_uploads/{id}/send"), &[], None, Some(&part)).await?;
+        let id = created["id"]
+            .as_str()
+            .ok_or_else(|| Error::Invalid("file upload has no id".into()))?
+            .to_string();
+        let part = FilePart {
+            filename,
+            mime,
+            bytes,
+        };
+        self.send_with(
+            Method::POST,
+            &format!("/v1/file_uploads/{id}/send"),
+            &[],
+            None,
+            Some(&part),
+        )
+        .await?;
         Ok(id)
     }
 
     pub async fn update_block(&self, id: &str, body: &Value) -> Result<Block> {
+        if self.is_private() {
+            let space = self.private_space_id()?;
+            let user = self.private_user_id();
+            let current = self.private_record(id).await?;
+            let ptype = current.get("type").and_then(Value::as_str).unwrap_or("");
+            let mut ops = Vec::new();
+            if ptype == "table_row" {
+                let parent_id = current
+                    .get("parent_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let parent = self.private_record(parent_id).await?;
+                let columns: Vec<String> = parent
+                    .pointer("/format/table_block_column_order")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_else(|| {
+                        current
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .map(|o| o.keys().cloned().collect())
+                            .unwrap_or_default()
+                    });
+                let cells = body
+                    .pointer("/table_row/cells")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for (i, col) in columns.iter().enumerate() {
+                    if let Some(cell) = cells.get(i) {
+                        ops.push(private::set_op(
+                            id,
+                            &space,
+                            json!(["properties", col]),
+                            private::rich_text_to_private(cell),
+                        ));
+                    }
+                }
+            } else {
+                let parent_id = current
+                    .get("parent_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let parent_table = current
+                    .get("parent_table")
+                    .and_then(Value::as_str)
+                    .unwrap_or("block");
+                let rec = private::block_record_from_official(
+                    id,
+                    body,
+                    parent_id,
+                    parent_table,
+                    &space,
+                    user.as_deref(),
+                )?;
+                for (key, value) in rec
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flatten()
+                {
+                    ops.push(private::set_op(
+                        id,
+                        &space,
+                        json!(["properties", key]),
+                        value.clone(),
+                    ));
+                }
+                for (key, value) in rec
+                    .get("format")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flatten()
+                {
+                    ops.push(private::set_op(
+                        id,
+                        &space,
+                        json!(["format", key]),
+                        value.clone(),
+                    ));
+                }
+            }
+            if !ops.is_empty() {
+                self.private_transact(ops).await?;
+            }
+            return self.get_block(id).await;
+        }
         self.call(Method::PATCH, &format!("/v1/blocks/{id}"), Some(body))
             .await
     }
 
     pub async fn delete_block(&self, id: &str) -> Result<Block> {
+        if self.is_private() {
+            let space = self.private_space_id()?;
+            let current = self.private_record(id).await?;
+            let parent_id = current
+                .get("parent_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let parent_table = current
+                .get("parent_table")
+                .and_then(Value::as_str)
+                .unwrap_or("block");
+            let mut ops = vec![private::update_op(
+                id,
+                &space,
+                json!([]),
+                json!({ "alive": false }),
+            )];
+            if parent_table == "block" || parent_table == "page" {
+                ops.push(private::list_op(
+                    parent_id,
+                    &space,
+                    "content",
+                    "listRemove",
+                    json!({ "id": id }),
+                ));
+            }
+            self.private_transact(ops).await?;
+            return self.get_block(id).await;
+        }
         self.call(Method::DELETE, &format!("/v1/blocks/{id}"), None)
             .await
     }
 
     pub async fn update_page_properties(&self, id: &str, props: &Value) -> Result<Page> {
+        if self.is_private() {
+            let space = self.private_space_id()?;
+            let current = self.private_record(id).await?;
+            let parent_id = current
+                .get("parent_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let collection = (current.get("parent_table").and_then(Value::as_str)
+                == Some("collection"))
+            .then_some(parent_id.as_str());
+            let schema = match collection {
+                Some(collection) => self
+                    .private_collection_schema(collection)
+                    .await
+                    .unwrap_or_default(),
+                None => Map::new(),
+            };
+            let mut private_props = Map::new();
+            for (key, value) in props.as_object().into_iter().flatten() {
+                let entry = schema.get(key).cloned().or_else(|| {
+                    (key == "title" || value.get("title").is_some())
+                        .then(|| json!({ "id": "title", "type": "title" }))
+                });
+                let Some(entry) = entry else { continue };
+                private_props.insert(key.clone(), private::property_to_private(&entry, value));
+            }
+            if !private_props.is_empty() {
+                let ops = private_props
+                    .into_iter()
+                    .map(|(key, value)| {
+                        private::set_op(id, &space, json!(["properties", key]), value)
+                    })
+                    .collect();
+                self.private_transact(ops).await?;
+            }
+            return self.get_page(id).await;
+        }
         let body = json!({ "properties": props });
         self.call(Method::PATCH, &format!("/v1/pages/{id}"), Some(&body))
             .await
@@ -231,33 +995,374 @@ impl Client {
 
     /// `POST /v1/pages`. Raw: Notion may answer with just `{object, id}`.
     pub async fn create_page(&self, body: &Value) -> Result<Value> {
+        if self.is_private() {
+            let space = self.private_space_id()?;
+            let user = self.private_user_id();
+            let parent = body.get("parent").cloned().unwrap_or(Value::Null);
+            let parent_type = parent
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("page_id");
+            let (parent_id, parent_table) = match parent_type {
+                "page_id" => (
+                    parent
+                        .get("page_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    "block",
+                ),
+                "data_source_id" => (
+                    parent
+                        .get("data_source_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    "collection",
+                ),
+                other => {
+                    return Err(Error::Invalid(format!(
+                        "browser sessions cannot create a page under `{other}`"
+                    )))
+                }
+            };
+            let id = private::new_id();
+            let official_props = body.get("properties").cloned().unwrap_or_else(|| json!({}));
+            let schema = if parent_table == "collection" {
+                self.private_collection_schema(&parent_id)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                Map::new()
+            };
+            let mut props = Map::new();
+            if parent_table == "collection" {
+                for (key, entry) in &schema {
+                    if let Some(value) = official_props.get(key) {
+                        props.insert(key.clone(), private::property_to_private(entry, value));
+                    } else if entry.get("type").and_then(Value::as_str) == Some("title") {
+                        props.insert(key.clone(), json!([[""]]));
+                    }
+                }
+            } else {
+                let title = official_props
+                    .pointer("/title/title")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]));
+                props.insert("title".into(), private::rich_text_to_private(&title));
+            }
+            let now = private::now_ms();
+            let mut rec = json!({
+                "id": id,
+                "version": 1,
+                "type": "page",
+                "alive": true,
+                "parent_id": parent_id,
+                "parent_table": parent_table,
+                "space_id": space,
+                "content": [],
+                "properties": props,
+                "created_time": now,
+                "last_edited_time": now,
+                "created_by_id": user,
+                "created_by_table": "notion_user",
+                "last_edited_by_id": user,
+                "last_edited_by_table": "notion_user",
+            });
+            if let Some(icon) = body.get("icon") {
+                let icon = icon
+                    .get("emoji")
+                    .and_then(Value::as_str)
+                    .or_else(|| icon.pointer("/external/url").and_then(Value::as_str));
+                if let Some(icon) = icon {
+                    rec["format"] = json!({ "page_icon": icon });
+                }
+            }
+            let mut ops = vec![private::set_op(&id, &space, json!([]), rec.clone())];
+            if parent_table == "block" {
+                ops.push(private::list_op(
+                    &parent_id,
+                    &space,
+                    "content",
+                    "listAfter",
+                    json!({ "id": &id }),
+                ));
+            }
+            self.private_transact(ops).await?;
+            return Ok(json!({ "object": "page", "id": id }));
+        }
         self.send(Method::POST, "/v1/pages", &[], Some(body)).await
     }
 
     /// `PATCH /v1/pages/{id}` with `icon`, `cover`, `in_trash`, `is_locked`.
     pub async fn update_page(&self, id: &str, body: &Value) -> Result<Page> {
+        if self.is_private() {
+            let space = self.private_space_id()?;
+            let mut format = Map::new();
+            let mut update = Map::new();
+            if let Some(icon) = body.get("icon") {
+                let icon = icon
+                    .get("emoji")
+                    .and_then(Value::as_str)
+                    .or_else(|| icon.pointer("/external/url").and_then(Value::as_str));
+                format.insert("page_icon".into(), json!(icon));
+            }
+            if let Some(cover) = body.get("cover") {
+                let url = cover
+                    .pointer("/external/url")
+                    .and_then(Value::as_str)
+                    .or_else(|| cover.pointer("/file/url").and_then(Value::as_str));
+                format.insert("page_cover".into(), json!(url));
+            }
+            if let Some(locked) = body.get("is_locked").and_then(Value::as_bool) {
+                format.insert("block_locked".into(), json!(locked));
+            }
+            for key in ["in_trash", "archived"] {
+                if let Some(trashed) = body.get(key).and_then(Value::as_bool) {
+                    update.insert("alive".into(), json!(!trashed));
+                }
+            }
+            let mut ops = Vec::new();
+            for (key, value) in format {
+                ops.push(private::set_op(id, &space, json!(["format", key]), value));
+            }
+            if !update.is_empty() {
+                ops.push(private::update_op(
+                    id,
+                    &space,
+                    json!([]),
+                    Value::Object(update),
+                ));
+            }
+            if !ops.is_empty() {
+                self.private_transact(ops).await?;
+            }
+            return self.get_page(id).await;
+        }
         self.call(Method::PATCH, &format!("/v1/pages/{id}"), Some(body))
             .await
     }
 
     /// `POST /v1/pages/{id}/move` under the page `parent`.
     pub async fn move_page(&self, id: &str, parent: &str) -> Result<Value> {
+        if self.is_private() {
+            let space = self.private_space_id()?;
+            let current = self.private_record(id).await?;
+            let old_parent = current
+                .get("parent_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mut ops = Vec::new();
+            if !old_parent.is_empty() {
+                ops.push(private::list_op(
+                    old_parent,
+                    &space,
+                    "content",
+                    "listRemove",
+                    json!({ "id": id }),
+                ));
+            }
+            ops.push(private::update_op(
+                id,
+                &space,
+                json!([]),
+                json!({ "parent_id": parent, "parent_table": "block" }),
+            ));
+            ops.push(private::list_op(
+                parent,
+                &space,
+                "content",
+                "listAfter",
+                json!({ "id": id }),
+            ));
+            self.private_transact(ops).await?;
+            return Ok(json!({ "object": "page", "id": id }));
+        }
         let body = json!({ "parent": { "type": "page_id", "page_id": parent } });
-        self.send(Method::POST, &format!("/v1/pages/{id}/move"), &[], Some(&body))
-            .await
+        self.send(
+            Method::POST,
+            &format!("/v1/pages/{id}/move"),
+            &[],
+            Some(&body),
+        )
+        .await
+    }
+
+    async fn private_collection_schema(&self, collection_id: &str) -> Result<Map<String, Value>> {
+        let resp = self
+            .private_post(
+                "syncRecordValues",
+                json!({ "requests": [{ "pointer": { "table": "collection", "id": collection_id },
+                                      "version": -1 }] }),
+            )
+            .await?;
+        let mut records = Records::default();
+        records.merge_response(&resp);
+        let collection = records
+            .collections
+            .get(collection_id)
+            .ok_or_else(|| Error::Invalid(format!("collection {collection_id} not found")))?;
+        Ok(collection
+            .get("schema")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// `GET /v1/databases/{id}`: its `data_sources` are `[{id, name}]`. Raw.
     pub async fn get_database(&self, id: &str) -> Result<Value> {
-        self.send(Method::GET, &format!("/v1/databases/{id}"), &[], None).await
+        if self.is_private() {
+            let records = self.private_records(id).await?;
+            let rec = records
+                .blocks
+                .get(id)
+                .ok_or_else(|| Error::Invalid(format!("database {id} is not in the record map")))?;
+            let collection = rec
+                .get("collection_id")
+                .and_then(Value::as_str)
+                .unwrap_or(id)
+                .to_string();
+            let title = records.collection_title_rich(&collection);
+            let name = records
+                .collection_title(&collection)
+                .unwrap_or_else(|| "Database".into());
+            return Ok(json!({
+                "object": "database",
+                "id": id,
+                "title": title,
+                "data_sources": [{ "id": collection, "name": name }],
+                "last_edited_time": records
+                    .blocks
+                    .get(id)
+                    .and_then(|b| b.get("last_edited_time"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            }));
+        }
+        self.send(Method::GET, &format!("/v1/databases/{id}"), &[], None)
+            .await
     }
 
     pub async fn get_data_source(&self, id: &str) -> Result<DataSource> {
+        if self.is_private() {
+            let database = self
+                .private_state
+                .lock()
+                .unwrap()
+                .database_for_collection
+                .get(id)
+                .cloned();
+            let mut records = match database {
+                Some(database) => self.private_records(&database).await?,
+                None => Records::default(),
+            };
+            if !records.collections.contains_key(id) {
+                let resp = self
+                    .private_post(
+                        "syncRecordValues",
+                        json!({ "requests": [{ "pointer": { "table": "collection", "id": id },
+                                              "version": -1 }] }),
+                    )
+                    .await?;
+                records.merge_response(&resp);
+            }
+            return records.data_source(id);
+        }
         self.call(Method::GET, &format!("/v1/data_sources/{id}"), None)
             .await
     }
 
     pub async fn query_data_source(&self, id: &str, filter_sort: Value) -> Result<Vec<Page>> {
+        if self.is_private() {
+            let auth = self.private_auth()?.clone();
+            let (view, database) = {
+                let state = self.private_state.lock().unwrap();
+                (
+                    state
+                        .views_for_collection
+                        .get(id)
+                        .and_then(|v| v.first().cloned()),
+                    state.database_for_collection.get(id).cloned(),
+                )
+            };
+            let view = match view {
+                Some(view) => view,
+                None => {
+                    if let Some(database) = database {
+                        let _ = self.private_records(&database).await?;
+                    }
+                    self.private_state
+                        .lock()
+                        .unwrap()
+                        .views_for_collection
+                        .get(id)
+                        .and_then(|v| v.first().cloned())
+                        .ok_or_else(|| {
+                            Error::Invalid(format!(
+                                "no view found for collection {id}; open the database first"
+                            ))
+                        })?
+                }
+            };
+            let mut loader = json!({
+                "type": "reducer",
+                "reducers": { "collection_group_results": { "type": "results", "limit": 999 } },
+                "sort": [],
+                "filter": {},
+                "searchQuery": "",
+                "userTimeZone": "UTC",
+            });
+            if let Some(obj) = filter_sort.as_object() {
+                if let Some(sort) = obj.get("sorts") {
+                    loader["sort"] = sort.clone();
+                }
+                if let Some(filter) = obj.get("filter") {
+                    loader["filter"] = filter.clone();
+                }
+            }
+            let resp = self
+                .private_post(
+                    "queryCollection",
+                    json!({
+                        "collection": { "id": id, "spaceId": auth.space_id },
+                        "collectionView": { "id": view, "spaceId": auth.space_id },
+                        "source": { "id": id, "spaceId": auth.space_id, "type": "collection" },
+                        "loader": loader,
+                    }),
+                )
+                .await?;
+            let mut records = Records::default();
+            records.merge_response(&resp);
+            self.remember(&records);
+            let ids: Vec<String> = resp
+                .pointer("/result/reducerResults/collection_group_results/blockIds")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+            let ids = if ids.is_empty() {
+                records
+                    .blocks
+                    .values()
+                    .filter(|b| {
+                        b.get("parent_id").and_then(Value::as_str) == Some(id)
+                            && b.get("parent_table").and_then(Value::as_str) == Some("collection")
+                    })
+                    .filter_map(|b| b.get("id").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            } else {
+                ids
+            };
+            let mut pages = Vec::new();
+            for id in ids {
+                if let Ok(page) = records.page(&id) {
+                    pages.push(page);
+                }
+            }
+            return Ok(pages);
+        }
         let body = match filter_sort {
             Value::Null => json!({}),
             v @ Value::Object(_) => v,
@@ -272,17 +1377,106 @@ impl Client {
     /// need a newer Notion-Version; any error makes the callers fall back to
     /// local views.
     pub async fn list_views(&self, data_source_id: &str) -> Result<Vec<Value>> {
-        self.paginate_with("/v1/views", None, &[("data_source_id", data_source_id)]).await
+        if self.is_private() {
+            let views = self
+                .private_state
+                .lock()
+                .unwrap()
+                .views_for_collection
+                .get(data_source_id)
+                .cloned()
+                .unwrap_or_default();
+            if views.is_empty() {
+                return Ok(Vec::new());
+            }
+            let requests: Vec<Value> = views
+                .iter()
+                .map(|id| {
+                    json!({ "pointer": { "table": "collection_view", "id": id },
+                                  "version": -1 })
+                })
+                .collect();
+            let resp = self
+                .private_post("syncRecordValues", json!({ "requests": requests }))
+                .await?;
+            let mut records = Records::default();
+            records.merge_response(&resp);
+            self.remember(&records);
+            return Ok(records
+                .views
+                .values()
+                .filter_map(|v| {
+                    let id = v.get("id").and_then(Value::as_str)?;
+                    if !views.iter().any(|view| view == id) {
+                        return None;
+                    }
+                    Some(json!({
+                        "object": "view",
+                        "id": id,
+                        "name": v.get("name").cloned().unwrap_or(Value::Null),
+                        "type": v.get("type").and_then(Value::as_str).map(|t| match t {
+                            "table" | "gallery" | "list" | "board" | "calendar" | "timeline"
+                                | "form" | "chart" | "map" | "dashboard" => t,
+                            _ => "table",
+                        }).unwrap_or("table"),
+                        "created_time": v.get("created_time").cloned().unwrap_or(Value::Null),
+                        "last_edited_time": v.get("last_edited_time").cloned().unwrap_or(Value::Null),
+                    }))
+                })
+                .collect());
+        }
+        self.paginate_with("/v1/views", None, &[("data_source_id", data_source_id)])
+            .await
     }
 
     /// Unresolved comments on a page or block, all pages. Needs the
     /// integration's "read comments" capability (403 otherwise).
     pub async fn list_comments(&self, block_or_page_id: &str) -> Result<Vec<Comment>> {
+        if self.is_private() {
+            let mut records = self.private_records(block_or_page_id).await?;
+            self.private_discussions(&mut records, block_or_page_id)
+                .await?;
+            return Ok(records.comments_for(block_or_page_id));
+        }
         self.paginate(&format!("/v1/comments?block_id={block_or_page_id}"), None)
             .await
     }
 
     pub async fn get_comment(&self, id: &str) -> Result<Comment> {
+        if self.is_private() {
+            let resp = self
+                .private_post(
+                    "syncRecordValues",
+                    json!({ "requests": [{ "pointer": { "table": "comment", "id": id },
+                                          "version": -1 }] }),
+                )
+                .await?;
+            let mut records = Records::default();
+            records.merge_response(&resp);
+            let comment =
+                records.comments.get(id).cloned().ok_or_else(|| {
+                    Error::Invalid(format!("comment {id} is not in the record map"))
+                })?;
+            let discussion_id = comment
+                .get("parent_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let disc_resp = self
+                .private_post(
+                    "syncRecordValues",
+                    json!({ "requests": [{ "pointer": { "table": "discussion", "id": discussion_id },
+                                          "version": -1 }] }),
+                )
+                .await?;
+            records.merge_response(&disc_resp);
+            let discussion = records
+                .discussions
+                .get(&discussion_id)
+                .ok_or_else(|| Error::Invalid("discussion is missing".into()))?;
+            let v = private::comment_json(&records, &discussion_id, discussion, &comment)?;
+            return crate::model::comment_from_json(v);
+        }
         self.call(Method::GET, &format!("/v1/comments/{id}"), None)
             .await
     }
@@ -291,18 +1485,111 @@ impl Client {
     /// Returns the raw response: with insert-only capability Notion sends just
     /// `{object, id}`, which isn't a full [`Comment`].
     pub async fn create_comment(&self, body: &Value) -> Result<Value> {
-        self.send(Method::POST, "/v1/comments", &[], Some(body)).await
+        if self.is_private() {
+            let space = self.private_space_id()?;
+            let user = self.private_user_id().unwrap_or_else(|| "me".into());
+            let parent = body.get("parent").cloned().unwrap_or(Value::Null);
+            let block_id = parent
+                .get("page_id")
+                .or_else(|| parent.get("block_id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Invalid("comment has no page/block parent".into()))?;
+            let rich_text = body.get("rich_text").cloned().unwrap_or_else(|| json!([]));
+            let discussion_id = private::new_id();
+            let comment_id = private::new_id();
+            let now = private::now_ms();
+            let discussion = json!({
+                "id": discussion_id,
+                "version": 1,
+                "parent_id": block_id,
+                "parent_table": "block",
+                "resolved": false,
+                "alive": true,
+                "comments": [comment_id],
+                "created_time": now,
+                "last_edited_time": now,
+            });
+            let comment = json!({
+                "id": comment_id,
+                "version": 1,
+                "alive": true,
+                "parent_id": discussion_id,
+                "parent_table": "discussion",
+                "created_by": user,
+                "created_time": now,
+                "last_edited_time": now,
+                "text": private::rich_text_to_private(&rich_text),
+            });
+            let ops = vec![
+                private::set_op_table("discussion", &discussion_id, &space, json!([]), discussion),
+                private::set_op_table("comment", &comment_id, &space, json!([]), comment),
+                private::list_op(
+                    block_id,
+                    &space,
+                    "discussions",
+                    "listAfter",
+                    json!({ "id": discussion_id }),
+                ),
+            ];
+            self.private_transact(ops).await?;
+            return Ok(json!({
+                "object": "comment",
+                "id": comment_id,
+                "discussion_id": discussion_id,
+                "parent": { "type": "block_id", "block_id": block_id },
+                "created_time": crate::private::now_ms(),
+                "last_edited_time": crate::private::now_ms(),
+                "created_by": { "object": "user", "id": user },
+                "rich_text": rich_text,
+                "resolved": false,
+            }));
+        }
+        self.send(Method::POST, "/v1/comments", &[], Some(body))
+            .await
     }
 
     /// Only comments created by this integration can be edited (else 404).
     pub async fn update_comment(&self, id: &str, rich_text: &Value) -> Result<Value> {
+        if self.is_private() {
+            let space = self.private_space_id()?;
+            self.private_transact(vec![private::update_op_table(
+                "comment",
+                id,
+                &space,
+                json!([]),
+                json!({ "text": private::rich_text_to_private(rich_text),
+                        "last_edited_time": private::now_ms() }),
+            )])
+            .await?;
+            return self
+                .get_comment(id)
+                .await
+                .map(|c| serde_json::to_value(c).unwrap_or(Value::Null));
+        }
         let body = json!({ "rich_text": rich_text });
-        self.send(Method::PATCH, &format!("/v1/comments/{id}"), &[], Some(&body))
-            .await
+        self.send(
+            Method::PATCH,
+            &format!("/v1/comments/{id}"),
+            &[],
+            Some(&body),
+        )
+        .await
     }
 
     /// Only comments created by this integration can be deleted (else 404).
     pub async fn delete_comment(&self, id: &str) -> Result<()> {
+        if self.is_private() {
+            let space = self.private_space_id()?;
+            self.private_transact(vec![private::update_op_table(
+                "comment",
+                id,
+                &space,
+                json!([]),
+                json!({ "alive": false }),
+            )])
+            .await?;
+            return Ok(());
+        }
         self.send(Method::DELETE, &format!("/v1/comments/{id}"), &[], None)
             .await
             .map(drop)
@@ -316,24 +1603,102 @@ impl Client {
     /// [`me`](Self::me) plus the person who owns the integration (`bot.owner`
     /// of type "user"; None if the workspace owns it): the "you" of the inbox.
     pub async fn me_identity(&self) -> Result<(String, Option<String>)> {
+        if self.is_private() {
+            let id = self
+                .private_auth()?
+                .user_id
+                .clone()
+                .unwrap_or_else(|| "me".to_string());
+            return Ok((id.clone(), Some(id)));
+        }
         let v = self.send(Method::GET, "/v1/users/me", &[], None).await?;
         let id = v["id"]
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| Error::Invalid("users/me has no id".into()))?;
         let owner = &v["bot"]["owner"];
-        let owner = (owner["type"] == "user").then(|| owner["user"]["id"].as_str().map(str::to_string)).flatten();
+        let owner = (owner["type"] == "user")
+            .then(|| owner["user"]["id"].as_str().map(str::to_string))
+            .flatten();
         Ok((id, owner))
     }
 
     /// Every workspace user, persons and bots, all pages. Needs the
     /// integration's "read user information" capability (403 otherwise).
     pub async fn list_users(&self) -> Result<Vec<User>> {
+        if self.is_private() {
+            return Ok(self
+                .private_state
+                .lock()
+                .unwrap()
+                .users
+                .values()
+                .cloned()
+                .collect());
+        }
         let raw: Vec<Value> = self.paginate("/v1/users", None).await?;
         Ok(raw.iter().filter_map(User::from_value).collect())
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
+        if self.is_private() {
+            let auth = self.private_auth()?.clone();
+            let body = json!({
+                "type": "BlocksInSpace",
+                "query": query,
+                "spaceId": auth.space_id,
+                "limit": 100,
+                "filters": {
+                    "isDeletedOnly": false,
+                    "excludeTemplates": false,
+                    "isNavigableOnly": false,
+                    "requireEditPermissions": false,
+                    "ancestors": [],
+                    "createdBy": [],
+                    "editedBy": [],
+                    "lastEditedTime": {},
+                    "createdTime": {},
+                },
+                "sort": { "field": "relevance" },
+                "source": "quick_find",
+            });
+            // `BlocksInSpace` with an empty query returns every page the account
+            // can reach, including pages in shared workspaces. `searchPagesWithParent`
+            // only lists the top-level pages of the current one, so it is the fallback.
+            let resp = match self.private_post("search", body).await {
+                Ok(resp) => resp,
+                Err(e) if query.trim().is_empty() => {
+                    match self
+                        .private_post(
+                            "searchPagesWithParent",
+                            json!({ "query": "", "parentId": auth.space_id,
+                                    "limit": 100, "spaceId": auth.space_id }),
+                        )
+                        .await
+                    {
+                        Ok(resp) => resp,
+                        Err(_) => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            let mut records = Records::default();
+            records.merge_response(&resp);
+            self.remember(&records);
+            let mut out = Vec::new();
+            for id in resp
+                .get("results")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.as_str().or_else(|| r.get("id").and_then(Value::as_str)))
+            {
+                if let Ok(result) = records.search_result(id) {
+                    out.push(result);
+                }
+            }
+            return Ok(out);
+        }
         self.paginate("/v1/search", Some(json!({ "query": query })))
             .await
     }
@@ -415,6 +1780,14 @@ impl Client {
 
     /// Single choke point: auth headers, rate limit, retry, error mapping.
     /// `file` makes the body multipart (field `file`) instead of JSON.
+    fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
+        resp.headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+    }
+
     async fn send_with(
         &self,
         method: Method,
@@ -681,7 +2054,9 @@ mod tests {
             .await;
         let cs = client(&s, 0).list_comments("p").await.unwrap();
         assert_eq!(
-            cs.iter().map(|c| (c.id.as_str(), c.created_by.as_str())).collect::<Vec<_>>(),
+            cs.iter()
+                .map(|c| (c.id.as_str(), c.created_by.as_str()))
+                .collect::<Vec<_>>(),
             [("c1", "bot"), ("c2", "bot")]
         );
         assert_eq!(cs[0].discussion_id, "d1");
@@ -702,9 +2077,12 @@ mod tests {
                 .and(path("/v1/comments"))
                 .and(header("Notion-Version", NOTION_VERSION))
                 .and(body_json(b))
-                .respond_with(ResponseTemplate::new(200).set_body_json(
-                    comment("new", "d", json!({"type": "page_id", "page_id": "p"}), "hi"),
-                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(comment(
+                    "new",
+                    "d",
+                    json!({"type": "page_id", "page_id": "p"}),
+                    "hi",
+                )))
                 .expect(1)
                 .mount(&s)
                 .await;
@@ -721,28 +2099,41 @@ mod tests {
         let pg = json!({"type": "block_id", "block_id": "b"});
         Mock::given(method("GET"))
             .and(path("/v1/comments/c1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(comment("c1", "d", pg.clone(), "x")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(comment(
+                "c1",
+                "d",
+                pg.clone(),
+                "x",
+            )))
             .mount(&s)
             .await;
         Mock::given(method("PATCH"))
             .and(path("/v1/comments/c1"))
-            .and(body_json(json!({"rich_text": [{"type": "text", "text": {"content": "y"}}]})))
+            .and(body_json(
+                json!({"rich_text": [{"type": "text", "text": {"content": "y"}}]}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(comment("c1", "d", pg, "y")))
             .expect(1)
             .mount(&s)
             .await;
         Mock::given(method("DELETE"))
             .and(path("/v1/comments/c1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"object": "comment", "id": "c1"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"object": "comment", "id": "c1"})),
+            )
             .expect(1)
             .mount(&s)
             .await;
         Mock::given(path("/v1/users/me"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"object": "user", "id": "bot-1"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"object": "user", "id": "bot-1"})),
+            )
             .mount(&s)
             .await;
         let c = client(&s, 0);
-        assert!(matches!(c.get_comment("c1").await.unwrap().parent, crate::model::Parent::Block(b) if b == "b"));
+        assert!(
+            matches!(c.get_comment("c1").await.unwrap().parent, crate::model::Parent::Block(b) if b == "b")
+        );
         let r = c
             .update_comment("c1", &json!([{"type": "text", "text": {"content": "y"}}]))
             .await
@@ -838,7 +2229,10 @@ mod tests {
         let v = client(&s, 0).list_views("ds").await.unwrap();
         assert_eq!(v[0]["type"], "board");
         let s = MockServer::start().await;
-        Mock::given(path("/v1/views")).respond_with(ResponseTemplate::new(404)).mount(&s).await;
+        Mock::given(path("/v1/views"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&s)
+            .await;
         assert!(client(&s, 0).list_views("ds").await.is_err());
     }
 
@@ -1014,13 +2408,25 @@ mod tests {
     #[tokio::test]
     async fn me_identity_reads_the_owner_only_when_a_person() {
         for (body, want) in [
-            (json!({"id": "b", "bot": {"owner": {"type": "user", "user": {"id": "u1"}}}}), Some("u1")),
-            (json!({"id": "b", "bot": {"owner": {"type": "workspace", "workspace": true}}}), None),
+            (
+                json!({"id": "b", "bot": {"owner": {"type": "user", "user": {"id": "u1"}}}}),
+                Some("u1"),
+            ),
+            (
+                json!({"id": "b", "bot": {"owner": {"type": "workspace", "workspace": true}}}),
+                None,
+            ),
             (json!({"id": "b"}), None),
         ] {
             let s = MockServer::start().await;
-            Mock::given(path("/v1/users/me")).respond_with(ResponseTemplate::new(200).set_body_json(body)).mount(&s).await;
-            assert_eq!(client(&s, 0).me_identity().await.unwrap(), ("b".to_string(), want.map(str::to_string)));
+            Mock::given(path("/v1/users/me"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&s)
+                .await;
+            assert_eq!(
+                client(&s, 0).me_identity().await.unwrap(),
+                ("b".to_string(), want.map(str::to_string))
+            );
         }
     }
 
@@ -1028,7 +2434,8 @@ mod tests {
     async fn list_users_paginates_and_parses_persons_and_bots() {
         let s = MockServer::start().await;
         let user = |id: &str, ty: &str, name: &str| {
-            let mut u = json!({"object": "user", "id": id, "type": ty, "name": name, "avatar_url": null});
+            let mut u =
+                json!({"object": "user", "id": id, "type": ty, "name": name, "avatar_url": null});
             if ty == "person" {
                 u["avatar_url"] = json!("https://img/a.png");
                 u["person"] = json!({"email": "a@x.org"});
@@ -1038,7 +2445,10 @@ mod tests {
         Mock::given(path("/v1/users"))
             .and(query_param("page_size", "100"))
             .and(query_param_is_missing("start_cursor"))
-            .respond_with(list(vec![user("u1", "person", "Ada"), user("b1", "bot", "Bot")], Some("c1")))
+            .respond_with(list(
+                vec![user("u1", "person", "Ada"), user("b1", "bot", "Bot")],
+                Some("c1"),
+            ))
             .expect(1)
             .mount(&s)
             .await;
@@ -1049,10 +2459,249 @@ mod tests {
             .mount(&s)
             .await;
         let us = client(&s, 0).list_users().await.unwrap();
-        let got: Vec<_> = us.iter().map(|u| (u.id.as_str(), u.kind.as_str(), u.name.as_str())).collect();
-        assert_eq!(got, [("u1", "person", "Ada"), ("b1", "bot", "Bot"), ("u2", "person", "Bo")]);
+        let got: Vec<_> = us
+            .iter()
+            .map(|u| (u.id.as_str(), u.kind.as_str(), u.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("u1", "person", "Ada"),
+                ("b1", "bot", "Bot"),
+                ("u2", "person", "Bo")
+            ]
+        );
         assert_eq!(us[0].email.as_deref(), Some("a@x.org"));
         assert_eq!(us[0].avatar_url.as_deref(), Some("https://img/a.png"));
         assert!(us[1].is_bot() && us[1].avatar_url.is_none() && us[1].email.is_none());
+    }
+}
+
+#[cfg(test)]
+mod private_api_tests {
+    use super::*;
+    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn auth() -> PrivateAuth {
+        PrivateAuth {
+            token_v2: "tok".into(),
+            space_id: "s1".into(),
+            user_id: Some("u1".into()),
+            cookies: None,
+        }
+    }
+
+    fn client(s: &MockServer) -> Client {
+        Client::new_private_at(
+            s.uri(),
+            auth(),
+            ClientConfig {
+                requests_per_sec: 1000.0,
+                burst: 1000,
+                max_retries: 0,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn page_value() -> Value {
+        json!({
+            "id": "p1", "type": "page", "alive": true,
+            "parent_id": "s1", "parent_table": "space",
+            "properties": { "title": [["Hello"]] },
+            "content": ["b1"],
+            "created_time": 1700000000000_i64,
+            "last_edited_time": 1700000000000_i64,
+        })
+    }
+
+    fn text_value() -> Value {
+        json!({
+            "id": "b1", "type": "text", "alive": true,
+            "parent_id": "p1", "parent_table": "block",
+            "properties": { "title": [["Hi"]] },
+            "content": [],
+            "created_time": 1700000000000_i64,
+            "last_edited_time": 1700000000000_i64,
+        })
+    }
+
+    fn chunk() -> Value {
+        json!({
+            "recordMap": {
+                "block": {
+                    "p1": { "role": "editor", "value": page_value() },
+                    "b1": { "role": "editor", "value": text_value() },
+                }
+            },
+            "cursor": { "stack": [] }
+        })
+    }
+
+    #[tokio::test]
+    async fn browser_spaces_reads_the_cookie_and_spaces() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/getSpacesInitial"))
+            .and(header("Cookie", "token_v2=tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "users": { "u1": {
+                    "notion_user": { "u1": { "value": { "value": { "id": "u1", "email": "a@b.c" } } } },
+                    "space": { "s1": { "value": { "id": "s1", "name": "Acme" } } },
+                    "space_view": { "v1": { "value": { "spaceId": "s1", "name": "Acme" } } }
+                }}
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let (user, spaces) = private::browser_spaces("tok", &s.uri()).await.unwrap();
+        assert_eq!(user.as_deref(), Some("u1"));
+        assert_eq!(spaces.len(), 1);
+        assert_eq!(spaces[0].id, "s1");
+        assert_eq!(spaces[0].name, "Acme");
+    }
+
+    #[tokio::test]
+    async fn reads_a_page_and_its_tree() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/loadPageChunk"))
+            .and(header("Cookie", "token_v2=tok"))
+            .and(header("x-notion-space-id", "s1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chunk()))
+            .expect(2)
+            .mount(&s)
+            .await;
+        let c = client(&s);
+        let page = c.get_page("p1").await.unwrap();
+        assert_eq!(page.title(), "Hello");
+        assert!(matches!(page.parent, crate::model::Parent::Workspace));
+        let tree = c.block_tree("p1").await.unwrap();
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].block.kind.type_name(), "paragraph");
+        assert_eq!(
+            tree[0].block.raw["paragraph"]["rich_text"][0]["plain_text"],
+            "Hi"
+        );
+    }
+
+    #[tokio::test]
+    async fn searches_the_space() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/search"))
+            .and(body_partial_json(json!({
+                "type": "BlocksInSpace", "spaceId": "s1", "query": ""
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": ["p1"],
+                "recordMap": { "block": { "p1": { "value": page_value() } } }
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let c = client(&s);
+        let results = c.search("").await.unwrap();
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            SearchResult::Page(p) => assert_eq!(p.title(), "Hello"),
+            _ => panic!("not a page"),
+        }
+    }
+
+    #[tokio::test]
+    async fn appending_a_block_uses_a_transaction() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/saveTransactionsFanout"))
+            .and(body_partial_json(
+                json!({ "transactions": [{ "spaceId": "s1" }] }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let c = client(&s);
+        let body = json!({
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [{ "type": "text", "text": { "content": "Hi", "link": null },
+                    "annotations": { "bold": false, "italic": false, "strikethrough": false,
+                        "underline": false, "code": false, "color": "default" },
+                    "plain_text": "Hi", "href": null }],
+                "color": "default",
+            }
+        });
+        let block = c.append_raw("p1", &body, None).await.unwrap();
+        assert_eq!(block.kind.type_name(), "paragraph");
+        assert_eq!(block.raw["paragraph"]["rich_text"][0]["plain_text"], "Hi");
+        let reqs = s.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let ops = body["transactions"][0]["operations"].as_array().unwrap();
+        assert_eq!(ops[0]["command"], "set");
+        assert_eq!(ops[1]["command"], "listAfter");
+        assert_eq!(ops[1]["pointer"]["id"], "p1");
+    }
+
+    #[tokio::test]
+    async fn updating_a_block_sets_properties() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/syncRecordValues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "recordMap": { "block": { "b1": { "value": text_value() } } }
+            })))
+            .expect(2)
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/saveTransactionsFanout"))
+            .and(body_partial_json(
+                json!({ "transactions": [{ "operations": [{
+                "path": ["properties", "title"], "command": "set"
+            }] }] }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let c = client(&s);
+        let body = json!({
+            "type": "paragraph",
+            "paragraph": { "rich_text": [{ "type": "text",
+                "text": { "content": "Changed", "link": null },
+                "annotations": { "bold": false, "italic": false, "strikethrough": false,
+                    "underline": false, "code": false, "color": "default" },
+                "plain_text": "Changed", "href": null }], "color": "default" }
+        });
+        let block = c.update_block("b1", &body).await.unwrap();
+        assert_eq!(block.kind.type_name(), "paragraph");
+    }
+
+    #[tokio::test]
+    async fn creating_a_page_sets_a_page_record() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/saveTransactionsFanout"))
+            .and(body_partial_json(
+                json!({ "transactions": [{ "operations": [{
+                "command": "set"
+            }] }] }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let c = client(&s);
+        let resp = c
+            .create_page(&json!({
+                "parent": { "type": "page_id", "page_id": "p1" },
+                "properties": { "title": { "title": [] } }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["object"], "page");
+        assert!(resp["id"].as_str().is_some());
     }
 }

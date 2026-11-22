@@ -42,15 +42,17 @@ pub const DARK: Colors = Colors {
 
 // Page layout, tuned to Notion's proportions (points).
 pub const TITLE_SIZE: f32 = 40.0;
-pub const TITLE_TOP: f32 = 24.0;
+pub const TITLE_TOP: f32 = 80.0;
 pub const PAGE_PAD: f32 = 48.0;
 /// Where text starts inside the page column: the row gutter plus the item
 /// spacing a text row gets. Icon, breadcrumb, title, blocks and tables share it.
 pub const TEXT_INSET: f32 = 20.0;
-pub const PAGE_MAX_WIDTH: f32 = 900.0;
+pub const PAGE_MAX_WIDTH: f32 = 708.0;
 /// Vertical gap between blocks.
 pub const BLOCK_GAP: f32 = 5.0;
-pub const H_SIZE: [f32; 3] = [30.0, 24.0, 19.0];
+/// Gap between the columns of a `column_list` (Notion uses 46 points).
+pub const COLUMN_GAP: f32 = 46.0;
+pub const H_SIZE: [f32; 3] = [30.0, 24.0, 20.0];
 /// Extra space above / below a heading of level 1, 2, 3.
 pub const H_ABOVE: [f32; 3] = [28.0, 20.0, 14.0];
 pub const H_BELOW: f32 = 2.0;
@@ -169,7 +171,11 @@ mod tests {
                 let (t, b) = block_color(&format!("{c}_background"), dark);
                 assert!(t.is_none() && b.is_some(), "{c}_background");
             }
-            assert_ne!(block_color(c, false), block_color(c, true), "{c}: a palette per theme");
+            assert_ne!(
+                block_color(c, false),
+                block_color(c, true),
+                "{c}: a palette per theme"
+            );
         }
     }
 

@@ -119,7 +119,10 @@ impl Switcher {
                 .filter_map(|id| tree.iter().find(|e| e.id == *id))
                 .map(|e| {
                     day = day.min(self.days.get(&e.id).copied().unwrap_or(day));
-                    Item { group: Some(group(self.today, day)), ..item(&self.paths, e) }
+                    Item {
+                        group: Some(group(self.today, day)),
+                        ..item(&self.paths, e)
+                    }
                 })
                 .collect();
         }
@@ -252,7 +255,10 @@ mod tests {
     fn databases_are_not_listed_as_pages() {
         let mut t = tree();
         t.push(e("db", "Kit grades"));
-        let sw = Switcher { query: "kit".into(), ..Default::default() };
+        let sw = Switcher {
+            query: "kit".into(),
+            ..Default::default()
+        };
         assert!(!ids(&sw.items(&t, &[])).contains(&"db"));
     }
 
@@ -261,16 +267,34 @@ mod tests {
         let g = |d| group(100, d);
         assert_eq!(
             [101, 100, 99, 98, 93, 92, 0].map(g),
-            ["Heute", "Heute", "Gestern", "Vergangene Woche", "Vergangene Woche", "Älter", "Älter"]
+            [
+                "Heute",
+                "Heute",
+                "Gestern",
+                "Vergangene Woche",
+                "Vergangene Woche",
+                "Älter",
+                "Älter"
+            ]
         );
     }
 
     #[test]
     fn empty_query_groups_by_day_in_recent_order_with_paths() {
         let mut t = tree();
-        t.push(PageEntry { parent: Some("a".into()), ..e("d", "Delta") });
-        t.push(PageEntry { parent: Some("d".into()), ..e("f", "Foxtrot") });
-        let mut sw = Switcher { today: 100, paths: paths(&t), ..Default::default() };
+        t.push(PageEntry {
+            parent: Some("a".into()),
+            ..e("d", "Delta")
+        });
+        t.push(PageEntry {
+            parent: Some("d".into()),
+            ..e("f", "Foxtrot")
+        });
+        let mut sw = Switcher {
+            today: 100,
+            paths: paths(&t),
+            ..Default::default()
+        };
         sw.days = [("a", 50), ("c", 100), ("d", 99), ("f", 97)]
             .map(|(k, v)| (k.to_string(), v))
             .into();
@@ -280,7 +304,12 @@ mod tests {
         let g: Vec<_> = items.iter().map(|i| i.group).collect();
         assert_eq!(
             g,
-            [Some("Heute"), Some("Gestern"), Some("Vergangene Woche"), Some("Älter")]
+            [
+                Some("Heute"),
+                Some("Gestern"),
+                Some("Vergangene Woche"),
+                Some("Älter")
+            ]
         );
         assert_eq!(items[2].path, "Alpha › Delta");
         assert_eq!(items[0].path, "");
@@ -296,8 +325,13 @@ mod tests {
     #[test]
     fn arrows_walk_the_pages_never_the_headers() {
         let ctx = Context::default();
-        let mut sw = Switcher { today: 100, ..Default::default() };
-        sw.days = [("a", 100), ("b", 99), ("c", 50)].map(|(k, v)| (k.to_string(), v)).into();
+        let mut sw = Switcher {
+            today: 100,
+            ..Default::default()
+        };
+        sw.days = [("a", 100), ("b", 99), ("c", 50)]
+            .map(|(k, v)| (k.to_string(), v))
+            .into();
         let recent: Vec<String> = ["a", "b", "c"].map(String::from).into();
         let items = sw.items(&tree(), &recent);
         let press = |sw: &mut Switcher, k| {
@@ -308,7 +342,10 @@ mod tests {
                 repeat: false,
                 modifiers: Modifiers::NONE,
             };
-            let raw = eframe::egui::RawInput { events: vec![ev], ..Default::default() };
+            let raw = eframe::egui::RawInput {
+                events: vec![ev],
+                ..Default::default()
+            };
             let mut out = Out::None;
             ctx.run_ui(raw, |ui| out = sw.keys(ui.ctx(), &items))
                 .drop_without_applying_deltas();
@@ -320,7 +357,13 @@ mod tests {
         }
         press(&mut sw, Key::ArrowUp);
         assert_eq!(sw.sel, 0);
-        assert_eq!(press(&mut sw, Key::Enter), Out::Pick { id: "a".into(), new_tab: false });
+        assert_eq!(
+            press(&mut sw, Key::Enter),
+            Out::Pick {
+                id: "a".into(),
+                new_tab: false
+            }
+        );
     }
 
     #[test]
@@ -329,7 +372,11 @@ mod tests {
             query: "KIT".into(),
             ..Default::default()
         };
-        assert_eq!(ids(&sw.items(&tree(), &[])), ["c", "b"], "prefix, then contains");
+        assert_eq!(
+            ids(&sw.items(&tree(), &[])),
+            ["c", "b"],
+            "prefix, then contains"
+        );
         sw.results = vec![
             ("b".into(), "Beta kit".into()),
             ("z".into(), "Remote only".into()),

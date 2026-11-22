@@ -1,10 +1,13 @@
 //! Drawing of the shell: tabs, sidebar, status bar, switcher. Each function
 //! returns the `Action` the user triggered, if any; `App::apply` runs it.
 
+pub mod browser_login;
+pub mod oauth;
 pub mod sidebar;
 pub mod status;
 pub mod switcher;
 pub mod tabbar;
+pub mod workspace;
 
 use eframe::egui::{
     self, pos2, vec2, Align, Id, Key, Label, Layout, Modifiers, Rect, RichText, Sense, Stroke,
@@ -36,7 +39,8 @@ pub fn item(
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
     if selected {
-        ui.painter().rect_filled(rect, 4.0, c.hover.gamma_multiply(2.0));
+        ui.painter()
+            .rect_filled(rect, 4.0, c.hover.gamma_multiply(2.0));
     } else if resp.hovered() {
         ui.painter().rect_filled(rect, 4.0, c.hover);
     }
@@ -81,11 +85,33 @@ pub fn breadcrumb(
     act
 }
 
-/// The centre of a tab with no page.
-pub fn empty_tab(ui: &mut Ui, c: &Colors) {
+/// The centre of a tab with no page. Offers the OAuth sign-in when no page is
+/// open, which is also the first thing a new user sees.
+pub fn empty_tab(ui: &mut Ui, c: &Colors) -> Option<Action> {
+    let mut act = None;
     ui.centered_and_justified(|ui| {
-        ui.label(RichText::new("New tab. Press Ctrl+K to open a page.").color(c.secondary));
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("New tab. Press Ctrl+K to open a page.").color(c.secondary));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("🌐 Browser session").clicked() {
+                    act = Some(Action::BrowserLoginStart);
+                }
+                if ui.button("🔐 Sign in with Notion…").clicked() {
+                    act = Some(Action::OAuthStart);
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "Browser session sees every workspace shared with your account. \
+                     OAuth and tokens use the public API.",
+                )
+                .small()
+                .color(c.secondary),
+            );
+        });
     });
+    act
 }
 
 /// What the find bar did this frame.
@@ -134,7 +160,11 @@ pub fn find_bar(ui: &mut Ui, c: &Colors, f: &mut Find) -> Option<FindOut> {
             out = Some(FindOut::Close);
         }
         let n = f.hits.len();
-        let count = if n == 0 { "0/0".to_string() } else { format!("{}/{n}", f.cur + 1) };
+        let count = if n == 0 {
+            "0/0".to_string()
+        } else {
+            format!("{}/{n}", f.cur + 1)
+        };
         ui.label(RichText::new(count).color(c.secondary));
         if ui.small_button("✕").clicked() {
             out = Some(FindOut::Close);
@@ -151,13 +181,22 @@ pub fn outline(ui: &mut Ui, c: &Colors, heads: &[(usize, u8, String)]) -> Option
     let top = area.center().y - step * heads.len() as f32 / 2.0;
     let mut act = None;
     for (k, (row, level, text)) in heads.iter().enumerate() {
-        let band = Rect::from_min_size(pos2(area.left(), top + k as f32 * step), vec2(area.width(), step));
+        let band = Rect::from_min_size(
+            pos2(area.left(), top + k as f32 * step),
+            vec2(area.width(), step),
+        );
         let r = ui.interact(band, Id::unique(("outline", k)), Sense::click());
         let color = if r.hovered() { c.accent } else { c.secondary };
         let y = band.center().y;
         let x = band.left() + 4.0 + 4.0 * f32::from(level.saturating_sub(1));
-        ui.painter().line_segment([pos2(x, y), pos2(band.right() - 4.0, y)], Stroke::new(2.0, color));
-        if r.on_hover_text(untitled(text)).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        ui.painter().line_segment(
+            [pos2(x, y), pos2(band.right() - 4.0, y)],
+            Stroke::new(2.0, color),
+        );
+        if r.on_hover_text(untitled(text))
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
             act = Some(Action::Goto(*row));
         }
     }

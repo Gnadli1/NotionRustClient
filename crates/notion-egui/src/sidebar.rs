@@ -179,10 +179,21 @@ mod tests {
 
     #[test]
     fn rows_nest_under_their_database() {
-        let db = PageEntry { database: true, ..e("db", "Grades", None) };
-        let es = [e("r2", "b row", Some("db")), db, e("r1", "A row", Some("db")), e("p", "Page", None)];
+        let db = PageEntry {
+            database: true,
+            ..e("db", "Grades", None)
+        };
+        let es = [
+            e("r2", "b row", Some("db")),
+            db,
+            e("r1", "A row", Some("db")),
+            e("p", "Page", None),
+        ];
         // collapsed: the database is a top-level entry with rows hidden
-        assert_eq!(shown(&es, &[]), [row("db", 0, true, false), row("p", 0, false, false)]);
+        assert_eq!(
+            shown(&es, &[]),
+            [row("db", 0, true, false), row("p", 0, false, false)]
+        );
         assert_eq!(
             shown(&es, &["db"]),
             [

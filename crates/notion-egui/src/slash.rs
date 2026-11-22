@@ -108,7 +108,15 @@ pub const ITEMS: &[Item] = &[
         kind: TargetKind::Equation,
         name: "Equation",
         hint: "Display TeX formula",
-        aliases: &["math", "tex", "katex", "$$", "Block-Gleichung", "Gleichung", "Formel"],
+        aliases: &[
+            "math",
+            "tex",
+            "katex",
+            "$$",
+            "Block-Gleichung",
+            "Gleichung",
+            "Formel",
+        ],
     },
 ];
 
@@ -266,7 +274,10 @@ mod tests {
         assert_eq!(kinds("hinw"), [Callout]);
         assert_eq!(kinds("trenn"), [Divider]);
         assert_eq!(kinds("gleichung"), [Equation]);
-        assert!(kinds("leichung").is_empty(), "word prefixes, not substrings");
+        assert!(
+            kinds("leichung").is_empty(),
+            "word prefixes, not substrings"
+        );
     }
 
     #[test]

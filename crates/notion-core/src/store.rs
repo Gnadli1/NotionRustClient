@@ -201,7 +201,8 @@ impl Store {
     /// Drops a cached page and its blocks (a never-created `local-*` page).
     pub fn delete_page(&self, id: &str) -> Result<()> {
         self.atomic(|| {
-            self.conn.execute("DELETE FROM blocks WHERE page_id = ?1", [id])?;
+            self.conn
+                .execute("DELETE FROM blocks WHERE page_id = ?1", [id])?;
             self.conn.execute("DELETE FROM pages WHERE id = ?1", [id])?;
             Ok(())
         })
@@ -488,7 +489,10 @@ impl Store {
 
     /// Cached comment count per parent, for the given parents' page: every
     /// block of `page_id` plus the page itself.
-    pub fn comment_counts(&self, page_id: &str) -> Result<std::collections::HashMap<String, usize>> {
+    pub fn comment_counts(
+        &self,
+        page_id: &str,
+    ) -> Result<std::collections::HashMap<String, usize>> {
         let mut st = self.conn.prepare(
             "SELECT parent_id, COUNT(*) FROM comments
              WHERE parent_id = ?1 OR parent_id IN (SELECT id FROM blocks WHERE page_id = ?1)
@@ -520,7 +524,8 @@ impl Store {
     }
 
     pub fn delete_comment(&self, id: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM comments WHERE id = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM comments WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -608,7 +613,11 @@ impl Store {
             "SELECT id, json_extract(raw, '$.last_edited_by.id'), last_edited_time FROM blocks WHERE page_id = ?1",
         )?;
         let rows = st.query_map([page_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?;
         let mut out = std::collections::HashMap::new();
         for row in rows {
@@ -652,7 +661,10 @@ impl Store {
 
     /// The cached data sources of a database, by title.
     pub fn data_sources_of(&self, database_id: &str) -> Result<Vec<DataSource>> {
-        self.list("SELECT raw FROM data_sources WHERE database_id = ?1 ORDER BY title, id", database_id)
+        self.list(
+            "SELECT raw FROM data_sources WHERE database_id = ?1 ORDER BY title, id",
+            database_id,
+        )
     }
 
     pub fn rows(&self, data_source_id: &str) -> Result<Vec<Page>> {
@@ -1183,18 +1195,26 @@ mod tests {
             .conn
             .prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name LIKE 'comments%' ORDER BY name")
             .unwrap();
-        st.query_map([], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect()
+        st.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect()
     }
 
     fn version(s: &Store) -> i64 {
-        s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+        s.conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
     }
 
     #[test]
     fn fresh_store_has_the_comments_table_and_indexes() {
         let s = Store::open_in_memory().unwrap();
         assert_eq!(version(&s), 5);
-        assert_eq!(tables(&s), ["comments", "comments_discussion", "comments_parent"]);
+        assert_eq!(
+            tables(&s),
+            ["comments", "comments_discussion", "comments_parent"]
+        );
         assert!(s.users().unwrap().is_empty(), "the users table exists");
     }
 
@@ -1205,8 +1225,10 @@ mod tests {
         {
             // a cache.db as the previous release left it
             let c = Connection::open(&path).unwrap();
-            c.execute_batch(&format!("BEGIN; {SCHEMA} COMMIT;")).unwrap();
-            c.execute("INSERT INTO id_map VALUES ('l', 'r')", []).unwrap();
+            c.execute_batch(&format!("BEGIN; {SCHEMA} COMMIT;"))
+                .unwrap();
+            c.execute("INSERT INTO id_map VALUES ('l', 'r')", [])
+                .unwrap();
         }
         let s = Store::open(&path).unwrap();
         assert_eq!(version(&s), 5);
@@ -1225,24 +1247,37 @@ mod tests {
         {
             // a cache.db as the C1 release left it
             let c = Connection::open(&path).unwrap();
-            c.execute_batch(&format!("BEGIN; {SCHEMA} {MIGRATE_2} COMMIT;")).unwrap();
-            c.execute("INSERT INTO id_map VALUES ('l', 'r')", []).unwrap();
+            c.execute_batch(&format!("BEGIN; {SCHEMA} {MIGRATE_2} COMMIT;"))
+                .unwrap();
+            c.execute("INSERT INTO id_map VALUES ('l', 'r')", [])
+                .unwrap();
             c.execute(
                 "INSERT INTO comments VALUES ('c', 'p', 'd', 't', 't', 'u', '{}')",
                 [],
             )
             .unwrap();
-            assert_eq!(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+            assert_eq!(
+                c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
         }
         let s = Store::open(&path).unwrap();
         assert_eq!(version(&s), 5);
         assert_eq!(s.resolve_id("l").unwrap(), "r");
-        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM comments", [], |r| r.get(0)).unwrap();
+        let n: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM comments", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1);
         s.put_users(&[user("u1", "Ada")]).unwrap();
         drop(s);
         let s = Store::open(&path).unwrap();
-        assert_eq!((version(&s), s.users().unwrap().len()), (5, 1), "reopening keeps it");
+        assert_eq!(
+            (version(&s), s.users().unwrap().len()),
+            (5, 1),
+            "reopening keeps it"
+        );
     }
 
     #[test]
@@ -1252,13 +1287,20 @@ mod tests {
         {
             // a cache.db as the C5 release left it
             let c = Connection::open(&path).unwrap();
-            c.execute_batch(&format!("BEGIN; {SCHEMA} {MIGRATE_2} {MIGRATE_3} {MIGRATE_4} COMMIT;")).unwrap();
-            c.execute("INSERT INTO id_map VALUES ('l', 'r')", []).unwrap();
+            c.execute_batch(&format!(
+                "BEGIN; {SCHEMA} {MIGRATE_2} {MIGRATE_3} {MIGRATE_4} COMMIT;"
+            ))
+            .unwrap();
+            c.execute("INSERT INTO id_map VALUES ('l', 'r')", [])
+                .unwrap();
         }
         let s = Store::open(&path).unwrap();
         assert_eq!(version(&s), 5);
         assert_eq!(s.resolve_id("l").unwrap(), "r");
-        assert!(s.media_get("x").unwrap().is_none(), "the media table exists");
+        assert!(
+            s.media_get("x").unwrap().is_none(),
+            "the media table exists"
+        );
     }
 
     fn user(id: &str, name: &str) -> User {
@@ -1274,16 +1316,25 @@ mod tests {
     #[test]
     fn id_only_users_never_wipe_a_known_one() {
         let s = Store::open_in_memory().unwrap();
-        s.put_users(&[user("u1", "Ada"), user("u2", "bob")]).unwrap();
+        s.put_users(&[user("u1", "Ada"), user("u2", "bob")])
+            .unwrap();
         s.put_users(&[user("u1", ""), user("u3", "")]).unwrap();
         let u1 = s.user("u1").unwrap().unwrap();
         assert_eq!((u1.name.as_str(), u1.kind.as_str()), ("Ada", "person"));
         assert_eq!(u1.email.as_deref(), Some("a@x.org"));
         assert_eq!(u1.raw["name"], "Ada", "raw kept too");
         // typed but nameless (null name) doesn't blank it either
-        s.put_users(&[User::from_value(&json!({ "object": "user", "id": "u1", "type": "person", "name": null })).unwrap()]).unwrap();
+        s.put_users(&[User::from_value(
+            &json!({ "object": "user", "id": "u1", "type": "person", "name": null }),
+        )
+        .unwrap()])
+            .unwrap();
         assert_eq!(s.user("u1").unwrap().unwrap().name, "Ada");
-        assert_eq!(s.user("u3").unwrap().unwrap().name, "", "a new id-only user is a row");
+        assert_eq!(
+            s.user("u3").unwrap().unwrap().name,
+            "",
+            "a new id-only user is a row"
+        );
         assert!(s.user("nope").unwrap().is_none());
         // a named one replaces (rename), and the list is sorted by name, case-insensitively
         s.put_users(&[user("u2", "Zed")]).unwrap();

@@ -637,7 +637,13 @@ pub fn take_commands(
         }
         // the same press may also arrive as the character it types
         drop_text |= (modifiers.ctrl || modifiers.alt)
-            && matches!(e, Event::Key { physical_key: Some(Key::Minus | Key::Backslash), .. });
+            && matches!(
+                e,
+                Event::Key {
+                    physical_key: Some(Key::Minus | Key::Backslash),
+                    ..
+                }
+            );
         false
     });
     if drop_text {
@@ -652,8 +658,16 @@ pub fn mouse_nav(events: &[Event]) -> Vec<Command> {
     events
         .iter()
         .filter_map(|e| match e {
-            Event::PointerButton { button: Extra1, pressed: true, .. } => Some(Command::Back),
-            Event::PointerButton { button: Extra2, pressed: true, .. } => Some(Command::Forward),
+            Event::PointerButton {
+                button: Extra1,
+                pressed: true,
+                ..
+            } => Some(Command::Back),
+            Event::PointerButton {
+                button: Extra2,
+                pressed: true,
+                ..
+            } => Some(Command::Forward),
             _ => None,
         })
         .collect()
@@ -748,7 +762,10 @@ mod tests {
             Some(ch("shift+tab"))
         );
         assert_eq!(first(Key::Num2, None, CTRL_SHIFT), Some(ch("ctrl+shift+2")));
-        assert_eq!(first(Key::Backslash, None, Modifiers::CTRL), Some(ch("ctrl+\\")));
+        assert_eq!(
+            first(Key::Backslash, None, Modifiers::CTRL),
+            Some(ch("ctrl+\\"))
+        );
         // a modifier alone has no name
         assert_eq!(first(Key::Copy, None, Modifiers::CTRL), None);
     }
@@ -784,9 +801,15 @@ mod tests {
         assert_eq!(v, [Event::Text("x".into())]);
         // Text only, and Key + Text for one press: once
         let mut v = vec![Event::Text("ß".into())];
-        assert_eq!(take_commands(&mut v, true, &k, |_| true), [Command::ToggleSidebar]);
+        assert_eq!(
+            take_commands(&mut v, true, &k, |_| true),
+            [Command::ToggleSidebar]
+        );
         assert!(v.is_empty());
-        let mut v = vec![press(Key::Minus, Some(Key::Minus), ctrl), Event::Text("ß".into())];
+        let mut v = vec![
+            press(Key::Minus, Some(Key::Minus), ctrl),
+            Event::Text("ß".into()),
+        ];
         assert_eq!(take_commands(&mut v, true, &k, |_| true).len(), 1);
     }
 
@@ -844,7 +867,11 @@ mod tests {
     #[test]
     fn block_edit_keys_and_altgr() {
         let k = Keymap::default();
-        let alt = Modifiers { ctrl: true, alt: true, ..Modifiers::NONE };
+        let alt = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Modifiers::NONE
+        };
         for (key, m, want) in [
             (Key::D, Modifiers::CTRL, Command::Duplicate),
             (Key::ArrowUp, CTRL_SHIFT, Command::MoveUp),
@@ -856,7 +883,10 @@ mod tests {
         }
         assert!(Command::ToggleAll.is_global() && !Command::Duplicate.is_global());
         // AltGr+T on the Austrian layout (Linux): a typed "t", no Ctrl or Alt
-        let mut v = vec![press(Key::T, Some(Key::T), Modifiers::NONE), Event::Text("t".into())];
+        let mut v = vec![
+            press(Key::T, Some(Key::T), Modifiers::NONE),
+            Event::Text("t".into()),
+        ];
         assert!(take_commands(&mut v, false, &k, |_| true).is_empty());
         assert_eq!(v.len(), 2);
         // a keys.json from before these actions still loads, with the new defaults
@@ -904,7 +934,10 @@ mod tests {
             k.get(&ch("ctrl+shift+e")),
             Some(Command::Mark(Mark::Equation))
         );
-        assert_eq!(k.get(&ch("ctrl+shift+s")), Some(Command::Mark(Mark::Strike)));
+        assert_eq!(
+            k.get(&ch("ctrl+shift+s")),
+            Some(Command::Mark(Mark::Strike))
+        );
         assert_eq!(k.get(&ch("ctrl+k")), Some(Command::Search));
         assert_eq!(k.get(&ch("ctrl+\\")), Some(Command::ToggleSidebar));
         assert_eq!(k.get(&ch("ctrl+ß")), Some(Command::ToggleSidebar));
@@ -932,8 +965,14 @@ mod tests {
 
     #[test]
     fn navigation_keys_are_taken_from_the_editor_and_rebindable() {
-        let alt = Modifiers { alt: true, ..Modifiers::NONE };
-        let mut ev = vec![press(Key::ArrowLeft, None, alt), press(Key::F, None, Modifiers::CTRL)];
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::NONE
+        };
+        let mut ev = vec![
+            press(Key::ArrowLeft, None, alt),
+            press(Key::F, None, Modifiers::CTRL),
+        ];
         let got = take_commands(&mut ev, false, &Keymap::default(), Command::is_global);
         assert_eq!(got, [Command::Back, Command::Find]);
         assert!(ev.is_empty(), "the text edit never sees them");
@@ -945,8 +984,15 @@ mod tests {
 
     #[test]
     fn altgr_brackets_and_typed_brackets_are_not_back() {
-        let ctrl_alt = Modifiers { ctrl: true, alt: true, ..Modifiers::NONE };
-        let mut ev = vec![press(Key::OpenBracket, None, ctrl_alt), Event::Text("[".into())];
+        let ctrl_alt = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Modifiers::NONE
+        };
+        let mut ev = vec![
+            press(Key::OpenBracket, None, ctrl_alt),
+            Event::Text("[".into()),
+        ];
         let got = take_commands(&mut ev, true, &Keymap::default(), Command::is_global);
         assert!(got.is_empty());
         assert_eq!(ev.len(), 2, "both pass through to the text edit");
@@ -961,7 +1007,12 @@ mod tests {
             pressed,
             modifiers: Modifiers::NONE,
         };
-        let evs = [ev(B::Extra1, true), ev(B::Extra1, false), ev(B::Extra2, true), ev(B::Primary, true)];
+        let evs = [
+            ev(B::Extra1, true),
+            ev(B::Extra1, false),
+            ev(B::Extra2, true),
+            ev(B::Primary, true),
+        ];
         assert_eq!(mouse_nav(&evs), [Command::Back, Command::Forward]);
     }
 
@@ -1108,9 +1159,17 @@ mod tests {
     fn upload_file_is_bound_and_parses_by_name() {
         let k = Keymap::default();
         assert_eq!(k.get(&ch("ctrl+shift+f")), Some(Command::UploadFile));
-        assert_eq!(DEFAULTS.iter().filter(|(_, n)| *n == "upload_file").count(), 1);
-        assert!(NAMES.iter().any(|(n, c)| *n == "upload_file" && *c == Command::UploadFile));
+        assert_eq!(
+            DEFAULTS.iter().filter(|(_, n)| *n == "upload_file").count(),
+            1
+        );
+        assert!(NAMES
+            .iter()
+            .any(|(n, c)| *n == "upload_file" && *c == Command::UploadFile));
         let mut chords = std::collections::HashSet::new();
-        assert!(DEFAULTS.iter().all(|(c, _)| chords.insert(*c)), "duplicate default chord");
+        assert!(
+            DEFAULTS.iter().all(|(c, _)| chords.insert(*c)),
+            "duplicate default chord"
+        );
     }
 }

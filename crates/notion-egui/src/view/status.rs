@@ -24,7 +24,11 @@ pub fn show(ui: &mut Ui, c: &Colors, s: &Status) -> Option<Action> {
     let mut act = None;
     let [queued, conflicts, failed] = s.counts;
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("queued {queued} ·")).size(12.0).color(c.secondary));
+        ui.label(
+            RichText::new(format!("queued {queued} ·"))
+                .size(12.0)
+                .color(c.secondary),
+        );
         let counts = format!("conflicts {conflicts} · failed {failed}");
         if s.has_problems {
             // opens the list of them
@@ -42,12 +46,20 @@ pub fn show(ui: &mut Ui, c: &Colors, s: &Status) -> Option<Action> {
             ui.label(RichText::new(b).size(12.0).color(c.secondary));
         }
         if let Some(i) = s.info {
-            ui.label(RichText::new(format!("· {i}")).size(12.0).color(c.secondary));
+            ui.label(
+                RichText::new(format!("· {i}"))
+                    .size(12.0)
+                    .color(c.secondary),
+            );
         }
         if let Some(e) = s.error {
             ui.add(
-                Label::new(RichText::new(format!("· error: {e}")).size(12.0).color(c.error))
-                    .truncate(),
+                Label::new(
+                    RichText::new(format!("· error: {e}"))
+                        .size(12.0)
+                        .color(c.error),
+                )
+                .truncate(),
             );
         }
     });
@@ -97,7 +109,10 @@ pub fn problems(ctx: &Context, c: &Colors, list: &[Problem], sel: usize) -> Opti
                             if p.conflict && ui.button("Resolve…").clicked() {
                                 act = Some(Action::Resolve(p.op));
                             }
-                            if ui.button(if p.conflict { "Keep theirs" } else { "Discard" }).clicked() {
+                            if ui
+                                .button(if p.conflict { "Keep theirs" } else { "Discard" })
+                                .clicked()
+                            {
                                 act = Some(Action::Discard(p.op));
                             }
                         });

@@ -10,6 +10,8 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 image.workspace = true
+webbrowser = "1"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 # session.rs tests use it

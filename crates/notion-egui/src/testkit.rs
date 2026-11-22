@@ -3,8 +3,8 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
 use std::sync::mpsc::{channel, Sender};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Event, Key, Modifiers, RawInput, ViewportCommand, ViewportId};
 use notion_core::model::Page;
@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 use crate::app::{Action, App, Grab};
-use crate::outline::tests::{blk, rt};
 use crate::menu::Menu;
+use crate::outline::tests::{blk, rt};
 use crate::worker::{Cmd, Event as WEvent};
 
 pub fn page(id: &str, parent: Value) -> Page {
@@ -174,10 +174,11 @@ impl Win {
             .get(&ViewportId::ROOT)
             .map(|v| v.commands.clone())
             .unwrap_or_default();
-        self.copied.extend(out.platform_output.commands.iter().filter_map(|c| match c {
-            egui::OutputCommand::CopyText(t) => Some(t.clone()),
-            _ => None,
-        }));
+        self.copied
+            .extend(out.platform_output.commands.iter().filter_map(|c| match c {
+                egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            }));
         self.text_at = out
             .shapes
             .iter()

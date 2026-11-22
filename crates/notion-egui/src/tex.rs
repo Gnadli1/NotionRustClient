@@ -74,6 +74,8 @@ impl P {
             return match c {
                 ',' | ':' | ';' | ' ' => Some(" ".into()),
                 '!' => Some(String::new()),
+                // `\\` ends a line; Notion's block equations show it as one
+                '\\' => Some("\n".into()),
                 '{' | '}' | '%' | '$' | '&' | '#' | '_' => Some(c.to_string()),
                 '|' => Some("‖".into()),
                 _ => None,
@@ -124,6 +126,12 @@ impl P {
                 _ => return None,
             }
             .into(),
+            // some notes use the `\Z`/`\R` shorthand rather than \mathbb
+            "R" => "ℝ".into(),
+            "N" => "ℕ".into(),
+            "Z" => "ℤ".into(),
+            "Q" => "ℚ".into(),
+            "C" => "ℂ".into(),
             "text" | "mathrm" | "textrm" | "operatorname" => self.arg()?,
             "quad" => " ".into(),
             "qquad" => "  ".into(),
@@ -251,10 +259,15 @@ fn symbol(name: &str) -> Option<&'static str> {
         "to" | "rightarrow" => "→",
         "leftarrow" => "←",
         "Rightarrow" => "⇒",
+        "implies" | "Longrightarrow" => "⟹",
         "Leftarrow" => "⇐",
+        "longleftarrow" => "⟵",
         "leftrightarrow" => "↔",
         "Leftrightarrow" => "⇔",
+        "iff" | "Longleftrightarrow" => "⟺",
         "mapsto" => "↦",
+        // Notion's editor sometimes spells `\in` as `\isin`
+        "isin" => "∈",
         "ldots" => "…",
         "cdots" => "⋯",
         "circ" => "∘",
@@ -311,6 +324,10 @@ mod tests {
             (r"90^\circ \angle", "90^∘ ∠"),
             (r"E = mc^2", "E = mc²"),
             (r"\left. x \right|", " x |"),
+            (r"T \implies Periodendauer", "T ⟹ Periodendauer"),
+            (r"n \isin \Z", "n ∈ ℤ"),
+            (r"a \\ b", "a \n b"),
+            ("a\n\\\\ \\mapsto b", "a\n\n ↦ b"),
         ];
         for (src, want) in cases {
             assert_eq!(pretty_tex(src).as_deref(), Some(want), "{src}");
@@ -326,7 +343,6 @@ mod tests {
             "{a",
             "a}",
             "x^",
-            r"a \\ b",
             r"\frac{a}",
             r"\sqrt[\alpha]{2}",
         ] {

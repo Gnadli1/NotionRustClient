@@ -7,8 +7,8 @@
 use std::cmp::Ordering;
 
 use eframe::egui::{
-    self, Align2, Context, FontId, Frame, Id, Key, Margin, Modifiers, Rect, RichText, Sense, Stroke, TextEdit, Ui,
-    Vec2,
+    self, Align2, Color32, Context, FontId, Frame, Id, Key, Margin, Modifiers, Rect, RichText,
+    Sense, Stroke, TextEdit, Ui, Vec2,
 };
 use eframe::egui::{pos2, vec2};
 use notion_core::model::{DataSource, Page, User};
@@ -20,8 +20,8 @@ use crate::keys::{take_exact, Command};
 use crate::pages::Dlg;
 use crate::slash::fold;
 use crate::theme::{self, Colors};
-use crate::views::Kind;
 use crate::view::untitled;
+use crate::views::Kind;
 use crate::worker::Cmd;
 
 const COL_W: f32 = 170.0;
@@ -30,7 +30,10 @@ const ROW_H: f32 = 26.0;
 const LEAD_W: f32 = 56.0;
 
 pub(crate) struct Col {
+    /// The property key (what the page's `properties` object is keyed by).
     pub name: String,
+    /// The property's display name (the private API keys blocks by short ids).
+    pub display: String,
     pub kind: String,
     /// The select, multi-select or status options.
     pub opts: Vec<String>,
@@ -123,7 +126,11 @@ pub(crate) fn is_choice(kind: &str) -> bool {
 }
 
 fn items(text: &str) -> Vec<String> {
-    text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect()
+    text.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 /// `text` with `v` added, or removed if it is in it.
@@ -140,8 +147,13 @@ fn toggled(text: &str, v: &str) -> String {
 
 fn options(p: &Value) -> Vec<String> {
     let kind = p["type"].as_str().unwrap_or_default();
-    let o = p[kind]["options"].as_array().map(Vec::as_slice).unwrap_or_default();
-    o.iter().filter_map(|o| o["name"].as_str().map(String::from)).collect()
+    let o = p[kind]["options"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    o.iter()
+        .filter_map(|o| o["name"].as_str().map(String::from))
+        .collect()
 }
 
 fn filter_id() -> Id {
@@ -151,29 +163,48 @@ fn filter_id() -> Id {
 impl Db {
     /// The table of `ds` with its (live) `pages`, in the order given. `sort`
     /// is the remembered (column name, descending). The caller runs `arrange`.
-    pub fn new(ds: &DataSource, pages: &[Page], users: &[User], sort: Option<&(String, bool)>) -> Db {
+    pub fn new(
+        ds: &DataSource,
+        pages: &[Page],
+        users: &[User],
+        sort: Option<&(String, bool)>,
+    ) -> Db {
         let schema = ds.properties.as_object();
         let col = |(name, p): (&String, &Value)| Col {
             name: name.clone(),
+            display: p["name"]
+                .as_str()
+                .filter(|n| !n.is_empty())
+                .unwrap_or(name)
+                .to_string(),
             kind: p["type"].as_str().unwrap_or_default().to_string(),
             opts: options(p),
         };
         let mut cols: Vec<Col> = Vec::new();
         for want_title in [true, false] {
             let all = schema.into_iter().flatten();
-            cols.extend(all.filter(|(_, p)| (p["type"] == "title") == want_title).map(col));
+            cols.extend(
+                all.filter(|(_, p)| (p["type"] == "title") == want_title)
+                    .map(col),
+            );
         }
         let who = |id: &str| crate::people::name_of(users, id);
         let rows = pages
             .iter()
             .map(|p| {
                 let props = p.raw["properties"].clone();
-                let cells: Vec<String> = cols.iter().map(|c| props::cell_text(&props[&c.name], &who)).collect();
+                let cells: Vec<String> = cols
+                    .iter()
+                    .map(|c| props::cell_text(&props[&c.name], &who))
+                    .collect();
                 DbRow {
                     id: p.id.clone(),
                     cover: notion_core::media::page_source(&p.raw).map(|s| s.key),
                     keys: cells.iter().map(|c| fold(c)).collect(),
-                    nums: cols.iter().map(|c| props::sort_num(&props[&c.name])).collect(),
+                    nums: cols
+                        .iter()
+                        .map(|c| props::sort_num(&props[&c.name]))
+                        .collect(),
                     fold: fold(&cells.join("\n")),
                     cells,
                     props,
@@ -209,7 +240,9 @@ impl Db {
     /// selection the filter hides.
     pub fn arrange(&mut self) {
         let q = fold(self.filter.trim());
-        let mut v: Vec<usize> = (0..self.rows.len()).filter(|&i| q.is_empty() || self.rows[i].fold.contains(&q)).collect();
+        let mut v: Vec<usize> = (0..self.rows.len())
+            .filter(|&i| q.is_empty() || self.rows[i].fold.contains(&q))
+            .collect();
         if let Some((c, desc)) = self.sort {
             v.sort_by(|&a, &b| {
                 let (a, b) = (&self.rows[a], &self.rows[b]);
@@ -223,12 +256,20 @@ impl Db {
                     (Some(x), Some(y)) => x.total_cmp(&y),
                     _ => a.keys[c].cmp(&b.keys[c]),
                 };
-                if desc { o.reverse() } else { o }
+                if desc {
+                    o.reverse()
+                } else {
+                    o
+                }
             });
         }
         self.view = v;
         self.relane();
-        if self.sel.as_ref().is_some_and(|(id, _)| self.pos(id).is_none()) {
+        if self
+            .sel
+            .as_ref()
+            .is_some_and(|(id, _)| self.pos(id).is_none())
+        {
             self.sel = None;
         }
     }
@@ -272,10 +313,21 @@ impl Db {
         let c = &self.cols[col];
         let opts = c.opts.iter().map(|o| (o.clone(), o.clone()));
         match c.kind.as_str() {
-            "select" => std::iter::once((String::new(), "— none —".to_string())).chain(opts).collect(),
+            "select" => std::iter::once((String::new(), "— none —".to_string()))
+                .chain(opts)
+                .collect(),
             "people" => users
                 .iter()
-                .map(|u| (u.id.clone(), if u.name.is_empty() { u.id.chars().take(8).collect() } else { u.name.clone() }))
+                .map(|u| {
+                    (
+                        u.id.clone(),
+                        if u.name.is_empty() {
+                            u.id.chars().take(8).collect()
+                        } else {
+                            u.name.clone()
+                        },
+                    )
+                })
                 .collect(),
             _ => opts.collect(),
         }
@@ -291,7 +343,9 @@ impl Db {
 
     /// The cached text of a cell, as `begin` reads it.
     fn cell_now(&self, row: &str, col: usize) -> Option<String> {
-        Some(props::edit_text(&self.row(row)?.props[&self.cols.get(col)?.name]))
+        Some(props::edit_text(
+            &self.row(row)?.props[&self.cols.get(col)?.name],
+        ))
     }
 
     /// Starts editing a cell; the error says why it can't be.
@@ -304,11 +358,23 @@ impl Db {
         let text = props::edit_text(&r.props[&c.name]);
         let cur = if is_choice(&c.kind) {
             let first = items(&text).into_iter().next().unwrap_or_default();
-            self.choices(col, users).iter().position(|(v, _)| *v == first).unwrap_or(0)
+            self.choices(col, users)
+                .iter()
+                .position(|(v, _)| *v == first)
+                .unwrap_or(0)
         } else {
             0
         };
-        self.edit = Some(CellEdit { row: row.into(), col, original: text.clone(), seen: text.clone(), text, cur, grab: true, failed: false });
+        self.edit = Some(CellEdit {
+            row: row.into(),
+            col,
+            original: text.clone(),
+            seen: text.clone(),
+            text,
+            cur,
+            grab: true,
+            failed: false,
+        });
         Ok(())
     }
 }
@@ -319,7 +385,12 @@ impl App {
         if matches!(self.store.data_source(id), Ok(Some(_))) {
             return Some(id.to_string());
         }
-        self.store.data_sources_of(id).ok()?.into_iter().next().map(|d| d.id)
+        self.store
+            .data_sources_of(id)
+            .ok()?
+            .into_iter()
+            .next()
+            .map(|d| d.id)
     }
 
     /// Builds the table if the open page is a cached data source (else `db`
@@ -336,7 +407,12 @@ impl App {
         self.page_head = None;
         self.block_edits.clear();
         self.rows.clear();
-        let mut pages: Vec<Page> = self.store.rows(id)?.into_iter().filter(|p| !p.in_trash).collect();
+        let mut pages: Vec<Page> = self
+            .store
+            .rows(id)?
+            .into_iter()
+            .filter(|p| !p.in_trash)
+            .collect();
         pages.sort_by(|a, b| (a.created_time, &a.id).cmp(&(b.created_time, &b.id)));
         let mut db = Db::new(&ds, &pages, &self.users, self.db_sorts.get(id));
         if !self.db_views.contains_key(id) {
@@ -357,9 +433,14 @@ impl App {
                 e.row = r(e.row);
                 e
             });
-            (db.focus_filter, db.reveal, db.offset, db.height) = (old.focus_filter, old.reveal, old.offset, old.height);
+            (db.focus_filter, db.reveal, db.offset, db.height) =
+                (old.focus_filter, old.reveal, old.offset, old.height);
             db.month = old.month;
-            if db.edit.as_ref().is_some_and(|e| db.row(&e.row).is_none() || e.col >= db.cols.len()) {
+            if db
+                .edit
+                .as_ref()
+                .is_some_and(|e| db.row(&e.row).is_none() || e.col >= db.cols.len())
+            {
                 db.edit = None;
             }
             // a pull may have dropped columns
@@ -379,14 +460,27 @@ impl App {
 
     /// Pulls the open table unless that happened lately or is under way.
     pub(crate) fn db_pull_if_stale(&mut self) {
-        let Some(ds) = self.db.as_ref().map(|d| d.ds.clone()) else { return };
-        let fresh = self.full_at.get(&ds).is_some_and(|t| t.elapsed() < crate::shell::FULL_MIN);
-        let out = self.sent.iter().any(|c| matches!(c, Cmd::Pull { id, .. } if *id == ds));
+        let Some(ds) = self.db.as_ref().map(|d| d.ds.clone()) else {
+            return;
+        };
+        let fresh = self
+            .full_at
+            .get(&ds)
+            .is_some_and(|t| t.elapsed() < crate::shell::FULL_MIN);
+        let out = self
+            .sent
+            .iter()
+            .any(|c| matches!(c, Cmd::Pull { id, .. } if *id == ds));
         if !(fresh || out || self.worker_gone || self.offline() || ds.starts_with("local-")) {
-            self.send(Cmd::Pull { id: ds.clone(), force: false });
+            self.send(Cmd::Pull {
+                id: ds.clone(),
+                force: false,
+            });
         }
         // once per session, after the pull: the saved views (any error keeps the local ones)
-        if !(self.worker_gone || self.offline() || ds.starts_with("local-")) && self.views_asked.insert(ds.clone()) {
+        if !(self.worker_gone || self.offline() || ds.starts_with("local-"))
+            && self.views_asked.insert(ds.clone())
+        {
             self.send(Cmd::Views { ds });
         }
     }
@@ -397,10 +491,16 @@ impl App {
             self.last_error = Some("editing is paused while a push runs".into());
             return false;
         }
-        let Some((ds, name)) = self.db.as_ref().and_then(|d| Some((d.ds.clone(), d.cols.get(col)?.name.clone()))) else {
+        let Some((ds, name)) = self
+            .db
+            .as_ref()
+            .and_then(|d| Some((d.ds.clone(), d.cols.get(col)?.name.clone())))
+        else {
             return false;
         };
-        match self.step_page(vec![ds, row.to_string()], |s| sync::local_set_property(&s.store, row, &name, text)) {
+        match self.step_page(vec![ds, row.to_string()], |s| {
+            sync::local_set_property(&s.store, row, &name, text)
+        }) {
             Ok(_) => true,
             Err(e) => {
                 self.last_error = Some(e.to_string());
@@ -411,7 +511,10 @@ impl App {
 
     /// [`Self::db_write`] unless the cell changed in the cache since the edit began.
     fn db_write_edit(&mut self, row: &str, col: usize, text: &str) -> bool {
-        let stale = self.db.as_ref().and_then(|d| Some(d.cell_now(row, col)? != d.edit.as_ref()?.seen));
+        let stale = self
+            .db
+            .as_ref()
+            .and_then(|d| Some(d.cell_now(row, col)? != d.edit.as_ref()?.seen));
         if stale == Some(true) {
             self.last_error = Some("changed in Notion meanwhile: Esc to discard your edit".into());
             return false;
@@ -424,7 +527,11 @@ impl App {
     /// commit.
     pub(crate) fn db_flush(&mut self) -> bool {
         let Some(d) = &self.db else { return true };
-        let Some(e) = d.edit.as_ref().filter(|e| e.text != e.original && !is_choice(&d.cols[e.col].kind)) else {
+        let Some(e) = d
+            .edit
+            .as_ref()
+            .filter(|e| e.text != e.original && !is_choice(&d.cols[e.col].kind))
+        else {
             return true;
         };
         let (row, col, text) = (e.row.clone(), e.col, e.text.clone());
@@ -445,7 +552,9 @@ impl App {
     /// Writes the edit (if it changed) and closes it. A refused value keeps
     /// the editor, but when `leaving` the second try discards it.
     pub(crate) fn db_commit(&mut self, leaving: bool) -> bool {
-        let Some(e) = self.db.as_ref().and_then(|d| d.edit.as_ref()) else { return true };
+        let Some(e) = self.db.as_ref().and_then(|d| d.edit.as_ref()) else {
+            return true;
+        };
         let wrote = e.text != e.original;
         if wrote {
             let (row, col, text) = (e.row.clone(), e.col, e.text.clone());
@@ -472,7 +581,9 @@ impl App {
 
     /// Enter or a click on the selected cell: edits it (a checkbox toggles).
     fn db_activate(&mut self) {
-        let Some((row, col)) = self.db.as_ref().and_then(|d| d.sel.clone()) else { return };
+        let Some((row, col)) = self.db.as_ref().and_then(|d| d.sel.clone()) else {
+            return;
+        };
         let kind = self.db.as_ref().expect("open").cols[col].kind.clone();
         if !props::editable(&kind) {
             self.info = Some(format!("read-only: a {kind} property can't be edited"));
@@ -493,7 +604,9 @@ impl App {
 
     fn db_toggle(&mut self, row: &str, col: usize) {
         let Some(d) = &self.db else { return };
-        let on = d.row(row).is_some_and(|r| r.props[&d.cols[col].name]["checkbox"] == true);
+        let on = d
+            .row(row)
+            .is_some_and(|r| r.props[&d.cols[col].name]["checkbox"] == true);
         if self.db_write(row, col, if on { "false" } else { "true" }) {
             self.refresh();
         }
@@ -508,7 +621,9 @@ impl App {
         if !self.db_commit(true) {
             return;
         }
-        let Some(ds) = self.db.as_ref().map(|d| d.ds.clone()) else { return };
+        let Some(ds) = self.db.as_ref().map(|d| d.ds.clone()) else {
+            return;
+        };
         match self.step_page(vec![ds.clone()], |s| sync::local_create_row(&s.store, &ds)) {
             Ok(id) => {
                 if let Some(d) = &mut self.db {
@@ -529,7 +644,9 @@ impl App {
 
     /// Shows view `i` of `Db::defs` and remembers it for the data source.
     pub(crate) fn db_set_view(&mut self, i: usize) {
-        let Some(d) = self.db.as_mut().filter(|d| i < d.defs.len()) else { return };
+        let Some(d) = self.db.as_mut().filter(|d| i < d.defs.len()) else {
+            return;
+        };
         (d.cur, d.reveal) = (i, true);
         d.arrange();
         let (ds, label) = (d.ds.clone(), crate::views::pref(&d.defs[i]));
@@ -548,7 +665,9 @@ impl App {
             self.info = Some("select a card first".into());
             return;
         };
-        let Some((col, value)) = d.move_target(&id, dl) else { return };
+        let Some((col, value)) = d.move_target(&id, dl) else {
+            return;
+        };
         if self.db_write(&id, col, &value) {
             self.refresh();
         }
@@ -568,7 +687,10 @@ impl App {
             self.last_error = Some("this row isn't pushed yet: push it (Ctrl+S) first".into());
             return;
         }
-        let title = d.row(&id).and_then(|r| r.cells.first().cloned()).unwrap_or_default();
+        let title = d
+            .row(&id)
+            .and_then(|r| r.cells.first().cloned())
+            .unwrap_or_default();
         self.dlg = Some(Dlg::Trash(id, title));
     }
 
@@ -579,8 +701,12 @@ impl App {
             self.last_error = Some("editing is paused while a push runs".into());
             return;
         }
-        let Some(ds) = self.db.as_ref().map(|d| d.ds.clone()) else { return };
-        match self.step_page(vec![ds, id.clone()], |s| sync::local_trash_page(&s.store, &id, true)) {
+        let Some(ds) = self.db.as_ref().map(|d| d.ds.clone()) else {
+            return;
+        };
+        match self.step_page(vec![ds, id.clone()], |s| {
+            sync::local_trash_page(&s.store, &id, true)
+        }) {
             Ok(_) => {
                 self.info = Some("trashed: restore it from the Trash view".into());
                 self.refresh();
@@ -596,7 +722,10 @@ impl App {
             Command::TrashPage => self.db_ask_trash(None),
             Command::TrashView if self.commit() => self.dlg = Some(Dlg::Bin { sel: 0 }),
             Command::TrashView => {}
-            _ => self.info = Some("not available on a database: open a row as a page (Ctrl+Shift+O)".into()),
+            _ => {
+                self.info =
+                    Some("not available on a database: open a row as a page (Ctrl+Shift+O)".into())
+            }
         }
     }
 
@@ -604,7 +733,11 @@ impl App {
     pub(crate) fn db_act(&mut self, a: Act) {
         match a {
             Act::Cell(row, col) => {
-                let same = self.db.as_ref().and_then(|d| d.edit.as_ref()).is_some_and(|e| e.row == row && e.col == col);
+                let same = self
+                    .db
+                    .as_ref()
+                    .and_then(|d| d.edit.as_ref())
+                    .is_some_and(|e| e.row == row && e.col == col);
                 if same || !self.db_commit(true) {
                     return;
                 }
@@ -617,7 +750,9 @@ impl App {
                 let Some(d) = &mut self.db else { return };
                 d.cycle_sort(col);
                 match d.sort {
-                    Some((c, desc)) => self.db_sorts.insert(d.ds.clone(), (d.cols[c].name.clone(), desc)),
+                    Some((c, desc)) => self
+                        .db_sorts
+                        .insert(d.ds.clone(), (d.cols[c].name.clone(), desc)),
                     None => self.db_sorts.remove(&d.ds),
                 };
             }
@@ -641,7 +776,12 @@ impl App {
                 }
             }
             Act::Commit(row, col) => {
-                if self.db.as_ref().and_then(|d| d.edit.as_ref()).is_some_and(|e| e.row == row && e.col == col) {
+                if self
+                    .db
+                    .as_ref()
+                    .and_then(|d| d.edit.as_ref())
+                    .is_some_and(|e| e.row == row && e.col == col)
+                {
                     self.db_commit(true);
                 }
             }
@@ -659,8 +799,16 @@ impl App {
     fn db_pick(&mut self, i: usize) {
         let (db, users) = (self.db.as_mut(), &self.users);
         let Some(db) = db else { return };
-        let Some((col, kind)) = db.edit.as_ref().map(|e| (e.col, db.cols[e.col].kind.clone())) else { return };
-        let Some((v, _)) = db.choices(col, users).into_iter().nth(i) else { return };
+        let Some((col, kind)) = db
+            .edit
+            .as_ref()
+            .map(|e| (e.col, db.cols[e.col].kind.clone()))
+        else {
+            return;
+        };
+        let Some((v, _)) = db.choices(col, users).into_iter().nth(i) else {
+            return;
+        };
         let e = db.edit.as_mut().expect("editing");
         e.cur = i;
         if kind == "multi_select" || kind == "people" {
@@ -703,11 +851,18 @@ impl App {
                 let (down, up) = (take(none, Key::ArrowDown).1, take(none, Key::ArrowUp).1);
                 let space = take(none, Key::Space).0 > 0;
                 let (db, users) = (self.db.as_mut().expect("open"), &self.users);
-                let n = db.choices(db.edit.as_ref().expect("editing").col, users).len();
+                let n = db
+                    .choices(db.edit.as_ref().expect("editing").col, users)
+                    .len();
                 let e = db.edit.as_mut().expect("editing");
                 e.cur = (e.cur + down).min(n.saturating_sub(1)).saturating_sub(up);
                 if space && kind != "select" && kind != "status" {
-                    self.db_pick(self.db.as_ref().and_then(|d| d.edit.as_ref()).map_or(0, |e| e.cur));
+                    self.db_pick(
+                        self.db
+                            .as_ref()
+                            .and_then(|d| d.edit.as_ref())
+                            .map_or(0, |e| e.cur),
+                    );
                 }
             }
             return;
@@ -766,7 +921,11 @@ impl App {
         }
         if space && mode == Kind::Table {
             let sel = self.db.as_ref().and_then(|d| d.sel.clone());
-            if let Some((row, col)) = sel.filter(|(_, c)| self.db.as_ref().is_some_and(|d| d.cols[*c].kind == "checkbox")) {
+            if let Some((row, col)) = sel.filter(|(_, c)| {
+                self.db
+                    .as_ref()
+                    .is_some_and(|d| d.cols[*c].kind == "checkbox")
+            }) {
                 if self.pushing() {
                     self.last_error = Some("editing is paused while a push runs".into());
                 } else {
@@ -780,7 +939,10 @@ impl App {
         if open {
             match self.db.as_ref().and_then(|d| d.sel.clone()) {
                 Some((row, _)) if !row.starts_with("local-") => self.open_or_pull(&row),
-                Some(_) => self.last_error = Some("this row isn't pushed yet: push it (Ctrl+S) first".into()),
+                Some(_) => {
+                    self.last_error =
+                        Some("this row isn't pushed yet: push it (Ctrl+S) first".into())
+                }
                 None => self.info = Some("select a row first".into()),
             }
         }
@@ -789,7 +951,11 @@ impl App {
     /// Enter in the editor: a single choice takes the highlighted one first.
     fn db_enter(&mut self, kind: &str) {
         if kind == "select" || kind == "status" {
-            let cur = self.db.as_ref().and_then(|d| d.edit.as_ref()).map_or(0, |e| e.cur);
+            let cur = self
+                .db
+                .as_ref()
+                .and_then(|d| d.edit.as_ref())
+                .map_or(0, |e| e.cur);
             return self.db_pick(cur);
         }
         self.db_commit(false);
@@ -800,7 +966,9 @@ impl App {
         let c = theme::colors(ui);
         let crumbs = self.breadcrumb();
         let title = untitled(&self.title).to_string();
-        let Some(mut db) = self.db.take() else { return Vec::new() };
+        let Some(mut db) = self.db.take() else {
+            return Vec::new();
+        };
         let choices = match &db.edit {
             Some(e) if is_choice(&db.cols[e.col].kind) => db.choices(e.col, &self.users),
             _ => Vec::new(),
@@ -811,205 +979,746 @@ impl App {
     }
 }
 
-fn grid_ui(ui: &mut Ui, c: &Colors, db: &mut Db, crumbs: &[(String, String, String)], title: &str, choices: &[(String, String)], media: &crate::media::Media) -> Vec<Action> {
+fn grid_ui(
+    ui: &mut Ui,
+    c: &Colors,
+    db: &mut Db,
+    crumbs: &[(String, String, String)],
+    title: &str,
+    choices: &[(String, String)],
+    media: &crate::media::Media,
+) -> Vec<Action> {
     let mut acts = Vec::new();
-    Frame::new().inner_margin(Margin::symmetric(16, 8)).show(ui, |ui| {
-        acts.extend(crate::view::breadcrumb(ui, c, crumbs, title));
-        ui.add_space(4.0);
-        ui.label(RichText::new(title).size(26.0).strong());
-        if db.tabs.len() > 1 {
+    Frame::new()
+        .inner_margin(Margin::symmetric(16, 8))
+        .show(ui, |ui| {
+            acts.extend(crate::view::breadcrumb(ui, c, crumbs, title));
+            ui.add_space(4.0);
+            ui.label(RichText::new(title).size(26.0).strong());
+            if db.tabs.len() > 1 {
+                ui.horizontal(|ui| {
+                    for (id, t) in &db.tabs {
+                        if ui.selectable_label(*id == db.ds, untitled(t)).clicked() && *id != db.ds
+                        {
+                            acts.push(Action::Db(Act::Tab(id.clone())));
+                        }
+                    }
+                });
+            }
             ui.horizontal(|ui| {
-                for (id, t) in &db.tabs {
-                    if ui.selectable_label(*id == db.ds, untitled(t)).clicked() && *id != db.ds {
-                        acts.push(Action::Db(Act::Tab(id.clone())));
+                for (i, d) in db.defs.iter().enumerate() {
+                    if ui
+                        .selectable_label(i == db.cur, &d.name)
+                        .on_hover_text("Ctrl+Shift+V: next view")
+                        .clicked()
+                        && i != db.cur
+                    {
+                        acts.push(Action::Db(Act::View(i)));
                     }
                 }
             });
-        }
-        ui.horizontal(|ui| {
-            for (i, d) in db.defs.iter().enumerate() {
-                if ui.selectable_label(i == db.cur, &d.name).on_hover_text("Ctrl+Shift+V: next view").clicked() && i != db.cur {
-                    acts.push(Action::Db(Act::View(i)));
+            ui.horizontal(|ui| {
+                let f = ui.add(
+                    TextEdit::singleline(&mut db.filter)
+                        .id(filter_id())
+                        .hint_text("Filter…  (Ctrl+F)")
+                        .desired_width(220.0),
+                );
+                if db.focus_filter {
+                    f.request_focus();
+                    db.focus_filter = false;
                 }
+                if f.changed() {
+                    db.arrange();
+                }
+                ui.label(
+                    RichText::new(format!("{} of {} rows", db.view.len(), db.rows.len()))
+                        .small()
+                        .color(c.secondary),
+                );
+                if ui.button("+ New").on_hover_text("Ctrl+Enter").clicked() {
+                    acts.push(Action::Db(Act::NewRow));
+                }
+            });
+            ui.add_space(6.0);
+            if db.mode() == Kind::Table {
+                table(ui, c, db, choices, &mut acts);
+            } else {
+                crate::views::body(ui, c, db, &mut acts, media);
             }
         });
-        ui.horizontal(|ui| {
-            let f = ui.add(TextEdit::singleline(&mut db.filter).id(filter_id()).hint_text("Filter…  (Ctrl+F)").desired_width(220.0));
-            if db.focus_filter {
-                f.request_focus();
-                db.focus_filter = false;
-            }
-            if f.changed() {
-                db.arrange();
-            }
-            ui.label(RichText::new(format!("{} of {} rows", db.view.len(), db.rows.len())).small().color(c.secondary));
-            if ui.button("+ New").on_hover_text("Ctrl+Enter").clicked() {
-                acts.push(Action::Db(Act::NewRow));
-            }
-        });
-        ui.add_space(6.0);
-        if db.mode() == Kind::Table {
-            table(ui, c, db, choices, &mut acts);
-        } else {
-            crate::views::body(ui, c, db, &mut acts, media);
-        }
-    });
     acts
 }
 
 /// Cell text, clipped to its cell.
 fn cell_text(ui: &Ui, cell: Rect, text: &str, size: f32, color: egui::Color32) {
-    ui.painter().with_clip_rect(cell.shrink2(vec2(2.0, 0.0))).text(
-        cell.left_center() + vec2(6.0, 0.0),
-        Align2::LEFT_CENTER,
-        text,
-        FontId::proportional(size),
-        color,
-    );
+    ui.painter()
+        .with_clip_rect(cell.shrink2(vec2(2.0, 0.0)))
+        .text(
+            cell.left_center() + vec2(6.0, 0.0),
+            Align2::LEFT_CENTER,
+            text,
+            FontId::proportional(size),
+            color,
+        );
 }
 
-fn table(ui: &mut Ui, c: &Colors, db: &mut Db, choices: &[(String, String)], acts: &mut Vec<Action>) {
+fn table(
+    ui: &mut Ui,
+    c: &Colors,
+    db: &mut Db,
+    choices: &[(String, String)],
+    acts: &mut Vec<Action>,
+) {
     let width = LEAD_W + COL_W * db.cols.len() as f32;
     let avail = (ui.available_height() - 2.0 * ROW_H - 20.0).max(100.0);
     let mut popup: Option<Rect> = None;
     let mut revealed = false;
-    egui::ScrollArea::horizontal().id_salt(("db-h", db.ds.clone())).auto_shrink([false, true]).show(ui, |ui| {
-        ui.spacing_mut().item_spacing = Vec2::ZERO;
-        let (head, _) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
-        ui.painter().rect_filled(head, 0.0, c.sidebar);
-        for (ci, col) in db.cols.iter().enumerate() {
-            let r = Rect::from_min_size(pos2(head.left() + LEAD_W + COL_W * ci as f32, head.top()), vec2(COL_W, ROW_H));
-            let resp = ui.interact(r, Id::unique(("db-head", &db.ds, ci)), Sense::click());
+    egui::ScrollArea::horizontal()
+        .id_salt(("db-h", db.ds.clone()))
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            let (head, _) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
+            ui.painter().rect_filled(head, 0.0, c.sidebar);
+            for (ci, col) in db.cols.iter().enumerate() {
+                let r = Rect::from_min_size(
+                    pos2(head.left() + LEAD_W + COL_W * ci as f32, head.top()),
+                    vec2(COL_W, ROW_H),
+                );
+                let resp = ui.interact(r, Id::unique(("db-head", &db.ds, ci)), Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(r, 0.0, c.hover);
+                }
+                let mark = match db.sort {
+                    Some((s, false)) if s == ci => " ▲",
+                    Some((s, true)) if s == ci => " ▼",
+                    _ => "",
+                };
+                cell_text(ui, r, &format!("{}{mark}", col.display), 13.0, c.secondary);
+                if resp
+                    .on_hover_text(format!("{} ({}): click to sort", col.display, col.kind))
+                    .clicked()
+                {
+                    acts.push(Action::Db(Act::Sort(ci)));
+                }
+            }
+            let mut area = egui::ScrollArea::vertical()
+                .id_salt(("db-v", db.ds.clone()))
+                .auto_shrink([false, false])
+                .max_height(avail);
+            if db.reveal {
+                if let Some(p) = db.sel.as_ref().and_then(|(id, _)| db.pos(id)) {
+                    let top = p as f32 * ROW_H;
+                    let h = db.height.max(ROW_H);
+                    let off = if top < db.offset {
+                        top
+                    } else if top + ROW_H > db.offset + h {
+                        top + ROW_H - h
+                    } else {
+                        db.offset
+                    };
+                    area = area.vertical_scroll_offset(off);
+                }
+            }
+            let out = area.show_rows(ui, ROW_H, db.view.len(), |ui, range| {
+                for pos in range {
+                    let row = &db.rows[db.view[pos]];
+                    let (rect, _) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
+                    if pos % 2 == 1 {
+                        ui.painter().rect_filled(rect, 0.0, c.hover);
+                    }
+                    ui.painter()
+                        .hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, c.border));
+                    let local = row.id.starts_with("local-");
+                    for (n, glyph, tip) in [
+                        (0.0, "↗", "Open as a page (Ctrl+Shift+O)"),
+                        (1.0, "🗑", "Trash (Ctrl+Shift+Backspace)"),
+                    ] {
+                        let r =
+                            Rect::from_min_size(rect.min + vec2(n * 28.0, 0.0), vec2(28.0, ROW_H));
+                        let resp = ui.interact(
+                            r,
+                            Id::unique(("db-lead", &row.id, n as u32)),
+                            Sense::click(),
+                        );
+                        if resp.hovered() {
+                            ui.painter().rect_filled(r, 3.0, c.hover);
+                        }
+                        ui.painter().text(
+                            r.center(),
+                            Align2::CENTER_CENTER,
+                            glyph,
+                            FontId::proportional(13.0),
+                            c.secondary,
+                        );
+                        if resp.on_hover_text(tip).clicked() {
+                            let id = row.id.clone();
+                            acts.push(Action::Db(if n == 0.0 {
+                                Act::OpenRow(id)
+                            } else {
+                                Act::Trash(id)
+                            }));
+                        }
+                    }
+                    for (ci, col) in db.cols.iter().enumerate() {
+                        let cell = Rect::from_min_size(
+                            pos2(rect.left() + LEAD_W + COL_W * ci as f32, rect.top()),
+                            vec2(COL_W, ROW_H),
+                        );
+                        let selected = db
+                            .sel
+                            .as_ref()
+                            .is_some_and(|(r, c)| *r == row.id && *c == ci);
+                        let editing = db
+                            .edit
+                            .as_ref()
+                            .is_some_and(|e| e.row == row.id && e.col == ci);
+                        if selected {
+                            ui.painter().rect_stroke(
+                                cell.shrink(1.0),
+                                2.0,
+                                Stroke::new(2.0, c.accent),
+                                egui::StrokeKind::Inside,
+                            );
+                            if db.reveal {
+                                ui.scroll_to_rect(cell, None);
+                                revealed = true;
+                            }
+                        }
+                        if editing && !is_choice(&col.kind) {
+                            let e = db.edit.as_mut().expect("editing");
+                            let eid = Id::unique(("db-edit", &e.row, e.col));
+                            if e.grab {
+                                let st = egui::text_edit::TextEditState::load(ui.ctx(), eid)
+                                    .unwrap_or_default();
+                                crate::app::set_cursor(ui.ctx(), eid, st, e.text.chars().count());
+                            }
+                            let r = ui.put(
+                                cell,
+                                TextEdit::singleline(&mut e.text)
+                                    .id(eid)
+                                    .frame(Frame::NONE)
+                                    .margin(Margin::symmetric(6, 4)),
+                            );
+                            if e.grab {
+                                r.request_focus();
+                                e.grab = !r.has_focus();
+                            } else if r.lost_focus() {
+                                // a click elsewhere: Enter and Esc were taken before the box saw them
+                                acts.push(Action::Db(Act::Commit(e.row.clone(), e.col)));
+                            }
+                            continue;
+                        }
+                        if editing {
+                            popup = Some(cell);
+                        }
+                        let resp =
+                            ui.interact(cell, Id::unique(("db-cell", &row.id, ci)), Sense::click());
+                        let ro = !props::editable(&col.kind);
+                        let color = if ro || local && ci > 0 {
+                            c.secondary
+                        } else {
+                            c.text
+                        };
+                        cell_text(ui, cell, &row.cells[ci], 14.0, color);
+                        if resp.clicked() {
+                            acts.push(Action::Db(Act::Cell(row.id.clone(), ci)));
+                        }
+                    }
+                }
+            });
+            db.offset = out.state.clamped_offset().y;
+            db.height = out.inner_rect.height();
+            if revealed {
+                db.reveal = false;
+            }
+            ui.add_space(4.0);
+            let (r, resp) =
+                ui.allocate_exact_size(vec2(width.min(LEAD_W + COL_W), ROW_H), Sense::click());
             if resp.hovered() {
-                ui.painter().rect_filled(r, 0.0, c.hover);
+                ui.painter().rect_filled(r, 3.0, c.hover);
             }
-            let mark = match db.sort {
-                Some((s, false)) if s == ci => " ▲",
-                Some((s, true)) if s == ci => " ▼",
-                _ => "",
-            };
-            cell_text(ui, r, &format!("{}{mark}", col.name), 13.0, c.secondary);
-            if resp.on_hover_text(format!("{} ({}): click to sort", col.name, col.kind)).clicked() {
-                acts.push(Action::Db(Act::Sort(ci)));
-            }
-        }
-        let mut area = egui::ScrollArea::vertical().id_salt(("db-v", db.ds.clone())).auto_shrink([false, false]).max_height(avail);
-        if db.reveal {
-            if let Some(p) = db.sel.as_ref().and_then(|(id, _)| db.pos(id)) {
-                let top = p as f32 * ROW_H;
-                let h = db.height.max(ROW_H);
-                let off = if top < db.offset { top } else if top + ROW_H > db.offset + h { top + ROW_H - h } else { db.offset };
-                area = area.vertical_scroll_offset(off);
-            }
-        }
-        let out = area.show_rows(ui, ROW_H, db.view.len(), |ui, range| {
-            for pos in range {
-                let row = &db.rows[db.view[pos]];
-                let (rect, _) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
-                if pos % 2 == 1 {
-                    ui.painter().rect_filled(rect, 0.0, c.hover);
-                }
-                ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, c.border));
-                let local = row.id.starts_with("local-");
-                for (n, glyph, tip) in [(0.0, "↗", "Open as a page (Ctrl+Shift+O)"), (1.0, "🗑", "Trash (Ctrl+Shift+Backspace)")] {
-                    let r = Rect::from_min_size(rect.min + vec2(n * 28.0, 0.0), vec2(28.0, ROW_H));
-                    let resp = ui.interact(r, Id::unique(("db-lead", &row.id, n as u32)), Sense::click());
-                    if resp.hovered() {
-                        ui.painter().rect_filled(r, 3.0, c.hover);
-                    }
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(13.0), c.secondary);
-                    if resp.on_hover_text(tip).clicked() {
-                        let id = row.id.clone();
-                        acts.push(Action::Db(if n == 0.0 { Act::OpenRow(id) } else { Act::Trash(id) }));
-                    }
-                }
-                for (ci, col) in db.cols.iter().enumerate() {
-                    let cell = Rect::from_min_size(pos2(rect.left() + LEAD_W + COL_W * ci as f32, rect.top()), vec2(COL_W, ROW_H));
-                    let selected = db.sel.as_ref().is_some_and(|(r, c)| *r == row.id && *c == ci);
-                    let editing = db.edit.as_ref().is_some_and(|e| e.row == row.id && e.col == ci);
-                    if selected {
-                        ui.painter().rect_stroke(cell.shrink(1.0), 2.0, Stroke::new(2.0, c.accent), egui::StrokeKind::Inside);
-                        if db.reveal {
-                            ui.scroll_to_rect(cell, None);
-                            revealed = true;
-                        }
-                    }
-                    if editing && !is_choice(&col.kind) {
-                        let e = db.edit.as_mut().expect("editing");
-                        let eid = Id::unique(("db-edit", &e.row, e.col));
-                        if e.grab {
-                            let st = egui::text_edit::TextEditState::load(ui.ctx(), eid).unwrap_or_default();
-                            crate::app::set_cursor(ui.ctx(), eid, st, e.text.chars().count());
-                        }
-                        let r = ui.put(cell, TextEdit::singleline(&mut e.text).id(eid).frame(Frame::NONE).margin(Margin::symmetric(6, 4)));
-                        if e.grab {
-                            r.request_focus();
-                            e.grab = !r.has_focus();
-                        } else if r.lost_focus() {
-                            // a click elsewhere: Enter and Esc were taken before the box saw them
-                            acts.push(Action::Db(Act::Commit(e.row.clone(), e.col)));
-                        }
-                        continue;
-                    }
-                    if editing {
-                        popup = Some(cell);
-                    }
-                    let resp = ui.interact(cell, Id::unique(("db-cell", &row.id, ci)), Sense::click());
-                    let ro = !props::editable(&col.kind);
-                    let color = if ro || local && ci > 0 { c.secondary } else { c.text };
-                    cell_text(ui, cell, &row.cells[ci], 14.0, color);
-                    if resp.clicked() {
-                        acts.push(Action::Db(Act::Cell(row.id.clone(), ci)));
-                    }
-                }
+            cell_text(ui, r, "+ New", 14.0, c.secondary);
+            if resp.clicked() {
+                acts.push(Action::Db(Act::NewRow));
             }
         });
-        db.offset = out.state.clamped_offset().y;
-        db.height = out.inner_rect.height();
-        if revealed {
-            db.reveal = false;
-        }
-        ui.add_space(4.0);
-        let (r, resp) = ui.allocate_exact_size(vec2(width.min(LEAD_W + COL_W), ROW_H), Sense::click());
-        if resp.hovered() {
-            ui.painter().rect_filled(r, 3.0, c.hover);
-        }
-        cell_text(ui, r, "+ New", 14.0, c.secondary);
-        if resp.clicked() {
-            acts.push(Action::Db(Act::NewRow));
-        }
-    });
     if let (Some(cell), Some(e)) = (popup, &db.edit) {
         let multi = matches!(db.cols[e.col].kind.as_str(), "multi_select" | "people");
         let chosen = items(&e.text);
         let ctx = ui.ctx().clone();
-        let area = egui::Area::new(Id::unique("db-choices")).order(egui::Order::Foreground).fixed_pos(cell.left_bottom()).show(&ctx, |ui| {
-            Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_min_width(COL_W);
-                if choices.is_empty() {
-                    ui.label(RichText::new("No options").color(c.secondary));
-                }
-                egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                    for (i, (v, label)) in choices.iter().enumerate() {
-                        let on = chosen.contains(v) || (v.is_empty() && chosen.is_empty());
-                        let mark = match (multi, on) {
-                            (true, true) => "☑ ",
-                            (true, false) => "☐ ",
-                            (false, true) => "● ",
-                            (false, false) => "   ",
-                        };
-                        if ui.selectable_label(i == e.cur, format!("{mark}{label}")).clicked() {
-                            acts.push(Action::Db(Act::Pick(i)));
-                        }
+        let area = egui::Area::new(Id::unique("db-choices"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(cell.left_bottom())
+            .show(&ctx, |ui| {
+                Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(COL_W);
+                    if choices.is_empty() {
+                        ui.label(RichText::new("No options").color(c.secondary));
                     }
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            for (i, (v, label)) in choices.iter().enumerate() {
+                                let on = chosen.contains(v) || (v.is_empty() && chosen.is_empty());
+                                let mark = match (multi, on) {
+                                    (true, true) => "☑ ",
+                                    (true, false) => "☐ ",
+                                    (false, true) => "● ",
+                                    (false, false) => "   ",
+                                };
+                                if ui
+                                    .selectable_label(i == e.cur, format!("{mark}{label}"))
+                                    .clicked()
+                                {
+                                    acts.push(Action::Db(Act::Pick(i)));
+                                }
+                            }
+                        });
                 });
             });
-        });
         // a click outside closes it, keeping what was picked
-        let click = ctx.input(|i| i.pointer.primary_clicked().then(|| i.pointer.interact_pos()).flatten());
+        let click = ctx.input(|i| {
+            i.pointer
+                .primary_clicked()
+                .then(|| i.pointer.interact_pos())
+                .flatten()
+        });
         if click.is_some_and(|p| !area.response.rect.contains(p) && !cell.contains(p)) {
             acts.push(Action::Db(Act::Commit(e.row.clone(), e.col)));
         }
+    }
+}
+
+// ------------------------------------------------------------- inline views
+
+/// A numeric chart: the x/y properties and the (x, y) points behind it.
+struct ChartView {
+    x_name: String,
+    points: Vec<(f64, f64)>,
+}
+
+/// The first two numeric properties are the x and y axes (Notion's chart
+/// views are configured server-side; this is the local approximation). Rows
+/// with an empty value on either axis are left out.
+fn chart_view(db: &Db) -> Option<ChartView> {
+    let numeric: Vec<usize> = db
+        .cols
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.kind == "number")
+        .map(|(i, _)| i)
+        .collect();
+    let (xi, yi) = (*numeric.first()?, *numeric.get(1)?);
+    let mut points = Vec::new();
+    for &ri in &db.view {
+        let row = &db.rows[ri];
+        let x = row
+            .props
+            .get(db.cols[xi].name.as_str())
+            .and_then(props::sort_num);
+        let y = row
+            .props
+            .get(db.cols[yi].name.as_str())
+            .and_then(props::sort_num);
+        if let (Some(x), Some(y)) = (x, y) {
+            points.push((x, y));
+        }
+    }
+    points.sort_by(|a, b| a.0.total_cmp(&b.0));
+    (points.len() >= 2).then(|| ChartView {
+        x_name: db.cols[xi].display.clone(),
+        points,
+    })
+}
+
+impl App {
+    /// A child database drawn inline: view tabs, then its chart or table.
+    /// Falls back to Notion's underlined database link when it isn't cached.
+    pub(crate) fn embedded_db_ui(
+        &mut self,
+        ui: &mut Ui,
+        block_id: &str,
+        title: &str,
+    ) -> Option<Action> {
+        let ds = self
+            .store
+            .data_sources_of(block_id)
+            .ok()
+            .and_then(|mut v| (!v.is_empty()).then(|| v.remove(0)));
+        let Some(ds) = ds else {
+            let text = if title.is_empty() { "Untitled" } else { title };
+            let (rect, r) =
+                ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+            crate::icons::paint(
+                ui,
+                Rect::from_center_size(pos2(rect.left() + 8.0, rect.center().y), vec2(16.0, 16.0)),
+                crate::icons::Icon::Database,
+                ui.visuals().weak_text_color(),
+            );
+            ui.painter().text(
+                pos2(rect.left() + 20.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                text,
+                FontId::proportional(16.0),
+                ui.visuals().text_color(),
+            );
+            return r.clicked().then(|| Action::Link {
+                link: crate::links::Link::Page(block_id.to_string()),
+                new_tab: false,
+            });
+        };
+        let pages: Vec<Page> = {
+            let mut pages: Vec<Page> = self
+                .store
+                .rows(&ds.id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|p| !p.in_trash)
+                .collect();
+            // insertion order, like the database's own table view
+            pages.sort_by(|a, b| {
+                a.created_time
+                    .cmp(&b.created_time)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            pages
+        };
+        let mut db = Db::new(&ds, &pages, &self.users, None);
+        db.arrange();
+        let chart = chart_view(&db);
+        let c = theme::colors(ui);
+        let state = Id::unique(("inline-db", block_id));
+        let mut table = ui
+            .ctx()
+            .data(|d| d.get_temp::<bool>(state))
+            .unwrap_or(chart.is_none());
+        let mut act = None;
+        // the row body is laid out horizontally; stack the database in it
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
+            if !title.is_empty() && title != "Database" && title != "Untitled" {
+                ui.label(RichText::new(title).size(16.0).strong());
+                ui.add_space(4.0);
+            }
+            ui.horizontal(|ui| {
+                if chart.is_some() && tab(ui, c, "Diagramm", crate::icons::Icon::Chart, !table) {
+                    table = false;
+                    ui.ctx().request_repaint();
+                }
+                if tab(ui, c, "Daten", crate::icons::Icon::Table, table) {
+                    table = true;
+                    ui.ctx().request_repaint();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (rect, r) = ui.allocate_exact_size(vec2(58.0, 26.0), Sense::click());
+                    let fill = if r.hovered() {
+                        c.accent.gamma_multiply(0.88)
+                    } else {
+                        c.accent
+                    };
+                    ui.painter().rect_filled(rect, 4.0, fill);
+                    ui.painter().text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        "Neu",
+                        FontId::proportional(12.5),
+                        Color32::WHITE,
+                    );
+                    if r.clicked() {
+                        act = Some(Action::Link {
+                            link: crate::links::Link::Page(ds.id.clone()),
+                            new_tab: false,
+                        });
+                    }
+                });
+            });
+            ui.ctx().data_mut(|d| d.insert_temp(state, table));
+            ui.add_space(4.0);
+            if table || chart.is_none() {
+                inline_table(ui, c, &db, &mut act);
+            } else if let Some(chart) = &chart {
+                inline_chart(ui, c, chart);
+            }
+        });
+        act
+    }
+}
+
+/// A view tab: icon plus label, filled when selected.
+fn tab(ui: &mut Ui, c: &Colors, label: &str, icon: crate::icons::Icon, on: bool) -> bool {
+    let font = FontId::proportional(12.5);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font.clone(), c.text);
+    let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + 34.0, 26.0), Sense::click());
+    if on {
+        ui.painter().rect_filled(rect, 4.0, c.border);
+    } else if r.hovered() {
+        ui.painter().rect_filled(rect, 4.0, c.hover);
+    }
+    let color = if on { c.text } else { c.secondary };
+    crate::icons::paint(
+        ui,
+        Rect::from_center_size(pos2(rect.left() + 14.0, rect.center().y), vec2(13.0, 13.0)),
+        icon,
+        color,
+    );
+    ui.painter().text(
+        pos2(rect.left() + 25.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        font,
+        color,
+    );
+    r.clicked()
+}
+
+/// The database's rows as a Notion table: header, entries, "+ Neu".
+fn inline_table(ui: &mut Ui, c: &Colors, db: &Db, act: &mut Option<Action>) {
+    let n = db.cols.len();
+    if n == 0 {
+        return;
+    }
+    let width = ui.available_width();
+    let title_w = if n > 1 {
+        (width * 0.4).min(270.0)
+    } else {
+        width
+    };
+    let other_w = if n > 1 {
+        (width - title_w) / (n - 1) as f32
+    } else {
+        width
+    };
+    let widths: Vec<f32> = (0..n)
+        .map(|i| if i == 0 { title_w } else { other_w })
+        .collect();
+    let (header_h, row_h) = (30.0, 32.0);
+    let mut visible: Vec<usize> = db
+        .view
+        .iter()
+        .copied()
+        .filter(|&ri| {
+            let row = &db.rows[ri];
+            row.cells.iter().any(|cell| !cell.trim().is_empty())
+        })
+        .collect();
+    // the chart's x values read best in order; empty ones last
+    if let Some(xi) = db.cols.iter().position(|c| c.kind == "number") {
+        let key = |ri: usize| {
+            db.rows[ri]
+                .props
+                .get(db.cols[xi].name.as_str())
+                .and_then(props::sort_num)
+                .unwrap_or(f64::INFINITY)
+        };
+        visible.sort_by(|&a, &b| key(a).total_cmp(&key(b)));
+    }
+    let height = header_h + row_h * (visible.len() + 1) as f32;
+    let (outer, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    let stroke = Stroke::new(1.0, c.border);
+    let header = Rect::from_min_size(outer.min, vec2(width, header_h));
+    ui.painter().rect_filled(header, 4.0, c.sidebar);
+    let mut x = outer.left();
+    for (ci, w) in widths.iter().enumerate() {
+        let cell = Rect::from_min_size(pos2(x, outer.top()), vec2(*w, header_h));
+        cell_text(ui, cell, &db.cols[ci].display, 12.5, c.secondary);
+        x += w;
+    }
+    let mut y = outer.top() + header_h;
+    ui.painter().hline(outer.x_range(), y, stroke);
+    for &ri in &visible {
+        let row = &db.rows[ri];
+        x = outer.left();
+        for (ci, w) in widths.iter().enumerate() {
+            let cell = Rect::from_min_size(pos2(x, y), vec2(*w, row_h));
+            cell_text(ui, cell, &row.cells[ci], 13.0, c.text);
+            x += w;
+        }
+        y += row_h;
+        ui.painter().hline(outer.x_range(), y, stroke);
+    }
+    x = outer.left();
+    for (ci, w) in widths.iter().enumerate() {
+        if ci > 0 {
+            ui.painter().vline(x, outer.y_range(), stroke);
+        }
+        x += w;
+    }
+    ui.painter()
+        .rect_stroke(outer, 4.0, stroke, egui::StrokeKind::Inside);
+    let new_row = Rect::from_min_size(pos2(outer.left(), y), vec2(width, row_h));
+    let resp = ui.interact(
+        new_row,
+        Id::unique(("inline-db-new", &db.ds)),
+        Sense::click(),
+    );
+    if resp.hovered() {
+        ui.painter().rect_filled(new_row, 0.0, c.hover);
+    }
+    ui.painter().text(
+        new_row.left_center() + vec2(10.0, 0.0),
+        Align2::LEFT_CENTER,
+        "+ Neu",
+        FontId::proportional(13.0),
+        c.secondary,
+    );
+    if resp.clicked() {
+        *act = Some(Action::Link {
+            link: crate::links::Link::Page(db.ds.clone()),
+            new_tab: false,
+        });
+    }
+}
+
+/// The chart: plot area, faint grid, axis ticks and the blue series.
+fn inline_chart(ui: &mut Ui, c: &Colors, chart: &ChartView) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 302.0), Sense::hover());
+    let plot = Rect::from_min_max(
+        pos2(rect.left() + 44.0, rect.top() + 2.0),
+        pos2(rect.right() - 8.0, rect.bottom() - 40.0),
+    );
+    ui.painter().rect_filled(plot, 6.0, c.sidebar);
+    let xs: Vec<f64> = chart.points.iter().map(|p| p.0).collect();
+    let ys: Vec<f64> = chart.points.iter().map(|p| p.1).collect();
+    let (x0, x1, xstep) = x_axis(&xs);
+    let (y0, y1, ystep) = y_axis(&ys);
+    let sx = |v: f64| plot.left() + ((v - x0) / (x1 - x0)) as f32 * plot.width();
+    let sy = |v: f64| plot.bottom() - ((v - y0) / (y1 - y0)) as f32 * plot.height();
+    let grid = Stroke::new(1.0, c.border.gamma_multiply(0.85));
+    let mut v = (y0 / ystep).ceil() * ystep;
+    while v <= y1 + ystep * 1e-6 {
+        let y = sy(v);
+        dashed_hline(ui, plot.x_range(), y, grid);
+        ui.painter().text(
+            pos2(plot.left() - 8.0, y),
+            Align2::RIGHT_CENTER,
+            fmt_num(v),
+            FontId::proportional(11.0),
+            c.secondary,
+        );
+        v += ystep;
+    }
+    let mut v = (x0 / xstep).ceil() * xstep;
+    while v <= x1 + xstep * 1e-6 {
+        ui.painter().text(
+            pos2(sx(v), plot.bottom() + 12.0),
+            Align2::CENTER_CENTER,
+            fmt_num(v),
+            FontId::proportional(11.0),
+            c.secondary,
+        );
+        v += xstep;
+    }
+    let points: Vec<egui::Pos2> = chart
+        .points
+        .iter()
+        .map(|&(x, y)| pos2(sx(x), sy(y)))
+        .collect();
+    ui.painter().add(egui::Shape::line(
+        points.clone(),
+        Stroke::new(2.0, c.accent),
+    ));
+    let font = FontId::proportional(11.0);
+    for (i, &(_, y)) in chart.points.iter().enumerate() {
+        let p = points[i];
+        let at = if plot.width() > 24.0 {
+            pos2(p.x.clamp(plot.left() + 8.0, plot.right() - 8.0), p.y - 9.0)
+        } else {
+            p
+        };
+        ui.painter().text(
+            at,
+            Align2::CENTER_BOTTOM,
+            fmt_num(y),
+            font.clone(),
+            c.accent,
+        );
+    }
+    // the x property's legend under the axis, as Notion draws it
+    let cx = plot.center().x;
+    let by = rect.bottom() - 14.0;
+    ui.painter().line_segment(
+        [pos2(cx - 48.0, by), pos2(cx - 36.0, by)],
+        Stroke::new(2.0, c.accent),
+    );
+    ui.painter().text(
+        pos2(cx - 31.0, by),
+        Align2::LEFT_CENTER,
+        &chart.x_name,
+        FontId::proportional(11.5),
+        c.secondary,
+    );
+}
+
+fn extent(vals: &[f64]) -> (f64, f64) {
+    vals.iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+            (lo.min(v), hi.max(v))
+        })
+}
+
+/// 1, 2, 5 × 10ⁿ near `v`.
+fn nice_step(v: f64) -> f64 {
+    if !v.is_finite() || v <= 0.0 {
+        return 1.0;
+    }
+    let e = 10f64.powf(v.log10().floor());
+    let m = v / e;
+    let n = if m <= 1.0 {
+        1.0
+    } else if m <= 2.0 {
+        2.0
+    } else if m <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    n * e
+}
+
+/// A half tick of breathing room on each side of the data.
+fn x_axis(vals: &[f64]) -> (f64, f64, f64) {
+    let (lo, mut hi) = extent(vals);
+    if hi - lo < 1e-9 {
+        hi = lo + 1.0;
+    }
+    let step = nice_step((hi - lo) / 4.0);
+    (lo - step / 2.0, hi + step / 2.0, step)
+}
+
+/// Half a span of padding beyond the data, snapped to whole ticks.
+fn y_axis(vals: &[f64]) -> (f64, f64, f64) {
+    let (lo, hi) = extent(vals);
+    let span = (hi - lo).max(1.0);
+    let step = nice_step(span / 2.0);
+    (
+        ((lo - span / 2.0) / step).floor() * step,
+        ((hi + span / 2.0) / step).ceil() * step,
+        step,
+    )
+}
+
+fn fmt_num(v: f64) -> String {
+    if (v - v.round()).abs() < 1e-9 {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{v:.2}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
+}
+
+fn dashed_hline(ui: &Ui, x: egui::Rangef, y: f32, stroke: Stroke) {
+    let mut x0 = x.min;
+    while x0 < x.max {
+        let x1 = (x0 + 3.0).min(x.max);
+        ui.painter()
+            .line_segment([pos2(x0, y), pos2(x1, y)], stroke);
+        x0 += 7.0;
     }
 }
 
@@ -1027,7 +1736,22 @@ mod tests {
 
     const T: &str = "2025-01-01T00:00:00.000Z";
     const NONE: Modifiers = Modifiers::NONE;
-    const CS: Modifiers = Modifiers { ctrl: true, shift: true, ..Modifiers::NONE };
+    const CS: Modifiers = Modifiers {
+        ctrl: true,
+        shift: true,
+        ..Modifiers::NONE
+    };
+
+    #[test]
+    fn chart_axes_follow_the_notion_example() {
+        // (t/s, s/m): (1, 2), (3, -2), (5, 2)
+        assert_eq!(x_axis(&[1.0, 3.0, 5.0]), (0.5, 5.5, 1.0));
+        assert_eq!(y_axis(&[-2.0, 2.0, 2.0]), (-4.0, 4.0, 2.0));
+        assert_eq!(fmt_num(-2.0), "-2");
+        assert_eq!(fmt_num(2.5), "2.5");
+        let (lo, hi, step) = y_axis(&[3.0, 3.0]);
+        assert!(lo < 3.0 && hi > 3.0 && step > 0.0);
+    }
 
     fn schema() -> Value {
         let o = |names: &[&str]| json!({ "options": names.iter().map(|n| json!({ "id": format!("o-{n}"), "name": n, "color": "gray" })).collect::<Vec<_>>() });
@@ -1048,8 +1772,15 @@ mod tests {
             ("Calc", "formula", json!({ "expression": "1" })),
             ("Made", "created_time", json!({})),
         ] {
-            let id = if kind == "title" { "title".to_string() } else { format!("id-{name}") };
-            m.insert(name.into(), json!({ "id": id, "name": name, "type": kind, kind: cfg }));
+            let id = if kind == "title" {
+                "title".to_string()
+            } else {
+                format!("id-{name}")
+            };
+            m.insert(
+                name.into(),
+                json!({ "id": id, "name": name, "type": kind, kind: cfg }),
+            );
         }
         Value::Object(m)
     }
@@ -1066,7 +1797,11 @@ mod tests {
     }
 
     fn row(id: &str, created: &str, name: &str, qty: Option<f64>) -> Page {
-        let who = if id == "r1" { json!([{ "object": "user", "id": "u1" }]) } else { json!([]) };
+        let who = if id == "r1" {
+            json!([{ "object": "user", "id": "u1" }])
+        } else {
+            json!([])
+        };
         let prop = |n: &str, k: &str, v: Value| json!({ "id": format!("id-{n}"), "type": k, k: v });
         serde_json::from_value(json!({
             "object": "page", "id": id, "created_time": created, "last_edited_time": T, "in_trash": false, "url": "https://notion.so/x",
@@ -1092,11 +1827,18 @@ mod tests {
     }
 
     fn user(id: &str, name: &str) -> User {
-        User::from_value(&json!({ "object": "user", "id": id, "type": "person", "name": name })).unwrap()
+        User::from_value(&json!({ "object": "user", "id": id, "type": "person", "name": name }))
+            .unwrap()
     }
 
     fn skipped(id: &str) -> WEvent {
-        WEvent::Pulled { id: id.into(), report: PullReport { skipped: true, ..Default::default() } }
+        WEvent::Pulled {
+            id: id.into(),
+            report: PullReport {
+                skipped: true,
+                ..Default::default()
+            },
+        }
     }
 
     /// A table of three rows, Beta (5), alpha (10), Gamma (no quantity),
@@ -1104,17 +1846,35 @@ mod tests {
     fn win() -> Win {
         let store = Store::open_in_memory().unwrap();
         store.upsert_data_source(&ds("ds", "Tasks", "db")).unwrap();
-        for p in [row("r1", T, "Beta", Some(5.0)), row("r2", "2025-01-02T00:00:00.000Z", "alpha", Some(10.0)), row("r3", "2025-01-03T00:00:00.000Z", "Gamma", None)] {
+        for p in [
+            row("r1", T, "Beta", Some(5.0)),
+            row("r2", "2025-01-02T00:00:00.000Z", "alpha", Some(10.0)),
+            row("r3", "2025-01-03T00:00:00.000Z", "Gamma", None),
+        ] {
             store.upsert_page(&p).unwrap();
         }
-        store.put_users(&[user("u1", "Ada Lovelace"), user("u2", "Bob")]).unwrap();
+        store
+            .put_users(&[user("u1", "Ada Lovelace"), user("u2", "Bob")])
+            .unwrap();
         add_page(&store, "p", None, &["a"]);
         let mut w = Win::new(store);
         w.app.apply(Action::Open("ds".into()));
         w.frames(vec![]);
-        assert_eq!(w.cmds(), [Cmd::Pull { id: "ds".into(), force: false }, Cmd::Views { ds: "ds".into() }]);
+        assert_eq!(
+            w.cmds(),
+            [
+                Cmd::Pull {
+                    id: "ds".into(),
+                    force: false
+                },
+                Cmd::Views { ds: "ds".into() }
+            ]
+        );
         w.answer(skipped("ds"));
-        w.answer(WEvent::Views { ds: "ds".into(), views: Vec::new() });
+        w.answer(WEvent::Views {
+            ds: "ds".into(),
+            views: Vec::new(),
+        });
         w
     }
 
@@ -1128,7 +1888,11 @@ mod tests {
 
     /// The row ids in the order shown.
     fn order(w: &Win) -> Vec<String> {
-        db(w).view.iter().map(|&i| db(w).rows[i].id.clone()).collect()
+        db(w)
+            .view
+            .iter()
+            .map(|&i| db(w).rows[i].id.clone())
+            .collect()
     }
 
     fn select(w: &mut Win, row: &str, name: &str) {
@@ -1137,7 +1901,13 @@ mod tests {
     }
 
     fn ops(w: &Win) -> Vec<OpKind> {
-        w.app.store.queued_ops().unwrap().into_iter().map(|o| o.kind).collect()
+        w.app
+            .store
+            .queued_ops()
+            .unwrap()
+            .into_iter()
+            .map(|o| o.kind)
+            .collect()
     }
 
     /// The properties the one queued update of `row` writes.
@@ -1145,7 +1915,10 @@ mod tests {
         let mine: Vec<Value> = ops(w)
             .into_iter()
             .filter_map(|k| match k {
-                OpKind::UpdatePageProperties { page_id, properties } if page_id == row => Some(properties),
+                OpKind::UpdatePageProperties {
+                    page_id,
+                    properties,
+                } if page_id == row => Some(properties),
                 _ => None,
             })
             .collect();
@@ -1166,10 +1939,22 @@ mod tests {
         assert_eq!(names[0], "Name", "the title comes first");
         assert_eq!(names.len(), 14);
         assert_eq!(order(&w), ["r1", "r2", "r3"], "created order");
-        for t in ["Name", "Qty", "Beta", "alpha", "Gamma", "Ada Lovelace", "3 of 3 rows"] {
+        for t in [
+            "Name",
+            "Qty",
+            "Beta",
+            "alpha",
+            "Gamma",
+            "Ada Lovelace",
+            "3 of 3 rows",
+        ] {
             assert!(w.shown.contains(t), "{t} in {}", w.shown);
         }
-        assert_eq!(cell(&w, "r1", "Who"), "Ada Lovelace", "people by their names");
+        assert_eq!(
+            cell(&w, "r1", "Who"),
+            "Ada Lovelace",
+            "people by their names"
+        );
         assert_eq!(cell(&w, "r1", "Calc"), "f");
         assert_eq!(cell(&w, "r2", "Qty"), "10");
     }
@@ -1177,15 +1962,33 @@ mod tests {
     #[test]
     fn a_database_opens_as_its_first_data_source_and_the_others_are_tabs() {
         let mut w = win();
-        w.app.store.upsert_data_source(&ds("ds2", "Archive", "db")).unwrap();
+        w.app
+            .store
+            .upsert_data_source(&ds("ds2", "Archive", "db"))
+            .unwrap();
         w.app.apply(Action::Open("db".into()));
         w.frames(vec![]);
         // by title: Archive < Tasks
         assert_eq!(w.app.current.as_deref(), Some("ds2"));
-        assert_eq!(db(&w).tabs.iter().map(|t| t.0.as_str()).collect::<Vec<_>>(), ["ds2", "ds"]);
-        assert_eq!(w.cmds(), [Cmd::Pull { id: "ds2".into(), force: false }, Cmd::Views { ds: "ds2".into() }]);
+        assert_eq!(
+            db(&w).tabs.iter().map(|t| t.0.as_str()).collect::<Vec<_>>(),
+            ["ds2", "ds"]
+        );
+        assert_eq!(
+            w.cmds(),
+            [
+                Cmd::Pull {
+                    id: "ds2".into(),
+                    force: false
+                },
+                Cmd::Views { ds: "ds2".into() }
+            ]
+        );
         w.answer(skipped("ds2"));
-        w.answer(WEvent::Views { ds: "ds2".into(), views: Vec::new() });
+        w.answer(WEvent::Views {
+            ds: "ds2".into(),
+            views: Vec::new(),
+        });
         assert!(db(&w).rows.is_empty() && w.shown.contains("Archive"));
         // another tab shows its own rows
         w.app.apply(Action::Db(Act::Tab("ds".into())));
@@ -1198,11 +2001,27 @@ mod tests {
     fn an_uncached_database_is_pulled_and_opens_when_its_data_source_arrives() {
         let mut w = win();
         w.app.apply(Action::Open("dbx".into()));
-        assert_eq!(w.cmds(), [Cmd::Pull { id: "dbx".into(), force: false }]);
+        assert_eq!(
+            w.cmds(),
+            [Cmd::Pull {
+                id: "dbx".into(),
+                force: false
+            }]
+        );
         assert_eq!(w.app.current.as_deref(), Some("ds"));
         // the worker cached the database's data source
-        w.app.store.upsert_data_source(&ds("dsx", "Other", "dbx")).unwrap();
-        w.answer(WEvent::Pulled { id: "dbx".into(), report: PullReport { fetched: 0, updated: 0, skipped: false } });
+        w.app
+            .store
+            .upsert_data_source(&ds("dsx", "Other", "dbx"))
+            .unwrap();
+        w.answer(WEvent::Pulled {
+            id: "dbx".into(),
+            report: PullReport {
+                fetched: 0,
+                updated: 0,
+                skipped: false,
+            },
+        });
         assert_eq!(w.app.current.as_deref(), Some("dsx"));
         assert!(w.app.db.is_some() && w.app.pending_open.is_none());
     }
@@ -1215,7 +2034,10 @@ mod tests {
         w.app.apply(Action::Open("ds".into()));
         assert!(w.app.db.is_some());
         w.app.apply(Action::Open("p".into()));
-        assert!(w.app.db.is_none() && !w.app.rows.is_empty(), "back on a page");
+        assert!(
+            w.app.db.is_none() && !w.app.rows.is_empty(),
+            "back on a page"
+        );
     }
 
     #[test]
@@ -1242,16 +2064,26 @@ mod tests {
         assert_eq!(db(&w).sort, Some((qty, true)));
         assert_eq!(order(&w), ["r2", "r1", "r3"]);
         // a sort stays when a poll brings a new row
-        w.app.store.upsert_page(&row("r4", "2025-01-04T00:00:00.000Z", "Delta", Some(7.0))).unwrap();
+        w.app
+            .store
+            .upsert_page(&row("r4", "2025-01-04T00:00:00.000Z", "Delta", Some(7.0)))
+            .unwrap();
         w.app.refresh();
         assert_eq!(order(&w), ["r2", "r4", "r1", "r3"]);
-        assert_eq!(click(&mut w, qty), ["r1", "r2", "r3", "r4"], "cleared: created order");
+        assert_eq!(
+            click(&mut w, qty),
+            ["r1", "r2", "r3", "r4"],
+            "cleared: created order"
+        );
     }
 
     #[test]
     fn the_filter_matches_all_cell_text_ignoring_case_and_umlauts() {
         let mut w = win();
-        w.app.store.upsert_page(&row("r4", "2025-01-04T00:00:00.000Z", "Müller", Some(1.0))).unwrap();
+        w.app
+            .store
+            .upsert_page(&row("r4", "2025-01-04T00:00:00.000Z", "Müller", Some(1.0)))
+            .unwrap();
         w.app.refresh();
         let filter = |w: &mut Win, f: &str| {
             let d = w.app.db.as_mut().unwrap();
@@ -1262,7 +2094,11 @@ mod tests {
         assert_eq!(filter(&mut w, "ALPHA"), ["r2"]);
         assert_eq!(filter(&mut w, "mueller"), ["r4"]);
         assert_eq!(filter(&mut w, "MÜLL"), ["r4"], "folded both ways");
-        assert_eq!(filter(&mut w, "lovelace"), ["r1"], "any column, people by name");
+        assert_eq!(
+            filter(&mut w, "lovelace"),
+            ["r1"],
+            "any column, people by name"
+        );
         assert_eq!(filter(&mut w, "zzz"), Vec::<String>::new());
         assert_eq!(filter(&mut w, ""), ["r1", "r2", "r3", "r4"]);
         // typed into the box: Ctrl+F focuses it, Esc leaves it
@@ -1272,7 +2108,11 @@ mod tests {
         assert!(w.shown.contains("1 of 4 rows"));
         w.press(Key::Escape, NONE);
         w.press(Key::ArrowDown, NONE);
-        assert_eq!(db(&w).sel.as_ref().map(|s| s.0.as_str()), Some("r3"), "the keys are the table's again");
+        assert_eq!(
+            db(&w).sel.as_ref().map(|s| s.0.as_str()),
+            Some("r3"),
+            "the keys are the table's again"
+        );
         // a selected row the filter hides is deselected
         let d = w.app.db.as_mut().unwrap();
         d.filter = "beta".into();
@@ -1292,7 +2132,11 @@ mod tests {
         for _ in 0..30 {
             w.press(Key::ArrowRight, NONE);
         }
-        assert_eq!(db(&w).sel.as_ref().unwrap().1, 13, "clamped at the last column");
+        assert_eq!(
+            db(&w).sel.as_ref().unwrap().1,
+            13,
+            "clamped at the last column"
+        );
         for _ in 0..5 {
             w.press(Key::ArrowDown, NONE);
         }
@@ -1306,7 +2150,11 @@ mod tests {
         assert_eq!(db(&w).edit.as_ref().map(|e| e.text.as_str()), Some("Beta"));
         w.frames(vec![]);
         w.type_text("X");
-        assert_eq!(db(&w).edit.as_ref().unwrap().text, "BetaX", "typing reaches the box");
+        assert_eq!(
+            db(&w).edit.as_ref().unwrap().text,
+            "BetaX",
+            "typing reaches the box"
+        );
         w.press(Key::Escape, NONE);
         assert!(db(&w).edit.is_none());
         assert_eq!(cell(&w, "r1", "Name"), "Beta");
@@ -1322,7 +2170,14 @@ mod tests {
         let c = col(w, name);
         w.app.apply(Action::Db(Act::Cell(row.into(), c)));
         w.frames(vec![]);
-        w.app.db.as_mut().unwrap().edit.as_mut().expect("editing").text = text.into();
+        w.app
+            .db
+            .as_mut()
+            .unwrap()
+            .edit
+            .as_mut()
+            .expect("editing")
+            .text = text.into();
         w.press(Key::Enter, NONE);
         assert!(db(w).edit.is_none(), "{name}: {:?}", w.app.last_error);
     }
@@ -1331,10 +2186,22 @@ mod tests {
     fn each_editor_commits_one_property_body_merged_into_one_op() {
         let mut w = win();
         for (name, text, body) in [
-            ("Name", "Hello", json!({ "title": [{ "type": "text", "text": { "content": "Hello" } }] })),
-            ("Notes", "n", json!({ "rich_text": [{ "type": "text", "text": { "content": "n" } }] })),
+            (
+                "Name",
+                "Hello",
+                json!({ "title": [{ "type": "text", "text": { "content": "Hello" } }] }),
+            ),
+            (
+                "Notes",
+                "n",
+                json!({ "rich_text": [{ "type": "text", "text": { "content": "n" } }] }),
+            ),
             ("Qty", "7,5", json!({ "number": 7.5 })),
-            ("Due", "2025-02-03/2025-02-05", json!({ "date": { "start": "2025-02-03", "end": "2025-02-05", "time_zone": null } })),
+            (
+                "Due",
+                "2025-02-03/2025-02-05",
+                json!({ "date": { "start": "2025-02-03", "end": "2025-02-05", "time_zone": null } }),
+            ),
             ("Site", "https://a.at", json!({ "url": "https://a.at" })),
             ("Mail", "a@b.at", json!({ "email": "a@b.at" })),
             ("Tel", "+43 1 234", json!({ "phone_number": "+43 1 234" })),
@@ -1351,7 +2218,11 @@ mod tests {
         assert_eq!(cell(&w, "r1", "Done"), "☑");
         assert!(db(&w).edit.is_none());
         w.press(Key::Enter, NONE);
-        assert_eq!(sent(&w, "r1")["Done"], json!({ "checkbox": false }), "Enter toggles too");
+        assert_eq!(
+            sent(&w, "r1")["Done"],
+            json!({ "checkbox": false }),
+            "Enter toggles too"
+        );
         // select: the popup, Down, Enter
         select(&mut w, "r1", "Kind");
         w.press(Key::Enter, NONE);
@@ -1369,7 +2240,10 @@ mod tests {
         w.press(Key::Enter, NONE);
         w.press(Key::ArrowDown, NONE);
         w.press(Key::Enter, NONE);
-        assert_eq!(sent(&w, "r1")["State"], json!({ "status": { "name": "Done" } }));
+        assert_eq!(
+            sent(&w, "r1")["State"],
+            json!({ "status": { "name": "Done" } })
+        );
         // multi-select: Space toggles at the highlight
         select(&mut w, "r1", "Tags");
         w.press(Key::Enter, NONE);
@@ -1378,7 +2252,10 @@ mod tests {
         w.press(Key::Space, NONE);
         assert!(db(&w).edit.is_some(), "still open");
         w.press(Key::Enter, NONE);
-        assert_eq!(sent(&w, "r1")["Tags"], json!({ "multi_select": [{ "name": "x" }, { "name": "y" }] }));
+        assert_eq!(
+            sent(&w, "r1")["Tags"],
+            json!({ "multi_select": [{ "name": "x" }, { "name": "y" }] })
+        );
         // people: from the cached users; r1 has Ada, swap her for Bob
         select(&mut w, "r1", "Who");
         w.press(Key::Enter, NONE);
@@ -1386,14 +2263,21 @@ mod tests {
         w.press(Key::ArrowDown, NONE);
         w.press(Key::Space, NONE);
         w.press(Key::Enter, NONE);
-        assert_eq!(sent(&w, "r1")["Who"], json!({ "people": [{ "object": "user", "id": "u2" }] }));
+        assert_eq!(
+            sent(&w, "r1")["Who"],
+            json!({ "people": [{ "object": "user", "id": "u2" }] })
+        );
         assert_eq!(cell(&w, "r1", "Who"), "Bob");
         // every one of them: one op, nothing else
         assert_eq!(w.queued(), 1);
         // the popup is drawn with its choices
         select(&mut w, "r2", "Tags");
         w.press(Key::Enter, NONE);
-        assert!(w.shown.contains("☐ x") && w.shown.contains("☐ y"), "{}", w.shown);
+        assert!(
+            w.shown.contains("☐ x") && w.shown.contains("☐ y"),
+            "{}",
+            w.shown
+        );
     }
 
     #[test]
@@ -1427,16 +2311,30 @@ mod tests {
         let (n, q) = (col(&w, "Notes"), col(&w, "Qty"));
         w.app.apply(Action::Db(Act::Cell("r1".into(), n)));
         w.app.apply(Action::Db(Act::Commit("r1".into(), q)));
-        assert_eq!(db(&w).edit.as_ref().map(|e| e.col), Some(n), "another cell's commit is ignored");
+        assert_eq!(
+            db(&w).edit.as_ref().map(|e| e.col),
+            Some(n),
+            "another cell's commit is ignored"
+        );
         // a pull changes the cell while it is typed in
         w.app.db.as_mut().unwrap().edit.as_mut().unwrap().text = "mine".into();
         let mut p = w.app.store.get_page("r1").unwrap().unwrap();
-        p.properties.insert("Notes".into(), serde_json::from_value(json!({ "id": "id-Notes", "type": "rich_text", "rich_text": [run("theirs")] })).unwrap());
+        p.properties.insert(
+            "Notes".into(),
+            serde_json::from_value(
+                json!({ "id": "id-Notes", "type": "rich_text", "rich_text": [run("theirs")] }),
+            )
+            .unwrap(),
+        );
         w.app.store.upsert_page(&p).unwrap();
         w.app.refresh();
         w.app.apply(Action::Db(Act::Commit("r1".into(), n)));
         assert!(db(&w).edit.is_some() && w.queued() == 0);
-        assert!(w.app.last_error.as_deref().is_some_and(|e| e.contains("changed in Notion")));
+        assert!(w
+            .app
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("changed in Notion")));
         assert_eq!(cell(&w, "r1", "Notes"), "theirs");
     }
 
@@ -1473,14 +2371,19 @@ mod tests {
             w.app.info = None;
             w.press(Key::Enter, NONE);
             assert!(db(&w).edit.is_none(), "{name}");
-            assert!(w.app.info.as_deref().unwrap().starts_with("read-only"), "{name}");
+            assert!(
+                w.app.info.as_deref().unwrap().starts_with("read-only"),
+                "{name}"
+            );
             let c = col(&w, name);
             w.app.apply(Action::Db(Act::Cell("r2".into(), c)));
             assert!(db(&w).edit.is_none());
         }
         w.press(Key::Space, NONE);
         assert_eq!(w.queued(), 0);
-        assert!(!props::editable("rollup") && !props::editable("relation") && !props::editable("files"));
+        assert!(
+            !props::editable("rollup") && !props::editable("relation") && !props::editable("files")
+        );
     }
 
     #[test]
@@ -1491,7 +2394,11 @@ mod tests {
         w.app.db.as_mut().unwrap().edit.as_mut().unwrap().text = "abc".into();
         w.press(Key::Enter, NONE);
         assert!(db(&w).edit.is_some(), "kept");
-        assert!(w.app.last_error.as_deref().unwrap().contains("number"), "{:?}", w.app.last_error);
+        assert!(
+            w.app.last_error.as_deref().unwrap().contains("number"),
+            "{:?}",
+            w.app.last_error
+        );
         assert_eq!(w.queued(), 0);
         // leaving (a tab, a page) once is refused, twice discards
         w.app.apply(Action::Open("p".into()));
@@ -1533,11 +2440,22 @@ mod tests {
         let id = db(&w).sel.as_ref().unwrap().0.clone();
         assert!(id.starts_with("local-"));
         assert_eq!(order(&w).last(), Some(&id));
-        assert_eq!(db(&w).edit.as_ref().map(|e| (e.row.as_str(), e.col)), Some((id.as_str(), 0)), "its title is in edit mode");
+        assert_eq!(
+            db(&w).edit.as_ref().map(|e| (e.row.as_str(), e.col)),
+            Some((id.as_str(), 0)),
+            "its title is in edit mode"
+        );
         match &ops(&w)[..] {
-            [OpKind::CreatePage { parent_id, local_id, body }] => {
+            [OpKind::CreatePage {
+                parent_id,
+                local_id,
+                body,
+            }] => {
                 assert_eq!((parent_id.as_str(), local_id.as_str()), ("ds", id.as_str()));
-                assert_eq!(body["parent"], json!({ "type": "data_source_id", "data_source_id": "ds" }));
+                assert_eq!(
+                    body["parent"],
+                    json!({ "type": "data_source_id", "data_source_id": "ds" })
+                );
             }
             o => panic!("{o:?}"),
         }
@@ -1548,8 +2466,15 @@ mod tests {
         edit(&mut w, &id, "Qty", "3");
         match &ops(&w)[..] {
             [OpKind::CreatePage { body, .. }] => {
-                assert_eq!(body["properties"]["Name"], json!({ "title": [{ "type": "text", "text": { "content": "Fresh" } }] }));
-                assert_eq!(body["properties"]["Qty"], json!({ "number": 3 }), "the create carries every edit");
+                assert_eq!(
+                    body["properties"]["Name"],
+                    json!({ "title": [{ "type": "text", "text": { "content": "Fresh" } }] })
+                );
+                assert_eq!(
+                    body["properties"]["Qty"],
+                    json!({ "number": 3 }),
+                    "the create carries every edit"
+                );
             }
             o => panic!("{o:?}"),
         }
@@ -1585,7 +2510,14 @@ mod tests {
         w.app.store.map_id(&local, "real1").unwrap();
         w.answer(WEvent::Pushed(Default::default()));
         assert_eq!(db(&w).sel, Some(("real1".into(), 0)));
-        assert_eq!(w.cmds().last(), Some(&Cmd::Pull { id: "ds".into(), force: true }), "re-pulled in full");
+        assert_eq!(
+            w.cmds().last(),
+            Some(&Cmd::Pull {
+                id: "ds".into(),
+                force: true
+            }),
+            "re-pulled in full"
+        );
         assert!(db(&w).row("real1").is_some());
     }
 
@@ -1596,11 +2528,16 @@ mod tests {
         w.press(Key::Backspace, CS);
         assert!(matches!(&w.app.dlg, Some(Dlg::Trash(id, t)) if id == "r2" && t == "alpha"));
         w.press(Key::Escape, NONE);
-        assert!(w.app.dlg.is_none() && order(&w).len() == 3 && w.queued() == 0, "Esc says no");
+        assert!(
+            w.app.dlg.is_none() && order(&w).len() == 3 && w.queued() == 0,
+            "Esc says no"
+        );
         w.press(Key::Backspace, CS);
         w.press(Key::Enter, NONE);
         assert_eq!(order(&w), ["r1", "r3"]);
-        assert!(matches!(&ops(&w)[..], [OpKind::UpdatePage { page_id, body }] if page_id == "r2" && body == &json!({ "in_trash": true })));
+        assert!(
+            matches!(&ops(&w)[..], [OpKind::UpdatePage { page_id, body }] if page_id == "r2" && body == &json!({ "in_trash": true }))
+        );
         assert_eq!(w.app.current.as_deref(), Some("ds"), "the table stays open");
         w.press(Key::Z, Modifiers::CTRL);
         assert_eq!(order(&w), ["r1", "r2", "r3"]);
@@ -1614,7 +2551,12 @@ mod tests {
         w.press(Key::Escape, NONE);
         w.press(Key::Backspace, CS);
         assert!(w.app.dlg.is_none());
-        assert!(w.app.last_error.as_deref().unwrap().contains("isn't pushed"));
+        assert!(w
+            .app
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("isn't pushed"));
     }
 
     #[test]
@@ -1639,7 +2581,10 @@ mod tests {
         w.app.apply(Action::Open("ds".into()));
         edit(&mut w, "r3", "Qty", "4");
         let s = sent(&w, "r3");
-        assert!(s["Name"].is_object() && s["Qty"] == json!({ "number": 4 }), "{s}");
+        assert!(
+            s["Name"].is_object() && s["Qty"] == json!({ "number": 4 }),
+            "{s}"
+        );
         // commands that make no sense on a table say so
         w.app.info = None;
         w.press(Key::I, CS);
@@ -1657,16 +2602,29 @@ mod tests {
         // a row changed in Notion
         let mut r = row("r2", T, "alpha", Some(99.0));
         r.raw["properties"]["Qty"]["number"] = json!(99);
-        w.app.store.upsert_page(&serde_json::from_value(r.raw.clone()).unwrap()).unwrap();
+        w.app
+            .store
+            .upsert_page(&serde_json::from_value(r.raw.clone()).unwrap())
+            .unwrap();
         let d = w.app.db.as_mut().unwrap();
         d.filter = "alp".into();
         d.arrange();
         select(&mut w, "r2", "Qty");
-        w.answer(WEvent::Pulled { id: "ds".into(), report: PullReport { fetched: 1, updated: 1, skipped: false } });
+        w.answer(WEvent::Pulled {
+            id: "ds".into(),
+            report: PullReport {
+                fetched: 1,
+                updated: 1,
+                skipped: false,
+            },
+        });
         assert_eq!(cell(&w, "r2", "Qty"), "99");
         assert_eq!(db(&w).filter, "alp");
         assert_eq!(db(&w).sel, Some(("r2".into(), col(&w, "Qty"))));
-        assert!(w.app.info.is_none() || !w.app.info.as_deref().unwrap().contains("pulled"), "quiet");
+        assert!(
+            w.app.info.is_none() || !w.app.info.as_deref().unwrap().contains("pulled"),
+            "quiet"
+        );
         // a poll in the middle of typing leaves the box alone
         w.press(Key::Enter, NONE);
         w.frames(vec![]);
@@ -1679,12 +2637,19 @@ mod tests {
     #[test]
     fn opening_pulls_only_when_the_table_was_not_pulled_lately() {
         let mut w = win();
-        let pulls = |w: &mut Win| w.cmds().into_iter().filter(|c| matches!(c, Cmd::Pull { id, .. } if id == "ds")).count();
+        let pulls = |w: &mut Win| {
+            w.cmds()
+                .into_iter()
+                .filter(|c| matches!(c, Cmd::Pull { id, .. } if id == "ds"))
+                .count()
+        };
         w.app.full_at.insert("ds".into(), Instant::now());
         w.app.apply(Action::Open("p".into()));
         w.app.apply(Action::Open("ds".into()));
         assert_eq!(pulls(&mut w), 0, "pulled a moment ago");
-        w.app.full_at.insert("ds".into(), Instant::now() - Duration::from_secs(120));
+        w.app
+            .full_at
+            .insert("ds".into(), Instant::now() - Duration::from_secs(120));
         w.app.apply(Action::Open("p".into()));
         w.app.apply(Action::Open("ds".into()));
         assert_eq!(pulls(&mut w), 1);
@@ -1698,18 +2663,32 @@ mod tests {
     fn a_tall_and_wide_table_draws_and_scrolls_the_selection_into_view() {
         let mut w = win();
         for i in 0..80 {
-            w.app.store.upsert_page(&row(&format!("x{i:02}"), "2025-02-01T00:00:00.000Z", &format!("Row {i}"), Some(i as f64))).unwrap();
+            w.app
+                .store
+                .upsert_page(&row(
+                    &format!("x{i:02}"),
+                    "2025-02-01T00:00:00.000Z",
+                    &format!("Row {i}"),
+                    Some(i as f64),
+                ))
+                .unwrap();
         }
         w.app.refresh();
         w.frames(vec![]);
-        assert!(w.shown.contains("Row 0") && !w.shown.contains("Row 70"), "only the visible rows are drawn");
+        assert!(
+            w.shown.contains("Row 0") && !w.shown.contains("Row 70"),
+            "only the visible rows are drawn"
+        );
         for _ in 0..60 {
             w.press(Key::ArrowDown, NONE);
         }
         w.frames(vec![]);
         w.frames(vec![]);
         let sel = db(&w).sel.as_ref().unwrap().0.clone();
-        assert!(w.shown.contains(&db(&w).row(&sel).unwrap().cells[0]), "the selected row is drawn: {sel}");
+        assert!(
+            w.shown.contains(&db(&w).row(&sel).unwrap().cells[0]),
+            "the selected row is drawn: {sel}"
+        );
     }
 
     // --- F5: board, list, calendar, gallery ---
@@ -1717,7 +2696,12 @@ mod tests {
     /// r1 Todo, 30 Mar - 2 Apr 2025; r2 Done, 10 Apr; r3 no state, no date.
     fn planned() -> Win {
         let mut w = win();
-        for (row, c, text) in [("r1", "State", "Todo"), ("r2", "State", "Done"), ("r1", "Due", "2025-03-30 → 2025-04-02"), ("r2", "Due", "2025-04-10")] {
+        for (row, c, text) in [
+            ("r1", "State", "Todo"),
+            ("r2", "State", "Done"),
+            ("r1", "Due", "2025-03-30 → 2025-04-02"),
+            ("r2", "Due", "2025-04-10"),
+        ] {
             let c = col(&w, c);
             assert!(w.app.db_write(row, c, text));
         }
@@ -1727,7 +2711,15 @@ mod tests {
 
     fn lanes(w: &Win) -> Vec<(String, Vec<String>)> {
         let d = db(w);
-        d.lanes.iter().map(|l| (l.label.clone(), l.rows.iter().map(|&i| d.rows[i].id.clone()).collect())).collect()
+        d.lanes
+            .iter()
+            .map(|l| {
+                (
+                    l.label.clone(),
+                    l.rows.iter().map(|&i| d.rows[i].id.clone()).collect(),
+                )
+            })
+            .collect()
     }
 
     fn to_view(w: &mut Win, kind: Kind) {
@@ -1744,10 +2736,27 @@ mod tests {
     fn the_board_groups_by_the_first_status_in_option_order_with_no_value() {
         let mut w = planned();
         to_view(&mut w, Kind::Board);
-        let l = |a: &str, b: &[&str]| (a.to_string(), b.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(lanes(&w), [l("No value", &["r3"]), l("Todo", &["r1"]), l("Done", &["r2"])]);
+        let l = |a: &str, b: &[&str]| {
+            (
+                a.to_string(),
+                b.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            lanes(&w),
+            [
+                l("No value", &["r3"]),
+                l("Todo", &["r1"]),
+                l("Done", &["r2"])
+            ]
+        );
         // no status: the first select
-        let cols = [("Kind", "select"), ("Qty", "number")].map(|(n, k)| Col { name: n.into(), kind: k.into(), opts: vec!["A".into()] });
+        let cols = [("Kind", "select"), ("Qty", "number")].map(|(n, k)| Col {
+            name: n.into(),
+            display: n.into(),
+            kind: k.into(),
+            opts: vec!["A".into()],
+        });
         assert_eq!(crate::views::group_col(&cols), Some(0));
         w.frames(vec![]);
     }
@@ -1758,13 +2767,18 @@ mod tests {
         to_view(&mut w, Kind::Board);
         w.app.db.as_mut().unwrap().sel = Some(("r3".into(), 0));
         w.press(Key::ArrowRight, CS);
-        assert_eq!(sent(&w, "r3"), json!({ "State": { "status": { "name": "Todo" } } }));
+        assert_eq!(
+            sent(&w, "r3"),
+            json!({ "State": { "status": { "name": "Todo" } } })
+        );
         assert_eq!(cell(&w, "r3", "State"), "Todo");
         assert_eq!(lanes(&w)[1].1, ["r1", "r3"]);
         assert_eq!(db(&w).sel.as_ref().map(|s| s.0.as_str()), Some("r3"));
         w.press(Key::Z, Modifiers::CTRL);
         assert_eq!(cell(&w, "r3", "State"), "");
-        assert!(!ops(&w).iter().any(|o| matches!(o, OpKind::UpdatePageProperties { page_id, .. } if page_id == "r3")));
+        assert!(!ops(&w)
+            .iter()
+            .any(|o| matches!(o, OpKind::UpdatePageProperties { page_id, .. } if page_id == "r3")));
         // into No value: a status can't be empty; the edge: nothing
         w.app.db.as_mut().unwrap().sel = Some(("r1".into(), 0));
         w.press(Key::ArrowLeft, CS);
@@ -1779,10 +2793,20 @@ mod tests {
     fn the_calendar_buckets_rows_by_month_and_day_and_lists_rows_without_dates() {
         let mut w = planned();
         to_view(&mut w, Kind::Calendar);
-        let days = |w: &Win| db(w).lanes.iter().map(|l| (l.day, l.rows.len())).collect::<Vec<_>>();
+        let days = |w: &Win| {
+            db(w)
+                .lanes
+                .iter()
+                .map(|l| (l.day, l.rows.len()))
+                .collect::<Vec<_>>()
+        };
         w.app.db.as_mut().unwrap().month = (2025, 3);
         w.app.db.as_mut().unwrap().relane();
-        assert_eq!(days(&w), [(30, 1), (31, 1), (0, 1)], "r1 spans two days of March; r3 has no date");
+        assert_eq!(
+            days(&w),
+            [(30, 1), (31, 1), (0, 1)],
+            "r1 spans two days of March; r3 has no date"
+        );
         w.press(Key::PageDown, NONE);
         assert_eq!(db(&w).month, (2025, 4));
         assert_eq!(days(&w), [(1, 1), (2, 1), (10, 1), (0, 1)]);
@@ -1806,32 +2830,68 @@ mod tests {
             w.press(Key::ArrowRight, NONE);
             assert!(db(&w).sel.is_some(), "{kind:?}");
         }
-        assert_eq!(w.app.store.view_pref("ds").unwrap().as_deref(), Some("gallery:Gallery"));
+        assert_eq!(
+            w.app.store.view_pref("ds").unwrap().as_deref(),
+            Some("gallery:Gallery")
+        );
         // remembered when the table is rebuilt, and read back from the store
         w.app.db_views.clear();
         w.app.refresh();
         assert_eq!(db(&w).mode(), Kind::Gallery);
         w.press(Key::Enter, NONE);
-        assert_ne!(w.app.current.as_deref(), Some("ds"), "Enter opened the card as a page");
+        assert_ne!(
+            w.app.current.as_deref(),
+            Some("ds"),
+            "Enter opened the card as a page"
+        );
     }
 
     #[test]
     fn saved_views_are_offered_and_an_api_error_leaves_the_local_ones() {
         let mut w = win();
-        let names = |w: &Win| db(w).defs.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
+        let names = |w: &Win| {
+            db(w)
+                .defs
+                .iter()
+                .map(|d| d.name.clone())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(names(&w), ["Table", "Board", "List", "Calendar", "Gallery"]);
         w.app.views_asked.clear();
         w.app.db_pull_if_stale();
-        assert_eq!(w.cmds(), [Cmd::Pull { id: "ds".into(), force: false }, Cmd::Views { ds: "ds".into() }]);
+        assert_eq!(
+            w.cmds(),
+            [
+                Cmd::Pull {
+                    id: "ds".into(),
+                    force: false
+                },
+                Cmd::Views { ds: "ds".into() }
+            ]
+        );
         w.answer(skipped("ds"));
         w.answer(WEvent::Error("404".into()));
         w.app.db_pull_if_stale();
-        assert!(!w.cmds().contains(&Cmd::Views { ds: "ds".into() }), "asked once per session");
+        assert!(
+            !w.cmds().contains(&Cmd::Views { ds: "ds".into() }),
+            "asked once per session"
+        );
         w.answer(skipped("ds"));
         assert_eq!(names(&w), ["Table", "Board", "List", "Calendar", "Gallery"]);
         assert!(w.app.last_error.is_none());
-        let saved = |id: &str, name: &str, kind: &str| notion_core::views::SavedView { id: id.into(), name: name.into(), kind: kind.into() };
-        w.answer(WEvent::Views { ds: "ds".into(), views: vec![saved("1", "Sprint", "board"), saved("2", "Gantt", "timeline"), saved("3", "Wall", "gallery")] });
+        let saved = |id: &str, name: &str, kind: &str| notion_core::views::SavedView {
+            id: id.into(),
+            name: name.into(),
+            kind: kind.into(),
+        };
+        w.answer(WEvent::Views {
+            ds: "ds".into(),
+            views: vec![
+                saved("1", "Sprint", "board"),
+                saved("2", "Gantt", "timeline"),
+                saved("3", "Wall", "gallery"),
+            ],
+        });
         assert_eq!(names(&w), ["Sprint", "Wall", "Table", "List", "Calendar"]);
     }
 
@@ -1845,7 +2905,11 @@ mod tests {
         assert_eq!(lanes(&w)[1].1, Vec::<String>::new());
         w.app.db.as_mut().unwrap().sel = Some(("r3".into(), 0));
         w.press(Key::ArrowRight, NONE);
-        assert_eq!(db(&w).sel.as_ref().unwrap().0, lanes(&w)[2].1[0], "the empty Todo is skipped");
+        assert_eq!(
+            db(&w).sel.as_ref().unwrap().0,
+            lanes(&w)[2].1[0],
+            "the empty Todo is skipped"
+        );
         // at the last column: stays
         let last = db(&w).sel.clone();
         w.press(Key::ArrowRight, NONE);
@@ -1854,7 +2918,10 @@ mod tests {
         let d = db(&w);
         assert_eq!(d.move_target("r2", 1), None);
         assert_eq!(d.move_target("r3", -1), None);
-        assert_eq!(d.move_target("r3", 1).map(|t| t.1), Some("Todo".to_string()));
+        assert_eq!(
+            d.move_target("r3", 1).map(|t| t.1),
+            Some("Todo".to_string())
+        );
         assert_eq!(d.move_target("nope", 1), None);
         // moving at the last column writes nothing
         let before = ops(&w).len();
@@ -1868,7 +2935,15 @@ mod tests {
         let mut w = planned();
         to_view(&mut w, Kind::Board);
         let g = col(&w, "State");
-        w.app.db.as_mut().unwrap().rows.iter_mut().find(|r| r.id == "r1").unwrap().cells[g] = "Gone".into();
+        w.app
+            .db
+            .as_mut()
+            .unwrap()
+            .rows
+            .iter_mut()
+            .find(|r| r.id == "r1")
+            .unwrap()
+            .cells[g] = "Gone".into();
         w.app.db.as_mut().unwrap().relane();
         assert_eq!(lanes(&w)[0].1, ["r1", "r3"]);
     }
@@ -1885,13 +2960,37 @@ mod tests {
     #[test]
     fn the_stored_view_is_kind_and_name_with_a_fallback_to_the_kind() {
         let mut w = planned();
-        let saved = |id: &str, name: &str, kind: &str| notion_core::views::SavedView { id: id.into(), name: name.into(), kind: kind.into() };
-        let two = vec![saved("1", "Board view", "board"), saved("2", "Board view", "board"), saved("3", "Wall", "gallery")];
-        w.answer(WEvent::Views { ds: "ds".into(), views: two });
-        let names = db(&w).defs.iter().map(|d| (d.name.clone(), d.kind)).collect::<Vec<_>>();
-        assert_eq!(names[..2], [("Board view".to_string(), Kind::Board), ("Board view".to_string(), Kind::Board)]);
+        let saved = |id: &str, name: &str, kind: &str| notion_core::views::SavedView {
+            id: id.into(),
+            name: name.into(),
+            kind: kind.into(),
+        };
+        let two = vec![
+            saved("1", "Board view", "board"),
+            saved("2", "Board view", "board"),
+            saved("3", "Wall", "gallery"),
+        ];
+        w.answer(WEvent::Views {
+            ds: "ds".into(),
+            views: two,
+        });
+        let names = db(&w)
+            .defs
+            .iter()
+            .map(|d| (d.name.clone(), d.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names[..2],
+            [
+                ("Board view".to_string(), Kind::Board),
+                ("Board view".to_string(), Kind::Board)
+            ]
+        );
         w.app.db_set_view(1);
-        assert_eq!(w.app.store.view_pref("ds").unwrap().as_deref(), Some("board:Board view"));
+        assert_eq!(
+            w.app.store.view_pref("ds").unwrap().as_deref(),
+            Some("board:Board view")
+        );
         // a stored local "Board" is lost once saved views come: the first board def stands in
         w.app.store.set_view_pref("ds", "board:Board").unwrap();
         w.app.db_views.clear();

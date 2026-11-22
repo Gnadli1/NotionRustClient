@@ -152,11 +152,25 @@ pub fn entries(menu: &Menu, q: &str, src: Sources) -> Vec<Entry> {
                 })
                 .collect();
             // not in "Turn into": a block can't become a page
-            if menu.kind == Kind::Slash && (slash::word_prefix(q, "Page") || slash::word_prefix(q, "Seite")) {
-                out.push(Entry { label: "Page".into(), hint: "A new subpage".into(), pick: Pick::NewPage });
+            if menu.kind == Kind::Slash
+                && (slash::word_prefix(q, "Page") || slash::word_prefix(q, "Seite"))
+            {
+                out.push(Entry {
+                    label: "Page".into(),
+                    hint: "A new subpage".into(),
+                    pick: Pick::NewPage,
+                });
             }
-            if menu.kind == Kind::Slash && ["Image", "File", "Bild", "Datei"].iter().any(|w| slash::word_prefix(q, w)) {
-                out.push(Entry { label: "Image or file".into(), hint: "Upload from a path".into(), pick: Pick::Upload });
+            if menu.kind == Kind::Slash
+                && ["Image", "File", "Bild", "Datei"]
+                    .iter()
+                    .any(|w| slash::word_prefix(q, w))
+            {
+                out.push(Entry {
+                    label: "Image or file".into(),
+                    hint: "Upload from a path".into(),
+                    pick: Pick::Upload,
+                });
             }
             out.extend(color_entries(q));
             out
@@ -191,7 +205,10 @@ fn color_entries(q: &str) -> Vec<Entry> {
             }
             let cap = format!("{}{}", c[..1].to_uppercase(), &c[1..]);
             let (en, de) = if bg {
-                (format!("Color {cap} background"), format!("Farbe {de} Hintergrund"))
+                (
+                    format!("Color {cap} background"),
+                    format!("Farbe {de} Hintergrund"),
+                )
             } else {
                 (format!("Color {cap}"), format!("Farbe {de}"))
             };
@@ -199,7 +216,11 @@ fn color_entries(q: &str) -> Vec<Entry> {
                 out.push(Entry {
                     label: en,
                     hint: if bg { "Background" } else { "Text colour" }.into(),
-                    pick: Pick::Color(if bg { format!("{c}_background") } else { (*c).into() }),
+                    pick: Pick::Color(if bg {
+                        format!("{c}_background")
+                    } else {
+                        (*c).into()
+                    }),
                 });
             }
         }
@@ -241,7 +262,11 @@ fn page_entries(q: &str, src: Sources) -> Vec<Entry> {
         .iter()
         .filter(|e| !e.database)
         .filter_map(|e| {
-            let recent = src.recent.iter().position(|r| *r == e.id).unwrap_or(usize::MAX);
+            let recent = src
+                .recent
+                .iter()
+                .position(|r| *r == e.id)
+                .unwrap_or(usize::MAX);
             Some((rank(&fq, &e.title)?, recent, slash::fold(&e.title), e))
         })
         .collect();
@@ -250,7 +275,11 @@ fn page_entries(q: &str, src: Sources) -> Vec<Entry> {
     hits.into_iter()
         .take(MAX_PAGES)
         .map(|(.., e)| {
-            let label = if e.title.is_empty() { "Untitled" } else { &e.title };
+            let label = if e.title.is_empty() {
+                "Untitled"
+            } else {
+                &e.title
+            };
             Entry {
                 label: format!("{} {label}", e.icon.as_deref().unwrap_or("📄")),
                 hint: "Page".into(),
@@ -288,21 +317,25 @@ fn user_entries(q: &str, users: &[User]) -> Vec<Entry> {
 
 /// Heute / Morgen / Gestern (and the English names) as date mentions.
 fn date_entries(q: &str, days: &Days) -> Vec<Entry> {
-    [("Heute", "Today", 0), ("Morgen", "Tomorrow", 1), ("Gestern", "Yesterday", 2)]
-        .into_iter()
-        .filter(|(de, en, _)| slash::word_prefix(q, de) || slash::word_prefix(q, en))
-        .map(|(de, _, n)| {
-            let iso = days[n].clone();
-            Entry {
-                label: format!("📅 {de}"),
-                hint: iso.clone(),
-                pick: Pick::Insert(mention(
-                    &iso,
-                    json!({ "type": "date", "date": { "start": iso, "end": null } }),
-                )),
-            }
-        })
-        .collect()
+    [
+        ("Heute", "Today", 0),
+        ("Morgen", "Tomorrow", 1),
+        ("Gestern", "Yesterday", 2),
+    ]
+    .into_iter()
+    .filter(|(de, en, _)| slash::word_prefix(q, de) || slash::word_prefix(q, en))
+    .map(|(de, _, n)| {
+        let iso = days[n].clone();
+        Entry {
+            label: format!("📅 {de}"),
+            hint: iso.clone(),
+            pick: Pick::Insert(mention(
+                &iso,
+                json!({ "type": "date", "date": { "start": iso, "end": null } }),
+            )),
+        }
+    })
+    .collect()
 }
 
 #[derive(Debug, PartialEq)]
@@ -347,7 +380,9 @@ pub fn show(ctx: &egui::Context, pos: egui::Pos2, menu: &Menu, entries: &[Entry]
             Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_min_width(260.0);
                 if menu.kind == Kind::TurnInto {
-                    ui.add(Label::new(Text::new(format!("Turn into  {}", menu.filter)).weak()));
+                    ui.add(Label::new(
+                        Text::new(format!("Turn into  {}", menu.filter)).weak(),
+                    ));
                 }
                 for (n, e) in entries.iter().enumerate() {
                     let mut t = Text::new(format!("{}   {}", e.label, e.hint));
@@ -366,7 +401,11 @@ mod tests {
     use crate::testkit::page_in;
 
     fn today() -> Days {
-        ["2026-11-20".into(), "2026-11-21".into(), "2026-11-19".into()]
+        [
+            "2026-11-20".into(),
+            "2026-11-21".into(),
+            "2026-11-19".into(),
+        ]
     }
 
     fn menu(kind: Kind) -> Menu {
@@ -388,7 +427,15 @@ mod tests {
     }
 
     fn slash_entries(q: &str) -> Vec<Entry> {
-        entries(&menu(Kind::Slash), q, Sources { tree: &[], recent: &[], users: &[] })
+        entries(
+            &menu(Kind::Slash),
+            q,
+            Sources {
+                tree: &[],
+                recent: &[],
+                users: &[],
+            },
+        )
     }
 
     #[test]
@@ -466,8 +513,16 @@ mod tests {
         assert_eq!(m.query("@ho", 0, 3).as_deref(), Some("ho"));
         assert_eq!(m.query("@", 0, 0), None);
         assert_eq!(m.query("x", 0, 1), None, "no @ at the trigger");
-        assert_eq!(m.query("@ ho", 0, 4), None, "a space right after @ closes it");
-        assert_eq!(m.query("@ho x", 0, 5).as_deref(), Some("ho x"), "spaces later are fine");
+        assert_eq!(
+            m.query("@ ho", 0, 4),
+            None,
+            "a space right after @ closes it"
+        );
+        assert_eq!(
+            m.query("@ho x", 0, 5).as_deref(),
+            Some("ho x"),
+            "spaces later are fine"
+        );
         m.kind = Kind::PageLink;
         assert_eq!(m.query("[[ a", 0, 4), None);
         assert_eq!(m.query("[[a", 0, 3).as_deref(), Some("a"));
@@ -489,35 +544,61 @@ mod tests {
             page("e", ""),
         ];
         let recent = ["c".to_string()];
-        let src = Sources { tree: &tree, recent: &recent, users: &[] };
+        let src = Sources {
+            tree: &tree,
+            recent: &recent,
+            users: &[],
+        };
         let q = |s: &str| labels(&page_entries(s, src));
         assert_eq!(q("")[0], "📄 Notizen Mathe", "the recent page leads");
-        assert_eq!(q("math"), ["📄 Mathe Notizen", "📄 Notizen Mathe"], "prefix before word prefix");
+        assert_eq!(
+            q("math"),
+            ["📄 Mathe Notizen", "📄 Notizen Mathe"],
+            "prefix before word prefix"
+        );
         assert_eq!(q("ueber"), ["📄 Übersicht"], "umlauts fold");
         assert_eq!(q("hsfg"), ["📄 Hausaufgaben"], "fuzzy subsequence");
         assert!(q("zzz").is_empty());
         assert!(q("").contains(&"📄 Untitled".to_string()));
         // a token that core reads back as a page mention
-        let Pick::Insert(t) = &page_entries("haus", src)[0].pick else { panic!() };
+        let Pick::Insert(t) = &page_entries("haus", src)[0].pick else {
+            panic!()
+        };
         assert_eq!(t, "@[Hausaufgaben](page:b)");
     }
 
     #[test]
     fn mention_tokens_escape_the_label() {
         let tree = [page("x", "a]b *c*")];
-        let es = page_entries("a", Sources { tree: &tree, recent: &[], users: &[] });
-        let Pick::Insert(t) = &es[0].pick else { panic!() };
+        let es = page_entries(
+            "a",
+            Sources {
+                tree: &tree,
+                recent: &[],
+                users: &[],
+            },
+        );
+        let Pick::Insert(t) = &es[0].pick else {
+            panic!()
+        };
         assert_eq!(t, "@[a\\]b \\*c\\*](page:x)");
     }
 
     #[test]
     fn dates_are_german_or_english() {
-        let src = Sources { tree: &[], recent: &[], users: &[] };
+        let src = Sources {
+            tree: &[],
+            recent: &[],
+            users: &[],
+        };
         let m = menu(Kind::Mention);
         let get = |q: &str| entries(&m, q, src);
         assert_eq!(labels(&get("")).len(), 3);
         let heute = get("heu");
-        assert_eq!(heute[0].pick, Pick::Insert("@[2026-11-20](date:2026-11-20)".into()));
+        assert_eq!(
+            heute[0].pick,
+            Pick::Insert("@[2026-11-20](date:2026-11-20)".into())
+        );
         assert_eq!(get("Morgen")[0].hint, "2026-11-21");
         assert_eq!(get("tomorrow")[0].hint, "2026-11-21");
         assert_eq!(get("gest")[0].hint, "2026-11-19");
@@ -529,11 +610,13 @@ mod tests {
     }
 
     fn person(id: &str, name: &str) -> User {
-        User::from_value(&json!({ "object": "user", "id": id, "type": "person", "name": name })).unwrap()
+        User::from_value(&json!({ "object": "user", "id": id, "type": "person", "name": name }))
+            .unwrap()
     }
 
     fn bot(id: &str, name: &str) -> User {
-        User::from_value(&json!({ "object": "user", "id": id, "type": "bot", "name": name })).unwrap()
+        User::from_value(&json!({ "object": "user", "id": id, "type": "bot", "name": name }))
+            .unwrap()
     }
 
     #[test]
@@ -547,23 +630,42 @@ mod tests {
             User::from_value(&json!({ "object": "user", "id": "u5" })).unwrap(),
         ];
         let q = |s: &str| user_entries(s, &users);
-        assert_eq!(labels(&q("")), ["👤 Jürgen Müller", "👤 Nick Zane", "👤 Zoe", "🤖 Zeta Bot"], "persons first; no name, no entry");
-        assert_eq!(labels(&q("z")), ["👤 Zoe", "👤 Nick Zane", "🤖 Zeta Bot"], "prefix, then word prefix; bots last");
+        assert_eq!(
+            labels(&q("")),
+            ["👤 Jürgen Müller", "👤 Nick Zane", "👤 Zoe", "🤖 Zeta Bot"],
+            "persons first; no name, no entry"
+        );
+        assert_eq!(
+            labels(&q("z")),
+            ["👤 Zoe", "👤 Nick Zane", "🤖 Zeta Bot"],
+            "prefix, then word prefix; bots last"
+        );
         assert_eq!(labels(&q("juergen")), ["👤 Jürgen Müller"], "umlauts fold");
         assert_eq!(labels(&q("mueller")), ["👤 Jürgen Müller"], "a word prefix");
         assert_eq!(labels(&q("jmr")), ["👤 Jürgen Müller"], "fuzzy");
         assert!(q("qqq").is_empty());
-        let Pick::Insert(t) = &q("zoe")[0].pick else { panic!() };
+        let Pick::Insert(t) = &q("zoe")[0].pick else {
+            panic!()
+        };
         assert_eq!(t, "@[Zoe](user:u1)");
         assert_eq!(q("zoe")[0].hint, "Person");
         assert_eq!(q("zeta")[0].hint, "Bot");
         // the `@` menu lists pages, then users, then dates
-        let src = Sources { tree: &[page("a", "Zebra")], recent: &[], users: &users };
+        let src = Sources {
+            tree: &[page("a", "Zebra")],
+            recent: &[],
+            users: &users,
+        };
         let all = entries(&menu(Kind::Mention), "ze", src);
-        assert_eq!(labels(&all)[..4], ["📄 Zebra", "👤 Nick Zane", "👤 Zoe", "🤖 Zeta Bot"]);
+        assert_eq!(
+            labels(&all)[..4],
+            ["📄 Zebra", "👤 Nick Zane", "👤 Zoe", "🤖 Zeta Bot"]
+        );
         // `[[` and `/` never list users
         assert!(entries(&menu(Kind::PageLink), "zoe", src).is_empty());
-        let many: Vec<User> = (0..20).map(|i| person(&format!("u{i}"), &format!("Pat {i}"))).collect();
+        let many: Vec<User> = (0..20)
+            .map(|i| person(&format!("u{i}"), &format!("Pat {i}")))
+            .collect();
         assert_eq!(user_entries("", &many).len(), MAX_USERS);
     }
 
@@ -580,10 +682,28 @@ mod tests {
     #[test]
     fn image_or_file_entry_matches_its_words_in_slash_only() {
         for q in ["image", "file", "bild", "datei", "IMA", "Dat"] {
-            assert!(slash_entries(q).iter().any(|e| matches!(e.pick, Pick::Upload)), "{q}");
+            assert!(
+                slash_entries(q)
+                    .iter()
+                    .any(|e| matches!(e.pick, Pick::Upload)),
+                "{q}"
+            );
         }
-        assert!(!slash_entries("heading").iter().any(|e| matches!(e.pick, Pick::Upload)));
-        let tt = entries(&menu(Kind::TurnInto), "image", Sources { tree: &[], recent: &[], users: &[] });
-        assert!(!tt.iter().any(|e| matches!(e.pick, Pick::Upload)), "a block can't turn into an upload");
+        assert!(!slash_entries("heading")
+            .iter()
+            .any(|e| matches!(e.pick, Pick::Upload)));
+        let tt = entries(
+            &menu(Kind::TurnInto),
+            "image",
+            Sources {
+                tree: &[],
+                recent: &[],
+                users: &[],
+            },
+        );
+        assert!(
+            !tt.iter().any(|e| matches!(e.pick, Pick::Upload)),
+            "a block can't turn into an upload"
+        );
     }
 }

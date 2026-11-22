@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
+use futures::future::join_all;
 use serde_json::{json, Value};
 
 use crate::api::{BlockNode, Client};
@@ -76,7 +77,9 @@ pub fn poll_settle() -> Skip {
 /// `pull_data_source` has none yet: its blocks still need fetching.)
 fn is_current(store: &Store, page: &Page) -> Result<bool> {
     Ok(match store.get_page(&page.id)? {
-        Some(c) => c.last_edited_time == page.last_edited_time && !store.children(&page.id)?.is_empty(),
+        Some(c) => {
+            c.last_edited_time == page.last_edited_time && !store.children(&page.id)?.is_empty()
+        }
         None => false,
     })
 }
@@ -87,7 +90,11 @@ pub async fn pull_page(
     page_id: &str,
     force: bool,
 ) -> Result<PullReport> {
-    let skip = if force { Skip::Never } else { Skip::IfUnchanged };
+    let skip = if force {
+        Skip::Never
+    } else {
+        Skip::IfUnchanged
+    };
     pull_page_skip(client, store, page_id, skip).await
 }
 
@@ -108,19 +115,44 @@ pub async fn pull_loaded(
     page: Page,
     skip: Skip,
 ) -> Result<PullReport> {
+    match prefetch_page(client, store, &page, skip).await? {
+        Some(tree) => apply_page(client, store, page, tree, true).await,
+        None => Ok(PullReport {
+            skipped: true,
+            ..Default::default()
+        }),
+    }
+}
+
+/// The network half of a page pull: `None` when the cached page is current.
+/// Split out so `pull_all` can fetch a batch of pages concurrently and write
+/// them one by one (SQLite has one writer at a time anyway).
+async fn prefetch_page(
+    client: &Client,
+    store: &Store,
+    page: &Page,
+    skip: Skip,
+) -> Result<Option<Vec<BlockNode>>> {
     let settled = match skip {
         Skip::Never => false,
         Skip::IfUnchanged => true,
         Skip::IfUnchangedAndOlder(age) => Utc::now() - page.last_edited_time >= age,
     };
-    if settled && is_current(store, &page)? {
-        return Ok(PullReport {
-            skipped: true,
-            ..Default::default()
-        });
+    if settled && is_current(store, page)? {
+        return Ok(None);
     }
-    let tree = client.block_tree(&page.id).await?;
+    Ok(Some(client.block_tree(&page.id).await?))
+}
 
+/// Writes a fetched page tree to the cache. `comments` also fetches the page's
+/// comment threads; a full sync leaves that out (comments load on demand).
+async fn apply_page(
+    client: &Client,
+    store: &Store,
+    mut page: Page,
+    tree: Vec<BlockNode>,
+    comments: bool,
+) -> Result<PullReport> {
     // Snapshot local state before writing anything, so traversal order can't
     // matter: blocks with queued edits keep their cached version, queued
     // deletes stay gone, unpushed `local-*` creates and queued moves keep their
@@ -233,20 +265,22 @@ pub async fn pull_loaded(
         all.extend(&n.children);
     }
     store.put_users(&dedupe_users(found))?;
-    let mut page = page;
     keep_queued_props(store, &mut page)?;
     store.upsert_page(&page)?;
     // ponytail: comment fetch strategy. Notion has no "all comments under this
     // page" endpoint and a block object carries no "has comments" flag, so a
-    // pull fetches only the page's own threads (one request, +1 on a pull of
-    // any size, however many blocks). Block threads are fetched lazily with
-    // `pull_comments(block_id)` when the comments panel opens for that block;
-    // a row's 💬 badge counts what is cached. Upgrade path if per-row badges
-    // must be eager: fetch the blocks of a visible window, rate-limited.
+    // single-page pull fetches only the page's own threads (one request, +1 on
+    // a pull of any size, however many blocks). Block threads are fetched
+    // lazily with `pull_comments(block_id)` when the comments panel opens for
+    // that block; a row's 💬 badge counts what is cached. A full sync skips
+    // this request for every page: it doubles the request count and the badge
+    // catches up when the page is opened.
     // Comment trouble (a 403 when the integration lacks the read-comments
     // capability, say) never fails the page pull.
-    if let Err(e) = pull_comments(client, store, &page.id).await {
-        tracing::warn!("comments of {} not pulled: {e}", page.id);
+    if comments {
+        if let Err(e) = pull_comments(client, store, &page.id).await {
+            tracing::warn!("comments of {} not pulled: {e}", page.id);
+        }
     }
     if let Err(e) = store.note_page(&page) {
         tracing::warn!("updates of {} not recorded: {e}", page.id);
@@ -314,7 +348,11 @@ pub async fn pull_data_source(client: &Client, store: &Store, ds_id: &str) -> Re
         queued.insert(store.resolve_id(op.kind.target_id())?);
     }
     for mut row in store.rows(&ds.id)? {
-        if !row.id.starts_with("local-") && !row.in_trash && !ids.contains(&row.id) && !queued.contains(&row.id) {
+        if !row.id.starts_with("local-")
+            && !row.in_trash
+            && !ids.contains(&row.id)
+            && !queued.contains(&row.id)
+        {
             row.in_trash = true;
             store.upsert_page(&row)?;
         }
@@ -337,7 +375,10 @@ fn merge_rows(store: &Store, rows: Vec<Page>) -> Result<PullReport> {
         // cached blocks are stale now: keep the old time, so the next page
         // pull refetches them instead of skipping the row as unchanged
         // (the time has minute precision: a same-minute edit shows in the properties)
-        if let Some(c) = cached.as_ref().filter(|_| !store.children(&row.id).is_ok_and(|b| b.is_empty())) {
+        if let Some(c) = cached
+            .as_ref()
+            .filter(|_| !store.children(&row.id).is_ok_and(|b| b.is_empty()))
+        {
             row.last_edited_time = c.last_edited_time;
         }
         // raw lags the struct fields until serialized: compare the typed properties
@@ -365,7 +406,12 @@ fn merge_rows(store: &Store, rows: Vec<Page>) -> Result<PullReport> {
 /// nothing changed. A row trashed or moved away in Notion stays cached until
 /// the next full pull.
 pub async fn poll_data_source(client: &Client, store: &Store, ds_id: &str) -> Result<PullReport> {
-    let newest = store.rows(ds_id)?.iter().filter(|r| !r.id.starts_with("local-")).map(|r| r.last_edited_time).max();
+    let newest = store
+        .rows(ds_id)?
+        .iter()
+        .filter(|r| !r.id.starts_with("local-"))
+        .map(|r| r.last_edited_time)
+        .max();
     let Some(newest) = newest else {
         return pull_data_source(client, store, ds_id).await;
     };
@@ -379,7 +425,12 @@ pub async fn poll_data_source(client: &Client, store: &Store, ds_id: &str) -> Re
 /// A database id: caches its data sources (the first with its rows, so it can open).
 pub async fn pull_database(client: &Client, store: &Store, db_id: &str) -> Result<PullReport> {
     let db = client.get_database(db_id).await?;
-    let ids: Vec<String> = db["data_sources"].as_array().into_iter().flatten().filter_map(|d| d["id"].as_str().map(str::to_string)).collect();
+    let ids: Vec<String> = db["data_sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d["id"].as_str().map(str::to_string))
+        .collect();
     let Some((first, rest)) = ids.split_first() else {
         return Err(Error::Invalid("this database has no data source".into()));
     };
@@ -397,12 +448,21 @@ pub async fn pull_any(client: &Client, store: &Store, id: &str, force: bool) -> 
     if store.data_source(id)?.is_some() {
         return pull_data_source(client, store, id).await;
     }
-    if matches!(store.get_block(id)?.map(|b| b.kind), Some(BlockKind::ChildDatabase { .. })) {
+    if matches!(
+        store.get_block(id)?.map(|b| b.kind),
+        Some(BlockKind::ChildDatabase { .. })
+    ) {
         return pull_database(client, store, id).await;
     }
     match pull_page(client, store, id, force).await {
-        Err(e @ Error::Api { status: 400 | 404, .. }) => match pull_database(client, store, id).await {
-            Err(Error::Api { status: 400 | 404, .. }) => Err(e),
+        Err(
+            e @ Error::Api {
+                status: 400 | 404, ..
+            },
+        ) => match pull_database(client, store, id).await {
+            Err(Error::Api {
+                status: 400 | 404, ..
+            }) => Err(e),
             r => r,
         },
         r => r,
@@ -431,26 +491,67 @@ pub struct SyncAllReport {
 /// Pulls every page and data source shared with the integration (`search("")`).
 /// `progress(done, total, title)` runs after each item. A failing item is
 /// recorded and skipped; a bad token or no connection aborts with the error.
+///
+/// Page trees are fetched in parallel batches (the limiter still owns the
+/// request rate) and written one at a time, which is the only ordering SQLite
+/// allows anyway. Comment threads are left to the on-demand pull, so a sync
+/// costs one request per page instead of two.
 pub async fn pull_all(
     client: &Client,
     store: &Store,
     mut progress: impl FnMut(usize, usize, &str),
 ) -> Result<SyncAllReport> {
+    const BATCH: usize = 6;
     let mut found = client.search("").await?;
     // data sources last: a row cached by `pull_data_source` first would hide its changes
     found.sort_by_key(|r| matches!(r, SearchResult::DataSource(_)));
     let total = found.len();
+    let mut pages = Vec::new();
+    let mut data_sources = Vec::new();
+    for item in found {
+        match item {
+            SearchResult::Page(p) => pages.push(p),
+            SearchResult::DataSource(d) => data_sources.push(d),
+        }
+    }
     let mut report = SyncAllReport::default();
-    for (i, item) in found.into_iter().enumerate() {
-        let (title, res) = match item {
-            SearchResult::Page(p) => {
-                let title = p.title();
-                (title, pull_loaded(client, store, p, poll_settle()).await.map(|r| (r.skipped, false)))
+    let mut done = 0;
+    for chunk in pages.chunks(BATCH) {
+        // the network waits of a batch overlap; the writes below stay serial
+        let fetched = join_all(
+            chunk
+                .iter()
+                .map(|p| prefetch_page(client, store, p, poll_settle())),
+        )
+        .await;
+        for (page, res) in chunk.iter().zip(fetched) {
+            let title = page.title();
+            let res = match res {
+                Ok(Some(tree)) => apply_page(client, store, page.clone(), tree, false)
+                    .await
+                    .map(|_| (false, false)),
+                Ok(None) => Ok((true, false)),
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok((true, _)) => report.skipped += 1,
+                Ok((false, false)) => report.pages += 1,
+                Ok((false, true)) => report.data_sources += 1,
+                Err(e @ Error::Api { status: 401, .. }) => return Err(e),
+                Err(Error::Http(e)) if e.is_connect() || e.is_timeout() => {
+                    return Err(Error::Http(e))
+                }
+                Err(e) => report.errors.push(format!("{title}: {e}")),
             }
-            SearchResult::DataSource(d) => {
-                (d.title.clone(), pull_data_source(client, store, &d.id).await.map(|_| (false, true)))
-            }
-        };
+            done += 1;
+            progress(done, total, &title);
+        }
+    }
+    for ds in data_sources {
+        let title = ds.title.clone();
+        let res = pull_data_source(client, store, &ds.id)
+            .await
+            .map(|_| (false, true));
         match res {
             Ok((true, _)) => report.skipped += 1,
             Ok((false, false)) => report.pages += 1,
@@ -459,7 +560,8 @@ pub async fn pull_all(
             Err(Error::Http(e)) if e.is_connect() || e.is_timeout() => return Err(Error::Http(e)),
             Err(e) => report.errors.push(format!("{title}: {e}")),
         }
-        progress(i + 1, total, &title);
+        done += 1;
+        progress(done, total, &title);
     }
     Ok(report)
 }
@@ -592,12 +694,7 @@ fn record_comment(own: &mut Own, c: &Comment) -> Result<()> {
 }
 
 /// `Some(reason)` if the remote comment was edited since the op's base.
-async fn check_comment(
-    client: &Client,
-    op: &Op,
-    id: &str,
-    own: &Own,
-) -> Result<Option<String>> {
+async fn check_comment(client: &Client, op: &Op, id: &str, own: &Own) -> Result<Option<String>> {
     let remote = client.get_comment(id).await?;
     conflict(op, id, remote.last_edited_time, own, |raw| {
         Ok(serde_json::from_value::<Comment>(raw.clone())?.rich_text == remote.rich_text)
@@ -735,7 +832,10 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
                 store.map_id(local_id, &new_id)?;
                 if let Ok(p) = serde_json::from_value::<Page>(resp.clone()) {
                     store.upsert_page(&p)?;
-                    own.insert(p.id.clone(), (p.last_edited_time, serde_json::to_value(&p)?));
+                    own.insert(
+                        p.id.clone(),
+                        (p.last_edited_time, serde_json::to_value(&p)?),
+                    );
                 }
                 Ok(())
             });
@@ -749,13 +849,20 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
                 return Ok(Outcome::Failed("its page was never created".into()));
             }
             let remote = client.get_page(&id).await?;
-            let keys: Vec<&str> = body.as_object().into_iter().flat_map(|o| o.keys().map(String::as_str)).collect();
+            let keys: Vec<&str> = body
+                .as_object()
+                .into_iter()
+                .flat_map(|o| o.keys().map(String::as_str))
+                .collect();
             if let Some(c) = page_conflict(op, &id, own, &remote, &keys) {
                 return Ok(Outcome::Conflict(c));
             }
             let p = client.update_page(&id, body).await?;
             store.upsert_page(&p)?;
-            own.insert(p.id.clone(), (p.last_edited_time, serde_json::to_value(&p)?));
+            own.insert(
+                p.id.clone(),
+                (p.last_edited_time, serde_json::to_value(&p)?),
+            );
         }
         OpKind::MovePage {
             page_id,
@@ -764,7 +871,9 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
             let id = store.resolve_id(page_id)?;
             let parent = store.resolve_id(new_parent_id)?;
             if id.starts_with("local-") || parent.starts_with("local-") {
-                return Ok(Outcome::Failed("its page or new parent was never created".into()));
+                return Ok(Outcome::Failed(
+                    "its page or new parent was never created".into(),
+                ));
             }
             let remote = client.get_page(&id).await?;
             if let Some(c) = page_conflict(op, &id, own, &remote, &["parent"]) {
@@ -774,7 +883,10 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
             // the answer may be just {object, id}: the cache already shows the move
             if let Ok(p) = serde_json::from_value::<Page>(resp) {
                 store.upsert_page(&p)?;
-                own.insert(p.id.clone(), (p.last_edited_time, serde_json::to_value(&p)?));
+                own.insert(
+                    p.id.clone(),
+                    (p.last_edited_time, serde_json::to_value(&p)?),
+                );
             }
         }
         OpKind::CreateBlock {
@@ -1006,10 +1118,12 @@ fn conflict_op(store: &Store, id: i64) -> Result<Op> {
 pub async fn fetch_remote(client: &Client, store: &Store, op: &Op) -> Result<Option<Remote>> {
     let id = store.resolve_id(op.kind.target_id())?;
     let got = match &op.kind {
-        OpKind::UpdateBlock { .. } | OpKind::DeleteBlock { .. } | OpKind::MoveBlock { .. } => client
-            .get_block(&id)
-            .await
-            .map(|b| (!b.in_trash).then_some(Remote::Block(b))),
+        OpKind::UpdateBlock { .. } | OpKind::DeleteBlock { .. } | OpKind::MoveBlock { .. } => {
+            client
+                .get_block(&id)
+                .await
+                .map(|b| (!b.in_trash).then_some(Remote::Block(b)))
+        }
         OpKind::UpdatePageProperties { .. } => client
             .get_page(&id)
             .await
@@ -1018,10 +1132,15 @@ pub async fn fetch_remote(client: &Client, store: &Store, op: &Op) -> Result<Opt
         OpKind::UpdatePage { .. } | OpKind::MovePage { .. } => {
             client.get_page(&id).await.map(|p| Some(Remote::Page(p)))
         }
-        OpKind::UpdateComment { .. } | OpKind::DeleteComment { .. } => {
-            client.get_comment(&id).await.map(|c| Some(Remote::Comment(c)))
+        OpKind::UpdateComment { .. } | OpKind::DeleteComment { .. } => client
+            .get_comment(&id)
+            .await
+            .map(|c| Some(Remote::Comment(c))),
+        _ => {
+            return Err(Error::Invalid(
+                "only edits, deletes and moves conflict".into(),
+            ))
         }
-        _ => return Err(Error::Invalid("only edits, deletes and moves conflict".into())),
     };
     match got {
         Err(Error::Api { status: 404, .. }) => Ok(None),
@@ -1040,7 +1159,13 @@ fn title_items(props: &Value) -> Option<(&String, &Vec<Value>)> {
 /// (yours, Notion's) as the editor shows them; `None` unless a text edit
 /// that Markdown carries (else a merge would drop formatting).
 fn texts(op: &Op, remote: &Remote) -> Option<(String, String)> {
-    let md = |rt: &[RichText], code| if code { plain_text(rt) } else { to_markdown(rt) };
+    let md = |rt: &[RichText], code| {
+        if code {
+            plain_text(rt)
+        } else {
+            to_markdown(rt)
+        }
+    };
     let rich = |v: &Value| serde_json::from_value::<Vec<RichText>>(v.clone()).ok();
     Some(match (&op.kind, remote) {
         (OpKind::UpdateBlock { body, .. }, Remote::Block(b)) => {
@@ -1119,7 +1244,9 @@ pub fn rebase_op(store: &Store, op_id: i64, remote: &Remote) -> Result<()> {
                 }
                 store.put_block(&serde_json::from_value(raw)?)?;
             }
-            (OpKind::DeleteBlock { block_id }, _) => store.delete_block(&store.resolve_id(block_id)?)?,
+            (OpKind::DeleteBlock { block_id }, _) => {
+                store.delete_block(&store.resolve_id(block_id)?)?
+            }
             (
                 OpKind::MoveBlock {
                     block_id,
@@ -1140,8 +1267,12 @@ pub fn rebase_op(store: &Store, op_id: i64, remote: &Remote) -> Result<()> {
             (OpKind::UpdatePageProperties { properties, .. }, Remote::Page(p)) => {
                 let mut p = p.clone();
                 if let Some((k, items)) = title_items(properties) {
-                    let t: String = items.iter().filter_map(|i| i["text"]["content"].as_str()).collect();
-                    p.properties.insert(k.clone(), PropertyValue::Title(title_runs(&t)));
+                    let t: String = items
+                        .iter()
+                        .filter_map(|i| i["text"]["content"].as_str())
+                        .collect();
+                    p.properties
+                        .insert(k.clone(), PropertyValue::Title(title_runs(&t)));
                 }
                 store.upsert_page(&p)?;
             }
@@ -1225,9 +1356,9 @@ pub async fn resolve_mine(
     seen: Option<&str>,
 ) -> Result<()> {
     let op = conflict_op(store, op_id)?;
-    let remote = fetch_remote(client, store, &op).await?.ok_or_else(|| {
-        Error::Invalid("it is gone from Notion: only Keep theirs is left".into())
-    })?;
+    let remote = fetch_remote(client, store, &op)
+        .await?
+        .ok_or_else(|| Error::Invalid("it is gone from Notion: only Keep theirs is left".into()))?;
     if let Some(seen) = seen {
         if texts(&op, &remote).is_none_or(|(_, theirs)| theirs != seen) {
             return Err(Error::Invalid("Notion changed again: review it".into()));
@@ -1285,7 +1416,11 @@ fn enqueue_update(store: &Store, base: &Block, block: &Block, body: Value) -> Re
         // the same block edited again with nothing queued since (typing
         // across polls): one PATCH, keeping the first op's base for conflicts
         if let Some(op) = store.queued_ops()?.pop() {
-            if let OpKind::UpdateBlock { block_id, body: old } = &op.kind {
+            if let OpKind::UpdateBlock {
+                block_id,
+                body: old,
+            } = &op.kind
+            {
                 if store.resolve_id(block_id)? == block.id {
                     let kind = OpKind::UpdateBlock {
                         block_id: block_id.clone(),
@@ -1538,10 +1673,17 @@ pub fn local_set_title(store: &Store, page_id: &str, title: &str) -> Result<i64>
         // an unpushed page: its create carries the title (and its row in the parent shows it)
         if let Some(op) = queued_create_page(store, &page.id)? {
             if let Some(mut b) = store.get_block(&page.id)? {
-                b.kind = BlockKind::ChildPage { title: title.to_string() };
+                b.kind = BlockKind::ChildPage {
+                    title: title.to_string(),
+                };
                 store.put_block(&b)?;
             }
-            return set_create_body(store, op, "properties", json!({ "title": { "title": body } }));
+            return set_create_body(
+                store,
+                op,
+                "properties",
+                json!({ "title": { "title": body } }),
+            );
         }
         if let Some(Op {
             id,
@@ -1584,11 +1726,23 @@ fn queued_create_page(store: &Store, local_id: &str) -> Result<Option<Op>> {
 
 /// Sets `body[key]` of a queued CreatePage op. Returns its id.
 fn set_create_body(store: &Store, op: Op, key: &str, value: Value) -> Result<i64> {
-    let OpKind::CreatePage { local_id, parent_id, mut body } = op.kind else {
+    let OpKind::CreatePage {
+        local_id,
+        parent_id,
+        mut body,
+    } = op.kind
+    else {
         return Err(Error::Invalid("not a page create".into()));
     };
     body[key] = value;
-    store.update_op_kind(op.id, &OpKind::CreatePage { local_id, parent_id, body })?;
+    store.update_op_kind(
+        op.id,
+        &OpKind::CreatePage {
+            local_id,
+            parent_id,
+            body,
+        },
+    )?;
     Ok(op.id)
 }
 
@@ -1605,7 +1759,11 @@ pub fn local_create_page(
 ) -> Result<String> {
     match store.get_page(parent_id)? {
         Some(p) if !p.in_trash => {}
-        _ => return Err(Error::Invalid("the parent page is not cached or in the trash".into())),
+        _ => {
+            return Err(Error::Invalid(
+                "the parent page is not cached or in the trash".into(),
+            ))
+        }
     }
     let id = local_stamp("local");
     let now = ts(&Utc::now());
@@ -1650,9 +1808,14 @@ pub fn local_set_property(store: &Store, page_id: &str, name: &str, text: &str) 
     let Parent::DataSource { id: ds, .. } = &base.parent else {
         return Err(Error::Invalid("not a database row".into()));
     };
-    let schema = store.data_source(ds)?.map(|d| d.properties[name].clone()).unwrap_or_default();
+    let schema = store
+        .data_source(ds)?
+        .map(|d| d.properties[name].clone())
+        .unwrap_or_default();
     if schema.is_null() {
-        return Err(Error::Invalid(format!("the database has no property {name}")));
+        return Err(Error::Invalid(format!(
+            "the database has no property {name}"
+        )));
     }
     let (sent, cached) = props::encode(&schema, text, &base.raw["properties"][name])?;
     let mut raw = serde_json::to_value(&base)?;
@@ -1661,23 +1824,38 @@ pub fn local_set_property(store: &Store, page_id: &str, name: &str, text: &str) 
     store.atomic(|| {
         store.upsert_page(&page)?;
         if let Some(op) = queued_create_page(store, page_id)? {
-            let OpKind::CreatePage { body, .. } = &op.kind else { unreachable!() };
+            let OpKind::CreatePage { body, .. } = &op.kind else {
+                unreachable!()
+            };
             let mut all = body["properties"].clone();
             all[name] = sent;
             return set_create_body(store, op, "properties", all);
         }
         if let Some(Op {
             id,
-            kind: OpKind::UpdatePageProperties { page_id, mut properties },
+            kind:
+                OpKind::UpdatePageProperties {
+                    page_id,
+                    mut properties,
+                },
             ..
         }) = queued_props(store, page_id)?
         {
             properties[name] = sent.clone();
-            store.update_op_kind(id, &OpKind::UpdatePageProperties { page_id, properties })?;
+            store.update_op_kind(
+                id,
+                &OpKind::UpdatePageProperties {
+                    page_id,
+                    properties,
+                },
+            )?;
             return Ok(id);
         }
         store.enqueue(
-            OpKind::UpdatePageProperties { page_id: page_id.to_string(), properties: json!({ name: sent }) },
+            OpKind::UpdatePageProperties {
+                page_id: page_id.to_string(),
+                properties: json!({ name: sent }),
+            },
             Some(base.last_edited_time),
             Some(serde_json::to_value(&base)?),
         )
@@ -1701,7 +1879,8 @@ pub fn local_create_row(store: &Store, ds_id: &str) -> Result<String> {
         .ok_or_else(|| Error::Invalid("the data source has no title property".into()))?;
     let id = local_stamp("local");
     let now = ts(&Utc::now());
-    let parent = json!({ "type": "data_source_id", "data_source_id": ds_id, "database_id": ds.database_id });
+    let parent =
+        json!({ "type": "data_source_id", "data_source_id": ds_id, "database_id": ds.database_id });
     let page: Page = serde_json::from_value(json!({
         "object": "page", "id": id, "parent": parent, "created_time": now,
         "last_edited_time": now, "in_trash": false, "url": "", "icon": null, "cover": null,
@@ -1744,7 +1923,11 @@ fn local_update_page(store: &Store, page_id: &str, key: &str, value: Value) -> R
             return set_create_body(store, op, key, value);
         }
         for op in store.queued_ops()? {
-            if let OpKind::UpdatePage { page_id: p, mut body } = op.kind {
+            if let OpKind::UpdatePage {
+                page_id: p,
+                mut body,
+            } = op.kind
+            {
                 if store.resolve_id(&p)? == page_id {
                     body[key] = value;
                     store.update_op_kind(op.id, &OpKind::UpdatePage { page_id: p, body })?;
@@ -1753,7 +1936,10 @@ fn local_update_page(store: &Store, page_id: &str, key: &str, value: Value) -> R
             }
         }
         store.enqueue(
-            OpKind::UpdatePage { page_id: page_id.to_string(), body: json!({ key: value }) },
+            OpKind::UpdatePage {
+                page_id: page_id.to_string(),
+                body: json!({ key: value }),
+            },
             Some(base.last_edited_time),
             Some(serde_json::to_value(&base)?),
         )
@@ -1801,7 +1987,9 @@ pub fn local_set_cover(store: &Store, page_id: &str, url: Option<&str>) -> Resul
 /// Locks or unlocks the page in Notion's UI (the API ignores the lock).
 pub fn local_set_locked(store: &Store, page_id: &str, locked: bool) -> Result<i64> {
     if page_id.starts_with("local-") {
-        return Err(Error::Invalid("this page isn't pushed yet: push it (Ctrl+S) first".into()));
+        return Err(Error::Invalid(
+            "this page isn't pushed yet: push it (Ctrl+S) first".into(),
+        ));
     }
     local_update_page(store, page_id, "is_locked", json!(locked))
 }
@@ -1809,7 +1997,9 @@ pub fn local_set_locked(store: &Store, page_id: &str, locked: bool) -> Result<i6
 /// Trashes or restores a page. An unpushed page can't be (undo removes it).
 pub fn local_trash_page(store: &Store, page_id: &str, trashed: bool) -> Result<i64> {
     if page_id.starts_with("local-") {
-        return Err(Error::Invalid("this page isn't pushed yet: push it (Ctrl+S) first".into()));
+        return Err(Error::Invalid(
+            "this page isn't pushed yet: push it (Ctrl+S) first".into(),
+        ));
     }
     // restoring under a trashed parent would leave it invisible
     let mut up = store.get_page(page_id)?.and_then(|p| match p.parent {
@@ -1817,7 +2007,9 @@ pub fn local_trash_page(store: &Store, page_id: &str, trashed: bool) -> Result<i
         _ => None,
     });
     for _ in 0..64 {
-        let Some(parent) = up.take().and_then(|id| store.get_page(&id).ok().flatten()) else { break };
+        let Some(parent) = up.take().and_then(|id| store.get_page(&id).ok().flatten()) else {
+            break;
+        };
         if !trashed && parent.in_trash {
             return Err(Error::Invalid("restore the parent page first".into()));
         }
@@ -1834,7 +2026,9 @@ pub fn local_trash_page(store: &Store, page_id: &str, trashed: bool) -> Result<i
 /// either page isn't pushed yet.
 pub fn local_move_page(store: &Store, page_id: &str, new_parent: &str) -> Result<i64> {
     if page_id.starts_with("local-") || new_parent.starts_with("local-") {
-        return Err(Error::Invalid("an unpushed page can't be moved: push it (Ctrl+S) first".into()));
+        return Err(Error::Invalid(
+            "an unpushed page can't be moved: push it (Ctrl+S) first".into(),
+        ));
     }
     let base = store
         .get_page(page_id)?
@@ -1848,9 +2042,14 @@ pub fn local_move_page(store: &Store, page_id: &str, new_parent: &str) -> Result
     for _ in 0..=tree.len() {
         let Some(at) = up else { break };
         if at == page_id {
-            return Err(Error::Invalid("a page can't move into itself or its own subpages".into()));
+            return Err(Error::Invalid(
+                "a page can't move into itself or its own subpages".into(),
+            ));
         }
-        up = tree.iter().find(|e| e.id == at).and_then(|e| e.parent.clone());
+        up = tree
+            .iter()
+            .find(|e| e.id == at)
+            .and_then(|e| e.parent.clone());
     }
     if base.parent == Parent::Page(new_parent.to_string()) {
         return Err(Error::Invalid("it is already there".into()));
@@ -1865,7 +2064,10 @@ pub fn local_move_page(store: &Store, page_id: &str, new_parent: &str) -> Result
             store.move_block_local(page_id, new_parent, None)?;
         }
         store.enqueue(
-            OpKind::MovePage { page_id: page_id.to_string(), new_parent_id: new_parent.to_string() },
+            OpKind::MovePage {
+                page_id: page_id.to_string(),
+                new_parent_id: new_parent.to_string(),
+            },
             Some(base.last_edited_time),
             Some(serde_json::to_value(&base)?),
         )
@@ -1930,15 +2132,17 @@ pub fn local_delete_block(store: &Store, block_id: &str) -> Result<Option<i64>> 
         // the block each op is about; a reply's is its thread's parent
         let mut targets = Vec::new();
         for op in &ops {
-            targets.push(match &op.kind {
-                OpKind::CreateComment {
-                    parent: CommentTarget::Discussion(d),
-                    ..
-                } => store.discussion_parent(d)?,
-                k => op_block(k).map(str::to_string),
-            }
-            .map(|t| store.resolve_id(&t))
-            .transpose()?);
+            targets.push(
+                match &op.kind {
+                    OpKind::CreateComment {
+                        parent: CommentTarget::Discussion(d),
+                        ..
+                    } => store.discussion_parent(d)?,
+                    k => op_block(k).map(str::to_string),
+                }
+                .map(|t| store.resolve_id(&t))
+                .transpose()?,
+            );
         }
         let mut drop: Vec<bool> = targets
             .iter()
@@ -2096,7 +2300,12 @@ pub fn local_create_block(
 }
 
 /// [`local_create_block`] for a request-shaped block `v` (`{type, <type>: …}`).
-pub(crate) fn local_create_json(store: &Store, parent_id: &str, after: Option<&str>, mut v: Value) -> Result<String> {
+pub(crate) fn local_create_json(
+    store: &Store,
+    parent_id: &str,
+    after: Option<&str>,
+    mut v: Value,
+) -> Result<String> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let now = Utc::now();
     let id = format!(
@@ -2144,7 +2353,9 @@ pub fn local_duplicate_block(store: &Store, block_id: &str, after: Option<&str>)
         let block = cached(store, id)?;
         let kids = store.children(id)?;
         if block.has_children && kids.is_empty() {
-            return Err(Error::Invalid("its children are not cached; pull the page first".into()));
+            return Err(Error::Invalid(
+                "its children are not cached; pull the page first".into(),
+            ));
         }
         let new = local_create_block(store, parent, after, block.kind)?;
         let mut prev: Option<String> = None;
@@ -2175,7 +2386,10 @@ pub fn local_split_block(store: &Store, block_id: &str, md: &str, at: usize) -> 
     store.atomic(|| {
         let base = cached(store, block_id)?;
         let t = base.kind.text().ok_or_else(|| {
-            Error::Invalid(format!("block type `{}` has no text", base.kind.type_name()))
+            Error::Invalid(format!(
+                "block type `{}` has no text",
+                base.kind.type_name()
+            ))
         })?;
         let (before, after) = split_markdown(md, at);
         if to_markdown(&before) != to_markdown(&t.rich_text) {
@@ -2452,7 +2666,9 @@ pub fn local_delete_comment(store: &Store, comment_id: &str) -> Result<Option<i6
             if starts_thread {
                 gone = store
                     .conn
-                    .prepare("SELECT id FROM comments WHERE discussion_id = ?1 AND id LIKE 'local-%'")?
+                    .prepare(
+                        "SELECT id FROM comments WHERE discussion_id = ?1 AND id LIKE 'local-%'",
+                    )?
                     .query_map([&base.discussion_id], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
             }
@@ -2814,24 +3030,31 @@ mod tests {
         serve_page(&s, T, "A", 1).await;
         pull_page(&c, &store, "p", false).await.unwrap();
         serve_page(&s, T, "A", 0).await;
-        let r = pull_page_skip(&c, &store, "p", poll_settle()).await.unwrap();
+        let r = pull_page_skip(&c, &store, "p", poll_settle())
+            .await
+            .unwrap();
         assert!(r.skipped);
         assert_eq!(s.received_requests().await.unwrap().len(), 1);
         s.verify().await;
 
         // recent: the same minute may hide an edit, so it is pulled in full...
-        let recent = (Utc::now() - chrono::Duration::seconds(20)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let recent = (Utc::now() - chrono::Duration::seconds(20))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let store = Store::open_in_memory().unwrap();
         serve_page(&s, &recent, "A", 1).await;
         pull_page(&c, &store, "p", false).await.unwrap();
         serve_page(&s, &recent, "B", 1).await;
-        let r = pull_page_skip(&c, &store, "p", poll_settle()).await.unwrap();
+        let r = pull_page_skip(&c, &store, "p", poll_settle())
+            .await
+            .unwrap();
         assert!(!r.skipped);
         assert_eq!(text(&store, "a"), "B");
         s.verify().await;
         // ...unless the caller already did that lately (`IfUnchanged`)
         serve_page(&s, &recent, "C", 0).await;
-        let r = pull_page_skip(&c, &store, "p", Skip::IfUnchanged).await.unwrap();
+        let r = pull_page_skip(&c, &store, "p", Skip::IfUnchanged)
+            .await
+            .unwrap();
         assert!(r.skipped);
         s.verify().await;
     }
@@ -2846,9 +3069,21 @@ mod tests {
         seed(&s, &store, &["b"]).await;
         local_edit_text(&store, "b", "mine").unwrap();
         get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
-        get(&s, "/v1/blocks/p/children", list(vec![blk("b", pp("p"), "theirs", T2, false)])).await;
-        get(&s, "/v1/blocks/b", ok(blk("b", pp("p"), "theirs", T2, false))).await;
-        let r = pull_page_skip(&c, &store, "p", poll_settle()).await.unwrap();
+        get(
+            &s,
+            "/v1/blocks/p/children",
+            list(vec![blk("b", pp("p"), "theirs", T2, false)]),
+        )
+        .await;
+        get(
+            &s,
+            "/v1/blocks/b",
+            ok(blk("b", pp("p"), "theirs", T2, false)),
+        )
+        .await;
+        let r = pull_page_skip(&c, &store, "p", poll_settle())
+            .await
+            .unwrap();
         assert_eq!((r.skipped, r.updated), (false, 1));
         assert_eq!(text(&store, "b"), "mine");
         let r = push(&c, &store).await.unwrap();
@@ -3451,8 +3686,14 @@ mod tests {
 
     #[test]
     fn merged_bodies_keep_both_halves_of_a_payload() {
-        let m = merge_bodies(json!({ "to_do": { "checked": true } }), json!({ "to_do": { "rich_text": [] }, "color": "red" }));
-        assert_eq!(m, json!({ "to_do": { "checked": true, "rich_text": [] }, "color": "red" }));
+        let m = merge_bodies(
+            json!({ "to_do": { "checked": true } }),
+            json!({ "to_do": { "rich_text": [] }, "color": "red" }),
+        );
+        assert_eq!(
+            m,
+            json!({ "to_do": { "checked": true, "rich_text": [] }, "color": "red" })
+        );
     }
 
     #[tokio::test]
@@ -3761,12 +4002,20 @@ mod tests {
             "parent": { "type": "database_id", "database_id": "db" }, "properties": {} });
         Mock::given(method("POST"))
             .and(path("/v1/search"))
-            .respond_with(list(vec![titled("p1", T, "One"), titled("p2", T, "Two"), ds.clone()]))
+            .respond_with(list(vec![
+                titled("p1", T, "One"),
+                titled("p2", T, "Two"),
+                ds.clone(),
+            ]))
             .mount(s)
             .await;
         get(s, "/v1/data_sources/ds", ok(ds)).await;
         let row = |id: &str| {
-            page(id, json!({ "type": "data_source_id", "data_source_id": "ds", "database_id": "db" }), T)
+            page(
+                id,
+                json!({ "type": "data_source_id", "data_source_id": "ds", "database_id": "db" }),
+                T,
+            )
         };
         Mock::given(method("POST"))
             .and(path("/v1/data_sources/ds/query"))
@@ -3791,29 +4040,66 @@ mod tests {
         let c = client(&s);
         workspace(&s, 500).await;
         let mut seen = Vec::new();
-        let r = pull_all(&c, &store, |d, t, title| seen.push((d, t, title.to_string()))).await.unwrap();
-        assert_eq!((r.pages, r.data_sources, r.skipped, r.errors.len()), (1, 1, 0, 1), "{r:?}");
+        let r = pull_all(&c, &store, |d, t, title| {
+            seen.push((d, t, title.to_string()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            (r.pages, r.data_sources, r.skipped, r.errors.len()),
+            (1, 1, 0, 1),
+            "{r:?}"
+        );
         assert!(r.errors[0].starts_with("Two: ") && r.errors[0].contains("boom"));
-        assert_eq!(seen.iter().map(|(d, t, _)| (*d, *t)).collect::<Vec<_>>(), [(1, 3), (2, 3), (3, 3)]);
+        assert_eq!(
+            seen.iter().map(|(d, t, _)| (*d, *t)).collect::<Vec<_>>(),
+            [(1, 3), (2, 3), (3, 3)]
+        );
         assert_eq!(seen[0].2, "One");
         assert_eq!(store.rows("ds").unwrap().len(), 2);
-        assert!(store.page_tree().unwrap().iter().any(|e| e.id == "ds" && e.database));
+        assert!(store
+            .page_tree()
+            .unwrap()
+            .iter()
+            .any(|e| e.id == "ds" && e.database));
 
         // p2 heals; p1 is skipped without a request (its blocks are gone)
         s.reset().await;
-        Mock::given(method("POST")).and(path("/v1/search"))
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
             .respond_with(list(vec![titled("p1", T, "One"), titled("p2", T, "Two")]))
-            .mount(&s).await;
-        get(&s, "/v1/blocks/p2/children", list(vec![blk("p2b", pp("p2"), "x", T, false)])).await;
+            .mount(&s)
+            .await;
+        get(
+            &s,
+            "/v1/blocks/p2/children",
+            list(vec![blk("p2b", pp("p2"), "x", T, false)]),
+        )
+        .await;
         let r = pull_all(&c, &store, |_, _, _| {}).await.unwrap();
-        assert_eq!(r, SyncAllReport { pages: 1, skipped: 1, ..Default::default() });
+        assert_eq!(
+            r,
+            SyncAllReport {
+                pages: 1,
+                skipped: 1,
+                ..Default::default()
+            }
+        );
         // and a third run touches nothing but the search
         s.reset().await;
-        Mock::given(method("POST")).and(path("/v1/search"))
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
             .respond_with(list(vec![titled("p1", T, "One"), titled("p2", T, "Two")]))
-            .mount(&s).await;
+            .mount(&s)
+            .await;
         let r = pull_all(&c, &store, |_, _, _| {}).await.unwrap();
-        assert_eq!(r, SyncAllReport { skipped: 2, ..Default::default() });
+        assert_eq!(
+            r,
+            SyncAllReport {
+                skipped: 2,
+                ..Default::default()
+            }
+        );
     }
 
     /// Notion's times have minute precision: an unchanged but recent time may hide an edit.
@@ -3821,21 +4107,40 @@ mod tests {
     async fn pull_all_refetches_pages_edited_in_the_last_minutes() {
         let s = MockServer::start().await;
         let store = Store::open_in_memory().unwrap();
-        let recent = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        Mock::given(method("POST")).and(path("/v1/search"))
+        let recent = (Utc::now() - chrono::Duration::seconds(30))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
             .respond_with(list(vec![titled("p1", &recent, "One")]))
-            .mount(&s).await;
-        get(&s, "/v1/blocks/p1/children", list(vec![blk("a", pp("p1"), "old", &recent, false)])).await;
+            .mount(&s)
+            .await;
+        get(
+            &s,
+            "/v1/blocks/p1/children",
+            list(vec![blk("a", pp("p1"), "old", &recent, false)]),
+        )
+        .await;
         let c = client(&s);
         let r = pull_all(&c, &store, |_, _, _| {}).await.unwrap();
         assert_eq!((r.pages, r.skipped), (1, 0));
         s.reset().await;
-        Mock::given(method("POST")).and(path("/v1/search"))
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
             .respond_with(list(vec![titled("p1", &recent, "One")]))
-            .mount(&s).await;
-        get(&s, "/v1/blocks/p1/children", list(vec![blk("a", pp("p1"), "new", &recent, false)])).await;
+            .mount(&s)
+            .await;
+        get(
+            &s,
+            "/v1/blocks/p1/children",
+            list(vec![blk("a", pp("p1"), "new", &recent, false)]),
+        )
+        .await;
         let r = pull_all(&c, &store, |_, _, _| {}).await.unwrap();
-        assert_eq!((r.pages, r.skipped), (1, 0), "same recent time: pulled again");
+        assert_eq!(
+            (r.pages, r.skipped),
+            (1, 0),
+            "same recent time: pulled again"
+        );
         assert_eq!(text(&store, "a"), "new");
     }
 
@@ -3850,29 +4155,71 @@ mod tests {
             "parent": { "type": "database_id", "database_id": "db" }, "properties": {} });
         // the row, cached at T with an old body
         get(&s, "/v1/pages/r", ok(page("r", dsp.clone(), T))).await;
-        get(&s, "/v1/blocks/r/children", list(vec![blk("rb", pp("r"), "old", T, false)])).await;
+        get(
+            &s,
+            "/v1/blocks/r/children",
+            list(vec![blk("rb", pp("r"), "old", T, false)]),
+        )
+        .await;
         pull_page(&c, &store, "r", true).await.unwrap();
         s.reset().await;
         // now changed: the data source comes first in the search
         let row = page("r", dsp, T2);
-        Mock::given(method("POST")).and(path("/v1/search"))
-            .respond_with(list(vec![ds.clone(), row.clone()])).mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .respond_with(list(vec![ds.clone(), row.clone()]))
+            .mount(&s)
+            .await;
         get(&s, "/v1/data_sources/ds", ok(ds)).await;
-        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query"))
-            .respond_with(list(vec![row])).mount(&s).await;
-        get(&s, "/v1/blocks/r/children", list(vec![blk("rb", pp("r"), "new", T2, false)])).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data_sources/ds/query"))
+            .respond_with(list(vec![row]))
+            .mount(&s)
+            .await;
+        get(
+            &s,
+            "/v1/blocks/r/children",
+            list(vec![blk("rb", pp("r"), "new", T2, false)]),
+        )
+        .await;
         let r = pull_all(&c, &store, |_, _, _| {}).await.unwrap();
-        assert_eq!((r.pages, r.data_sources, r.errors.len()), (1, 1, 0), "{r:?}");
+        assert_eq!(
+            (r.pages, r.data_sources, r.errors.len()),
+            (1, 1, 0),
+            "{r:?}"
+        );
         assert_eq!(text(&store, "rb"), "new");
         // and a row only the data source reports keeps its old time until its blocks are pulled
         s.reset().await;
-        let row3 = page("r", json!({ "type": "data_source_id", "data_source_id": "ds", "database_id": "db" }), "2025-01-03T00:00:00.000Z");
-        get(&s, "/v1/data_sources/ds", ok(json!({ "object": "data_source", "id": "ds", "title": [], "last_edited_time": T,
-            "parent": { "type": "database_id", "database_id": "db" }, "properties": {} }))).await;
-        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query"))
-            .respond_with(list(vec![row3])).mount(&s).await;
+        let row3 = page(
+            "r",
+            json!({ "type": "data_source_id", "data_source_id": "ds", "database_id": "db" }),
+            "2025-01-03T00:00:00.000Z",
+        );
+        get(
+            &s,
+            "/v1/data_sources/ds",
+            ok(
+                json!({ "object": "data_source", "id": "ds", "title": [], "last_edited_time": T,
+            "parent": { "type": "database_id", "database_id": "db" }, "properties": {} }),
+            ),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data_sources/ds/query"))
+            .respond_with(list(vec![row3]))
+            .mount(&s)
+            .await;
         pull_data_source(&c, &store, "ds").await.unwrap();
-        assert_eq!(store.get_page("r").unwrap().unwrap().last_edited_time.to_rfc3339(), "2025-01-02T00:00:00+00:00");
+        assert_eq!(
+            store
+                .get_page("r")
+                .unwrap()
+                .unwrap()
+                .last_edited_time
+                .to_rfc3339(),
+            "2025-01-02T00:00:00+00:00"
+        );
     }
 
     #[tokio::test]
@@ -3883,7 +4230,9 @@ mod tests {
         get(&s, "/v1/blocks/p1/children", ResponseTemplate::new(401).set_body_json(
             json!({ "object": "error", "status": 401, "code": "unauthorized", "message": "bad token" }))).await;
         workspace(&s, 200).await;
-        let e = pull_all(&client(&s), &store, |_, _, _| {}).await.unwrap_err();
+        let e = pull_all(&client(&s), &store, |_, _, _| {})
+            .await
+            .unwrap_err();
         assert!(matches!(e, Error::Api { status: 401, .. }), "{e:?}");
         assert!(store.get_page("p2").unwrap().is_none(), "stopped at p1");
     }
@@ -5148,13 +5497,15 @@ mod tests {
         let s = MockServer::start().await;
         let store = Store::open_in_memory().unwrap();
         seed(&s, &store, &["a"]).await;
-        let (op, local) = local_add_comment(&store, CommentTarget::Page("p".into()), rt("hi")).unwrap();
+        let (op, local) =
+            local_add_comment(&store, CommentTarget::Page("p".into()), rt("hi")).unwrap();
         assert!(local.starts_with("local-"));
         assert_eq!(comment_text(&store, &local), "hi");
         assert_eq!(store.comments_for("p").unwrap().len(), 1);
         // a reply to the still-local thread, queued behind it
         let disc = store.get_comment(&local).unwrap().unwrap().discussion_id;
-        let (_, reply) = local_add_comment(&store, CommentTarget::Discussion(disc), rt("re")).unwrap();
+        let (_, reply) =
+            local_add_comment(&store, CommentTarget::Discussion(disc), rt("re")).unwrap();
         assert_eq!(store.queued_ops().unwrap()[0].id, op);
 
         post_comment(
@@ -5177,7 +5528,9 @@ mod tests {
         assert!(store.get_comment(&local).unwrap().is_none());
         let cs = store.comments_for("p").unwrap();
         assert_eq!(
-            cs.iter().map(|c| (c.id.as_str(), c.discussion_id.as_str())).collect::<Vec<_>>(),
+            cs.iter()
+                .map(|c| (c.id.as_str(), c.discussion_id.as_str()))
+                .collect::<Vec<_>>(),
             [("c1", "d1"), ("c2", "d1")]
         );
         assert!(store.queued_ops().unwrap().is_empty());
@@ -5222,7 +5575,10 @@ mod tests {
         local_add_comment(&store, CommentTarget::Block(l), rt("x")).unwrap();
         Mock::given(method("PATCH"))
             .and(path("/v1/blocks/p/children"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"code": "validation_error", "message": "no"})))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(json!({"code": "validation_error", "message": "no"})),
+            )
             .mount(&s)
             .await;
         let r = push(&client(&s), &store).await.unwrap();
@@ -5248,10 +5604,17 @@ mod tests {
         assert!(store.get_comment("c2").unwrap().is_none());
 
         get(&s, "/v1/comments/c1", ok(cm("c1", "d1", bp("a"), "old", T))).await;
-        get(&s, "/v1/comments/c2", ok(cm("c2", "d2", bp("a"), "gone", T))).await;
+        get(
+            &s,
+            "/v1/comments/c2",
+            ok(cm("c2", "d2", bp("a"), "gone", T)),
+        )
+        .await;
         Mock::given(method("PATCH"))
             .and(path("/v1/comments/c1"))
-            .and(body_partial_json(json!({ "rich_text": [{ "text": { "content": "newer" } }] })))
+            .and(body_partial_json(
+                json!({ "rich_text": [{ "text": { "content": "newer" } }] }),
+            ))
             .respond_with(ok(cm("c1", "d1", bp("a"), "newer", T2)))
             .expect(1)
             .mount(&s)
@@ -5276,7 +5639,12 @@ mod tests {
             .put_comment(&serde_json::from_value(cm("c1", "d1", bp("a"), "old", T)).unwrap())
             .unwrap();
         local_edit_comment(&store, "c1", rt("mine")).unwrap();
-        get(&s, "/v1/comments/c1", ok(cm("c1", "d1", bp("a"), "theirs", T2))).await;
+        get(
+            &s,
+            "/v1/comments/c1",
+            ok(cm("c1", "d1", bp("a"), "theirs", T2)),
+        )
+        .await;
         let r = push(&client(&s), &store).await.unwrap();
         assert_eq!((r.applied, r.conflicts), (0, 1), "{r:?}");
     }
@@ -5299,7 +5667,12 @@ mod tests {
         local_add_comment(&store, CommentTarget::Page("p".into()), rt("unpushed")).unwrap();
 
         get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
-        get(&s, "/v1/blocks/p/children", list(vec![blk("a", pp("p"), "a", T, false)])).await;
+        get(
+            &s,
+            "/v1/blocks/p/children",
+            list(vec![blk("a", pp("p"), "a", T, false)]),
+        )
+        .await;
         get(
             &s,
             "/v1/comments",
@@ -5312,11 +5685,21 @@ mod tests {
         .await;
         pull_page(&client(&s), &store, "p", true).await.unwrap();
         let cs = store.comments_for("p").unwrap();
-        let got: Vec<_> = cs.iter().map(|c| (c.id.as_str(), plain_text(&c.rich_text))).collect();
+        let got: Vec<_> = cs
+            .iter()
+            .map(|c| (c.id.as_str(), plain_text(&c.rich_text)))
+            .collect();
         assert!(got.contains(&("e", "mine-edited".to_string())), "{got:?}");
         assert!(got.contains(&("n", "new remote".to_string())), "{got:?}");
-        assert!(got.iter().any(|(id, t)| id.starts_with("local-") && t == "unpushed"), "{got:?}");
-        assert!(!got.iter().any(|(id, _)| *id == "x" || *id == "r"), "{got:?}");
+        assert!(
+            got.iter()
+                .any(|(id, t)| id.starts_with("local-") && t == "unpushed"),
+            "{got:?}"
+        );
+        assert!(
+            !got.iter().any(|(id, _)| *id == "x" || *id == "r"),
+            "{got:?}"
+        );
         assert_eq!(got.len(), 3);
     }
 
@@ -5338,9 +5721,17 @@ mod tests {
         // 403 (no read-comments capability): the page pull still succeeds
         s.reset().await;
         get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
-        get(&s, "/v1/blocks/p/children", list(vec![blk("a", pp("p"), "a", T, false)])).await;
+        get(
+            &s,
+            "/v1/blocks/p/children",
+            list(vec![blk("a", pp("p"), "a", T, false)]),
+        )
+        .await;
         Mock::given(path("/v1/comments"))
-            .respond_with(ResponseTemplate::new(403).set_body_json(json!({"code": "restricted_resource", "message": "no"})))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({"code": "restricted_resource", "message": "no"})),
+            )
             .mount(&s)
             .await;
         pull_page(&client(&s), &store, "p", true).await.unwrap();
@@ -5351,7 +5742,8 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let (_, a) = local_add_comment(&store, CommentTarget::Page("p".into()), rt("a")).unwrap();
         let disc = store.get_comment(&a).unwrap().unwrap().discussion_id;
-        let (_, b) = local_add_comment(&store, CommentTarget::Discussion(disc.clone()), rt("b")).unwrap();
+        let (_, b) =
+            local_add_comment(&store, CommentTarget::Discussion(disc.clone()), rt("b")).unwrap();
         // deleting only the reply keeps the thread
         assert_eq!(local_delete_comment(&store, &b).unwrap(), None);
         assert_eq!(store.queued_ops().unwrap().len(), 1);
@@ -5371,9 +5763,20 @@ mod tests {
         local_add_comment(&store, CommentTarget::Page("p".into()), rt("keep")).unwrap();
         local_delete_block(&store, "b").unwrap();
         assert!(store.comments_for("b").unwrap().is_empty());
-        let kinds: Vec<_> = store.queued_ops().unwrap().into_iter().map(|o| o.kind).collect();
+        let kinds: Vec<_> = store
+            .queued_ops()
+            .unwrap()
+            .into_iter()
+            .map(|o| o.kind)
+            .collect();
         assert_eq!(kinds.len(), 2, "{kinds:?}"); // page comment create + delete block
-        assert!(kinds.iter().any(|k| matches!(k, OpKind::CreateComment { parent: CommentTarget::Page(_), .. })));
+        assert!(kinds.iter().any(|k| matches!(
+            k,
+            OpKind::CreateComment {
+                parent: CommentTarget::Page(_),
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -5415,7 +5818,9 @@ mod tests {
         let b = |id: &str, parent: Value| -> Block {
             serde_json::from_value(blk(id, parent, id, T, false)).unwrap()
         };
-        store.replace_children("p", "a1", &[b("a11", bp("a1"))]).unwrap();
+        store
+            .replace_children("p", "a1", &[b("a11", bp("a1"))])
+            .unwrap();
         for (id, blk) in [("c-a", "a"), ("c-a1", "a1"), ("c-a11", "a11")] {
             real_thread(&store, id, &format!("d-{blk}"), bp(blk));
         }
@@ -5432,16 +5837,24 @@ mod tests {
         let store = undo_store();
         real_thread(&store, "c1", "d1", bp("b"));
         local_add_comment(&store, CommentTarget::Discussion("d1".into()), rt("reply")).unwrap();
-        let (_, l) = local_add_comment(&store, CommentTarget::Block("b".into()), rt("new")).unwrap();
+        let (_, l) =
+            local_add_comment(&store, CommentTarget::Block("b".into()), rt("new")).unwrap();
         let d = store.get_comment(&l).unwrap().unwrap().discussion_id;
         local_add_comment(&store, CommentTarget::Discussion(d), rt("reply2")).unwrap();
         // survives: a reply on another block's thread
         real_thread(&store, "c2", "d2", bp("c"));
         local_add_comment(&store, CommentTarget::Discussion("d2".into()), rt("other")).unwrap();
         local_delete_block(&store, "b").unwrap();
-        let kinds: Vec<_> = store.queued_ops().unwrap().into_iter().map(|o| o.kind).collect();
+        let kinds: Vec<_> = store
+            .queued_ops()
+            .unwrap()
+            .into_iter()
+            .map(|o| o.kind)
+            .collect();
         assert_eq!(kinds.len(), 2, "{kinds:?}");
-        assert!(matches!(&kinds[0], OpKind::CreateComment { parent: CommentTarget::Discussion(d), .. } if d == "d2"));
+        assert!(
+            matches!(&kinds[0], OpKind::CreateComment { parent: CommentTarget::Discussion(d), .. } if d == "d2")
+        );
         assert!(matches!(&kinds[1], OpKind::DeleteBlock { .. }));
     }
 
@@ -5452,13 +5865,24 @@ mod tests {
         real_thread(&store, "c1", "d1", bp("a1"));
         for id in ["b", "a"] {
             // a's comment sits on its child: the copy would lose it too
-            let e = local_move_block(&store, id, "c", None).unwrap_err().to_string();
+            let e = local_move_block(&store, id, "c", None)
+                .unwrap_err()
+                .to_string();
             assert!(e.contains("has comments") && e.contains("moving"), "{e}");
         }
-        let e = local_change_type(&store, "b", TargetKind::Heading1).unwrap_err().to_string();
-        assert!(e.contains("has comments") && e.contains("converting"), "{e}");
+        let e = local_change_type(&store, "b", TargetKind::Heading1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("has comments") && e.contains("converting"),
+            "{e}"
+        );
         assert_eq!(store.comments_for("b").unwrap().len(), 1);
-        assert_eq!(store.queued_ops().unwrap().len(), 1, "only the comment create");
+        assert_eq!(
+            store.queued_ops().unwrap().len(),
+            1,
+            "only the comment create"
+        );
         // a commentless block still moves
         local_move_block(&store, "c", "b", None).unwrap();
     }
@@ -5468,7 +5892,8 @@ mod tests {
         let s = MockServer::start().await;
         let store = Store::open_in_memory().unwrap();
         seed(&s, &store, &["a"]).await;
-        let (_, local) = local_add_comment(&store, CommentTarget::Page("p".into()), rt("hi")).unwrap();
+        let (_, local) =
+            local_add_comment(&store, CommentTarget::Page("p".into()), rt("hi")).unwrap();
         Mock::given(method("POST"))
             .and(path("/v1/comments"))
             .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
@@ -5479,8 +5904,15 @@ mod tests {
         assert_eq!((r.applied, r.failed), (0, 1), "{r:?}");
         assert!(store.queued_ops().unwrap().is_empty());
         let failed = store.ops_by_status(OpStatus::Failed).unwrap();
-        assert!(failed[0].error.as_deref().unwrap().contains("may have been posted"));
-        assert!(store.get_comment(&local).unwrap().is_some(), "kept until the user decides");
+        assert!(failed[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("may have been posted"));
+        assert!(
+            store.get_comment(&local).unwrap().is_some(),
+            "kept until the user decides"
+        );
         // a second push must not POST again (expect(1) above)
         push(&client(&s), &store).await.unwrap();
     }
@@ -5489,7 +5921,11 @@ mod tests {
     async fn comment_post_that_never_connected_stays_queued() {
         let store = Store::open_in_memory().unwrap();
         local_add_comment(&store, CommentTarget::Page("p".into()), rt("hi")).unwrap();
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         let c = Client::new(
             "t".into(),
             ClientConfig {
@@ -5551,11 +5987,25 @@ mod tests {
         pull_page(&client(&s), &store, "p", true).await.unwrap();
 
         let name = |id: &str| store.user(id).unwrap().map(|u| (u.name, u.email));
-        assert_eq!(name("u1"), Some(("Ada".into(), Some("u1@x.org".into()))), "id-only inline kept the name");
-        assert_eq!(name("u2"), Some((String::new(), None)), "unknown name: row with the id");
+        assert_eq!(
+            name("u1"),
+            Some(("Ada".into(), Some("u1@x.org".into()))),
+            "id-only inline kept the name"
+        );
+        assert_eq!(
+            name("u2"),
+            Some((String::new(), None)),
+            "unknown name: row with the id"
+        );
         assert_eq!(name("u3").unwrap().0, "Bob", "mention carried the name");
-        assert_eq!(store.get_page("p").unwrap().unwrap().last_edited_by(), Some("u2"));
-        assert_eq!(store.get_block("a").unwrap().unwrap().last_edited_by(), Some("u1"));
+        assert_eq!(
+            store.get_page("p").unwrap().unwrap().last_edited_by(),
+            Some("u2")
+        );
+        assert_eq!(
+            store.get_block("a").unwrap().unwrap().last_edited_by(),
+            Some("u1")
+        );
         assert_eq!(store.users().unwrap().len(), 3);
     }
 
@@ -5565,9 +6015,23 @@ mod tests {
         let stub = |id: &str| u(json!({ "object": "user", "id": id }));
         let typed = u(json!({ "object": "user", "id": "u2", "type": "bot" }));
         let named = u(json!({ "object": "user", "id": "u1", "type": "person", "name": "Ada" }));
-        let got = dedupe_users(vec![stub("u1"), stub("u2"), typed, named, stub("u1"), stub("u3"), stub("u2")]);
-        let view: Vec<_> = got.iter().map(|u| (u.id.as_str(), u.kind.as_str(), u.name.as_str())).collect();
-        assert_eq!(view, [("u1", "person", "Ada"), ("u2", "bot", ""), ("u3", "", "")]);
+        let got = dedupe_users(vec![
+            stub("u1"),
+            stub("u2"),
+            typed,
+            named,
+            stub("u1"),
+            stub("u3"),
+            stub("u2"),
+        ]);
+        let view: Vec<_> = got
+            .iter()
+            .map(|u| (u.id.as_str(), u.kind.as_str(), u.name.as_str()))
+            .collect();
+        assert_eq!(
+            view,
+            [("u1", "person", "Ada"), ("u2", "bot", ""), ("u3", "", "")]
+        );
     }
 
     #[tokio::test]
@@ -5577,7 +6041,10 @@ mod tests {
         get(
             &s,
             "/v1/users",
-            list(vec![user_obj("u1", Some("Ada")), json!({ "object": "user", "id": "bot", "type": "bot", "name": "Notion Client" })]),
+            list(vec![
+                user_obj("u1", Some("Ada")),
+                json!({ "object": "user", "id": "bot", "type": "bot", "name": "Notion Client" }),
+            ]),
         )
         .await;
         assert_eq!(pull_users(&client(&s), &store).await.unwrap(), 2);
@@ -5591,9 +6058,15 @@ mod tests {
             .expect(1)
             .mount(&s)
             .await;
-        let e = pull_users(&client(&s), &Store::open_in_memory().unwrap()).await.unwrap_err();
+        let e = pull_users(&client(&s), &Store::open_in_memory().unwrap())
+            .await
+            .unwrap_err();
         assert!(matches!(e, Error::Api { status: 403, .. }), "{e:?}");
-        assert_eq!(s.received_requests().await.unwrap().len(), 1, "no retry loop");
+        assert_eq!(
+            s.received_requests().await.unwrap().len(),
+            1,
+            "no retry loop"
+        );
     }
 
     // ---- resolving conflicts
@@ -5603,7 +6076,12 @@ mod tests {
     async fn conflicted(s: &MockServer, store: &Store) -> i64 {
         seed(s, store, &["b"]).await;
         let op = local_edit_text(store, "b", "mine").unwrap();
-        get(s, "/v1/blocks/b", ok(blk("b", pp("p"), "theirs", T2, false))).await;
+        get(
+            s,
+            "/v1/blocks/b",
+            ok(blk("b", pp("p"), "theirs", T2, false)),
+        )
+        .await;
         let r = push(&client(s), store).await.unwrap();
         assert_eq!((r.applied, r.conflicts), (0, 1));
         op
@@ -5616,17 +6094,29 @@ mod tests {
         let op = conflicted(&s, &store).await;
         // a later edit of the same block, queued after the conflict
         local_edit_text(&store, "b", "mine 2").unwrap();
-        resolve_mine(&client(&s), &store, op, None, None).await.unwrap();
+        resolve_mine(&client(&s), &store, op, None, None)
+            .await
+            .unwrap();
         assert!(store.ops_by_status(OpStatus::Conflict).unwrap().is_empty());
         let q = store.queued_ops().unwrap();
         assert_eq!(q.len(), 2);
         assert_eq!(q[0].id, op);
         assert_eq!(q[0].error, None);
         assert_eq!(ts(&q[0].base_last_edited_time.unwrap()), T2);
-        assert_eq!(text(&store, "b"), "mine 2", "the later edit stays in the cache");
+        assert_eq!(
+            text(&store, "b"),
+            "mine 2",
+            "the later edit stays in the cache"
+        );
         Mock::given(method("PATCH"))
             .and(path("/v1/blocks/b"))
-            .respond_with(ok(blk("b", pp("p"), "mine 2", "2025-01-03T00:00:00.000Z", false)))
+            .respond_with(ok(blk(
+                "b",
+                pp("p"),
+                "mine 2",
+                "2025-01-03T00:00:00.000Z",
+                false,
+            )))
             .expect(2)
             .mount(&s)
             .await;
@@ -5642,10 +6132,17 @@ mod tests {
         let op = conflicted(&s, &store).await;
         // a pull in between brought Notion's text into the cache
         get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
-        get(&s, "/v1/blocks/p/children", list(vec![blk("b", pp("p"), "theirs", T2, false)])).await;
+        get(
+            &s,
+            "/v1/blocks/p/children",
+            list(vec![blk("b", pp("p"), "theirs", T2, false)]),
+        )
+        .await;
         pull_page(&client(&s), &store, "p", true).await.unwrap();
         assert_eq!(text(&store, "b"), "theirs");
-        resolve_mine(&client(&s), &store, op, None, None).await.unwrap();
+        resolve_mine(&client(&s), &store, op, None, None)
+            .await
+            .unwrap();
         assert_eq!(text(&store, "b"), "mine");
     }
 
@@ -5665,10 +6162,19 @@ mod tests {
             let op = conflicted(&s, &store).await;
             s.reset().await;
             get(&s, "/v1/blocks/b", gone).await;
-            assert_eq!(fetch_conflict(&client(&s), &store, op).await.unwrap(), Fetched::Gone);
-            let e = resolve_mine(&client(&s), &store, op, None, None).await.unwrap_err();
+            assert_eq!(
+                fetch_conflict(&client(&s), &store, op).await.unwrap(),
+                Fetched::Gone
+            );
+            let e = resolve_mine(&client(&s), &store, op, None, None)
+                .await
+                .unwrap_err();
             assert!(e.to_string().contains("gone"), "{e}");
-            assert_eq!(store.ops_by_status(OpStatus::Conflict).unwrap().len(), 1, "still a conflict");
+            assert_eq!(
+                store.ops_by_status(OpStatus::Conflict).unwrap().len(),
+                1,
+                "still a conflict"
+            );
         }
     }
 
@@ -5679,16 +6185,27 @@ mod tests {
         let op = conflicted(&s, &store).await;
         assert_eq!(
             fetch_conflict(&client(&s), &store, op).await.unwrap(),
-            Fetched::Text { mine: "mine".into(), theirs: "theirs".into() }
+            Fetched::Text {
+                mine: "mine".into(),
+                theirs: "theirs".into()
+            }
         );
-        resolve_mine(&client(&s), &store, op, Some("mine and **theirs**"), None).await.unwrap();
+        resolve_mine(&client(&s), &store, op, Some("mine and **theirs**"), None)
+            .await
+            .unwrap();
         assert_eq!(text(&store, "b"), "mine and theirs");
         Mock::given(method("PATCH"))
             .and(path("/v1/blocks/b"))
             .and(body_partial_json(json!({ "paragraph": { "rich_text": [
                 { "text": { "content": "mine and " } },
                 { "text": { "content": "theirs" }, "annotations": { "bold": true } } ] } })))
-            .respond_with(ok(blk("b", pp("p"), "mine and theirs", "2025-01-03T00:00:00.000Z", false)))
+            .respond_with(ok(blk(
+                "b",
+                pp("p"),
+                "mine and theirs",
+                "2025-01-03T00:00:00.000Z",
+                false,
+            )))
             .expect(1)
             .mount(&s)
             .await;
@@ -5702,21 +6219,33 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         // title
         let c = client(&s);
-        store.upsert_page(&serde_json::from_value(titled("t", T, "old")).unwrap()).unwrap();
+        store
+            .upsert_page(&serde_json::from_value(titled("t", T, "old")).unwrap())
+            .unwrap();
         let op = local_set_title(&store, "t", "mine").unwrap();
         get(&s, "/v1/pages/t", ok(titled("t", T2, "theirs"))).await;
         let r = push(&c, &store).await.unwrap();
         assert_eq!(r.conflicts, 1);
         assert_eq!(
             fetch_conflict(&c, &store, op).await.unwrap(),
-            Fetched::Text { mine: "mine".into(), theirs: "theirs".into() }
+            Fetched::Text {
+                mine: "mine".into(),
+                theirs: "theirs".into()
+            }
         );
-        resolve_mine(&c, &store, op, Some("mine + theirs"), None).await.unwrap();
-        assert_eq!(store.get_page("t").unwrap().unwrap().title(), "mine + theirs");
+        resolve_mine(&c, &store, op, Some("mine + theirs"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_page("t").unwrap().unwrap().title(),
+            "mine + theirs"
+        );
         Mock::given(method("PATCH"))
             .and(path("/v1/pages/t"))
-            .and(body_partial_json(json!({ "properties": { "Name": { "title": [
-                { "text": { "content": "mine + theirs" } }] } } })))
+            .and(body_partial_json(
+                json!({ "properties": { "Name": { "title": [
+                { "text": { "content": "mine + theirs" } }] } } }),
+            ))
             .respond_with(ok(titled("t", "2025-01-03T00:00:00.000Z", "mine + theirs")))
             .expect(1)
             .mount(&s)
@@ -5725,18 +6254,32 @@ mod tests {
         assert_eq!((r.applied, r.conflicts, r.failed), (1, 0, 0), "{r:?}");
 
         // comment
-        store.put_comment(&serde_json::from_value(cm("c1", "d1", bp("a"), "old", T)).unwrap()).unwrap();
+        store
+            .put_comment(&serde_json::from_value(cm("c1", "d1", bp("a"), "old", T)).unwrap())
+            .unwrap();
         let op = local_edit_comment(&store, "c1", rt("mine")).unwrap();
-        get(&s, "/v1/comments/c1", ok(cm("c1", "d1", bp("a"), "theirs", T2))).await;
+        get(
+            &s,
+            "/v1/comments/c1",
+            ok(cm("c1", "d1", bp("a"), "theirs", T2)),
+        )
+        .await;
         assert_eq!(push(&c, &store).await.unwrap().conflicts, 1);
         assert_eq!(
             fetch_conflict(&c, &store, op).await.unwrap(),
-            Fetched::Text { mine: "mine".into(), theirs: "theirs".into() }
+            Fetched::Text {
+                mine: "mine".into(),
+                theirs: "theirs".into()
+            }
         );
-        resolve_mine(&c, &store, op, Some("both"), None).await.unwrap();
+        resolve_mine(&c, &store, op, Some("both"), None)
+            .await
+            .unwrap();
         assert_eq!(comment_text(&store, "c1"), "both");
         let q = store.queued_ops().unwrap();
-        assert!(matches!(&q[0].kind, OpKind::UpdateComment { rich_text, .. } if rich_text[0]["text"]["content"] == "both"));
+        assert!(
+            matches!(&q[0].kind, OpKind::UpdateComment { rich_text, .. } if rich_text[0]["text"]["content"] == "both")
+        );
     }
 
     #[tokio::test]
@@ -5745,13 +6288,31 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         seed(&s, &store, &["b"]).await;
         local_delete_block(&store, "b").unwrap().unwrap();
-        get(&s, "/v1/blocks/b", ok(blk("b", pp("p"), "theirs", T2, false))).await;
+        get(
+            &s,
+            "/v1/blocks/b",
+            ok(blk("b", pp("p"), "theirs", T2, false)),
+        )
+        .await;
         assert_eq!(push(&client(&s), &store).await.unwrap().conflicts, 1);
         let op = store.ops_by_status(OpStatus::Conflict).unwrap()[0].id;
-        assert_eq!(fetch_conflict(&client(&s), &store, op).await.unwrap(), Fetched::Other);
-        assert!(resolve_mine(&client(&s), &store, op, Some("x"), None).await.is_err(), "nothing to merge");
-        resolve_mine(&client(&s), &store, op, None, None).await.unwrap();
-        assert!(store.get_block("b").unwrap().is_none(), "still deleted in the cache");
+        assert_eq!(
+            fetch_conflict(&client(&s), &store, op).await.unwrap(),
+            Fetched::Other
+        );
+        assert!(
+            resolve_mine(&client(&s), &store, op, Some("x"), None)
+                .await
+                .is_err(),
+            "nothing to merge"
+        );
+        resolve_mine(&client(&s), &store, op, None, None)
+            .await
+            .unwrap();
+        assert!(
+            store.get_block("b").unwrap().is_none(),
+            "still deleted in the cache"
+        );
         Mock::given(method("DELETE"))
             .and(path("/v1/blocks/b"))
             .respond_with(ok(blk("b", pp("p"), "theirs", T2, false)))
@@ -5767,12 +6328,28 @@ mod tests {
         let s = MockServer::start().await;
         let store = Store::open_in_memory().unwrap();
         let op = conflicted(&s, &store).await;
-        let Fetched::Text { theirs, .. } = fetch_conflict(&client(&s), &store, op).await.unwrap() else { panic!() };
+        let Fetched::Text { theirs, .. } = fetch_conflict(&client(&s), &store, op).await.unwrap()
+        else {
+            panic!()
+        };
         // Notion changes again before the user decides
         s.reset().await;
-        get(&s, "/v1/blocks/b", ok(blk("b", pp("p"), "theirs, edited again", "2025-01-03T00:00:00.000Z", false))).await;
+        get(
+            &s,
+            "/v1/blocks/b",
+            ok(blk(
+                "b",
+                pp("p"),
+                "theirs, edited again",
+                "2025-01-03T00:00:00.000Z",
+                false,
+            )),
+        )
+        .await;
         for merged in [None, Some("mine and theirs")] {
-            let e = resolve_mine(&client(&s), &store, op, merged, Some(&theirs)).await.unwrap_err();
+            let e = resolve_mine(&client(&s), &store, op, merged, Some(&theirs))
+                .await
+                .unwrap_err();
             assert!(e.to_string().contains("changed again"), "{e}");
             let ops = store.ops_by_status(OpStatus::Conflict).unwrap();
             assert_eq!(ops.len(), 1, "still a conflict");
@@ -5780,8 +6357,13 @@ mod tests {
             assert_eq!(text(&store, "b"), "mine", "cache untouched");
         }
         // seeing the new text lets it through
-        let Fetched::Text { theirs, .. } = fetch_conflict(&client(&s), &store, op).await.unwrap() else { panic!() };
-        resolve_mine(&client(&s), &store, op, None, Some(&theirs)).await.unwrap();
+        let Fetched::Text { theirs, .. } = fetch_conflict(&client(&s), &store, op).await.unwrap()
+        else {
+            panic!()
+        };
+        resolve_mine(&client(&s), &store, op, None, Some(&theirs))
+            .await
+            .unwrap();
         assert_eq!(store.queued_ops().unwrap().len(), 1);
     }
 
@@ -5796,10 +6378,17 @@ mod tests {
             "mention": { "type": "link_preview", "link_preview": { "url": "https://x.y" } } }]);
         s.reset().await;
         get(&s, "/v1/blocks/b", ok(theirs)).await;
-        assert_eq!(fetch_conflict(&client(&s), &store, op).await.unwrap(), Fetched::Other);
-        assert!(resolve_mine(&client(&s), &store, op, Some("x"), None).await.is_err());
+        assert_eq!(
+            fetch_conflict(&client(&s), &store, op).await.unwrap(),
+            Fetched::Other
+        );
+        assert!(resolve_mine(&client(&s), &store, op, Some("x"), None)
+            .await
+            .is_err());
         // Keep mine still works
-        resolve_mine(&client(&s), &store, op, None, None).await.unwrap();
+        resolve_mine(&client(&s), &store, op, None, None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -5810,13 +6399,24 @@ mod tests {
         let mut u = RichText::plain("mine");
         u.annotations.underline = true;
         local_edit_rich(&store, "b", vec![u]).unwrap();
-        get(&s, "/v1/blocks/b", ok(blk("b", pp("p"), "theirs", T2, false))).await;
+        get(
+            &s,
+            "/v1/blocks/b",
+            ok(blk("b", pp("p"), "theirs", T2, false)),
+        )
+        .await;
         push(&client(&s), &store).await.unwrap();
         let op = store.ops_by_status(OpStatus::Conflict).unwrap()[0].id;
-        resolve_mine(&client(&s), &store, op, Some("mine"), None).await.unwrap();
+        resolve_mine(&client(&s), &store, op, Some("mine"), None)
+            .await
+            .unwrap();
         let q = store.queued_ops().unwrap();
-        assert!(matches!(&q[0].kind, OpKind::UpdateBlock { body, .. }
-            if body["paragraph"]["rich_text"][0]["annotations"]["underline"] == true), "{:?}", q[0].kind);
+        assert!(
+            matches!(&q[0].kind, OpKind::UpdateBlock { body, .. }
+            if body["paragraph"]["rich_text"][0]["annotations"]["underline"] == true),
+            "{:?}",
+            q[0].kind
+        );
     }
 
     #[tokio::test]
@@ -5824,7 +6424,9 @@ mod tests {
         let s = MockServer::start().await;
         let store = Store::open_in_memory().unwrap();
         let c = client(&s);
-        store.upsert_page(&serde_json::from_value(titled("t", T, "old")).unwrap()).unwrap();
+        store
+            .upsert_page(&serde_json::from_value(titled("t", T, "old")).unwrap())
+            .unwrap();
         let op = store
             .enqueue(
                 OpKind::UpdatePageProperties {
@@ -5838,7 +6440,10 @@ mod tests {
             .unwrap();
         store.mark_op(op, OpStatus::Conflict, Some("x")).unwrap();
         get(&s, "/v1/pages/t", ok(titled("t", T2, "theirs"))).await;
-        assert_eq!(fetch_conflict(&c, &store, op).await.unwrap(), Fetched::Other);
+        assert_eq!(
+            fetch_conflict(&c, &store, op).await.unwrap(),
+            Fetched::Other
+        );
     }
 
     // ------------------------------------------------ block editing (F2)
@@ -5858,12 +6463,20 @@ mod tests {
             ]),
         )
         .await;
-        get(&s, "/v1/blocks/a/children", list(vec![blk("a1", bp("a"), "A1", T, false)])).await;
+        get(
+            &s,
+            "/v1/blocks/a/children",
+            list(vec![blk("a1", bp("a"), "A1", T, false)]),
+        )
+        .await;
         pull_page(&c, &store, "p", true).await.unwrap();
         s.reset().await;
 
         let copy = local_duplicate_block(&store, "a", None).unwrap();
-        assert_eq!(ids(&store.children("p").unwrap()), ["a", copy.as_str(), "b"]);
+        assert_eq!(
+            ids(&store.children("p").unwrap()),
+            ["a", copy.as_str(), "b"]
+        );
         assert_eq!(text(&store, &copy), "A");
         let kid = store.children(&copy).unwrap();
         assert_eq!((kid.len(), text(&store, &kid[0].id)), (1, "A1".into()));
@@ -5915,8 +6528,15 @@ mod tests {
             let s = MockServer::start().await;
             let store = Store::open_in_memory().unwrap();
             seed(&s, &store, &["a", "b", "c"]).await;
-            local_move_block(&store, moved, "p", Some(anchor)).unwrap().unwrap();
-            get(&s, &format!("/v1/blocks/{moved}"), ok(blk(moved, pp("p"), moved, T, false))).await;
+            local_move_block(&store, moved, "p", Some(anchor))
+                .unwrap()
+                .unwrap();
+            get(
+                &s,
+                &format!("/v1/blocks/{moved}"),
+                ok(blk(moved, pp("p"), moved, T, false)),
+            )
+            .await;
             Mock::given(method("PATCH"))
                 .and(path("/v1/blocks/p/children"))
                 .and(body_partial_json(json!({ "after": anchor })))
@@ -5954,7 +6574,9 @@ mod tests {
         }))
         .unwrap();
         store.put_comment(&c).unwrap();
-        let e = local_move_block(&store, "b", "p", None).unwrap_err().to_string();
+        let e = local_move_block(&store, "b", "p", None)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("comments"), "{e}");
         assert!(store.queued_ops().unwrap().is_empty());
     }
@@ -5970,7 +6592,9 @@ mod tests {
         get(&s, "/v1/blocks/a", ok(blk("a", pp("p"), "a", T, false))).await;
         Mock::given(method("PATCH"))
             .and(path("/v1/blocks/a"))
-            .and(body_partial_json(json!({ "paragraph": { "color": "red_background" } })))
+            .and(body_partial_json(
+                json!({ "paragraph": { "color": "red_background" } }),
+            ))
             .respond_with(ok(blk("a", pp("p"), "a", T2, false)))
             .expect(1)
             .mount(&s)
@@ -6007,7 +6631,10 @@ mod tests {
         let new = local_split_block(&store, "a", "**bold tail**", 6).unwrap();
         assert_eq!(ids(&store.children("p").unwrap()), ["a", new.as_str(), "b"]);
         let (l, r) = (rich(&store, "a"), rich(&store, &new));
-        assert_eq!((plain_text(&l), plain_text(&r)), ("bold".into(), " tail".into()));
+        assert_eq!(
+            (plain_text(&l), plain_text(&r)),
+            ("bold".into(), " tail".into())
+        );
         assert!(l[0].annotations.bold && r[0].annotations.bold);
         let kinds: Vec<_> = store
             .queued_ops()
@@ -6017,7 +6644,12 @@ mod tests {
             .collect();
         assert_eq!(kinds, [true, false], "an edit, then a create");
 
-        get(&s, "/v1/blocks/a", ok(blk("a", pp("p"), "bold tail", T, false))).await;
+        get(
+            &s,
+            "/v1/blocks/a",
+            ok(blk("a", pp("p"), "bold tail", T, false)),
+        )
+        .await;
         Mock::given(method("PATCH"))
             .and(path("/v1/blocks/a"))
             .and(body_string_contains("\"bold\""))
@@ -6048,11 +6680,23 @@ mod tests {
             .replace_children("p", "p", &[serde_json::from_value(parent).unwrap()])
             .unwrap();
         // has_children, none cached: refused, nothing queued
-        let e = local_duplicate_block(&store, "a", None).unwrap_err().to_string();
+        let e = local_duplicate_block(&store, "a", None)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("not cached"), "{e}");
         assert!(store.queued_ops().unwrap().is_empty());
         let new = local_split_block(&store, "a", "a", 1).unwrap();
-        assert_eq!(store.get_block(&new).unwrap().unwrap().kind.text().unwrap().color, "blue");
+        assert_eq!(
+            store
+                .get_block(&new)
+                .unwrap()
+                .unwrap()
+                .kind
+                .text()
+                .unwrap()
+                .color,
+            "blue"
+        );
     }
 
     #[test]
@@ -6061,19 +6705,30 @@ mod tests {
         let mut bullet = blk("a", pp("p"), "x", T, false);
         bullet["type"] = json!("bulleted_list_item");
         bullet["bulleted_list_item"] = bullet["paragraph"].take();
-        store.upsert_page(&serde_json::from_value(page("p", pp("root"), T)).unwrap()).unwrap();
+        store
+            .upsert_page(&serde_json::from_value(page("p", pp("root"), T)).unwrap())
+            .unwrap();
         store
             .replace_children("p", "p", &[serde_json::from_value(bullet).unwrap()])
             .unwrap();
         let new = local_split_block(&store, "a", "x", 1).unwrap();
-        assert_eq!(store.queued_ops().unwrap().len(), 1, "no edit: nothing changed");
+        assert_eq!(
+            store.queued_ops().unwrap().len(),
+            1,
+            "no edit: nothing changed"
+        );
         let b = store.get_block(&new).unwrap().unwrap();
         assert!(matches!(b.kind, BlockKind::BulletedListItem(_)));
         assert_eq!(plain_text(&b.kind.text().unwrap().rich_text), "");
     }
 
     async fn post(s: &MockServer, p: &str, resp: ResponseTemplate, expect: u64) {
-        Mock::given(method("POST")).and(path(p)).respond_with(resp).expect(expect).mount(s).await;
+        Mock::given(method("POST"))
+            .and(path(p))
+            .respond_with(resp)
+            .expect(expect)
+            .mount(s)
+            .await;
     }
     async fn patch(s: &MockServer, p: &str, body: Value, resp: ResponseTemplate) {
         Mock::given(method("PATCH"))
@@ -6085,7 +6740,11 @@ mod tests {
             .await;
     }
     fn report(applied: usize, conflicts: usize) -> PushReport {
-        PushReport { applied, conflicts, failed: 0 }
+        PushReport {
+            applied,
+            conflicts,
+            failed: 0,
+        }
     }
 
     #[tokio::test]
@@ -6096,7 +6755,15 @@ mod tests {
         let id = local_create_page(&store, "p", Some("b"), "Notes").unwrap();
         assert!(id.starts_with("local-"));
         assert_eq!(ids(&store.children("p").unwrap()), ["b", id.as_str()]);
-        assert_eq!(store.page_tree().unwrap().iter().filter(|e| e.id == id).count(), 1);
+        assert_eq!(
+            store
+                .page_tree()
+                .unwrap()
+                .iter()
+                .filter(|e| e.id == id)
+                .count(),
+            1
+        );
         // renaming and editing before the push rewrite the one create
         local_set_title(&store, &id, "Ideas").unwrap();
         local_set_icon(&store, &id, Some("📝")).unwrap();
@@ -6123,7 +6790,13 @@ mod tests {
             .await;
         let mut div = blk_json_divider("d");
         div["parent"] = pp("real1");
-        patch(&s, "/v1/blocks/real1/children", json!({ "children": [{ "type": "divider" }] }), list(vec![div])).await;
+        patch(
+            &s,
+            "/v1/blocks/real1/children",
+            json!({ "children": [{ "type": "divider" }] }),
+            list(vec![div]),
+        )
+        .await;
         let r = push(&client(&s), &store).await.unwrap();
         assert_eq!(r, report(2, 0));
         assert_eq!(store.resolve_id(&id).unwrap(), "real1");
@@ -6182,7 +6855,10 @@ mod tests {
         )
         .await;
         assert_eq!(r, report(1, 0));
-        assert_eq!(store.get_page("p").unwrap().unwrap().raw["icon"]["emoji"], "🚀");
+        assert_eq!(
+            store.get_page("p").unwrap().unwrap().raw["icon"]["emoji"],
+            "🚀"
+        );
 
         // remove both
         let (r, _) = push_page_op(
@@ -6219,7 +6895,13 @@ mod tests {
 
         let s = MockServer::start().await;
         get(&s, "/v1/pages/p", ok(trashed)).await;
-        patch(&s, "/v1/pages/p", json!({ "in_trash": false }), ok(page("p", pp("root"), T2))).await;
+        patch(
+            &s,
+            "/v1/pages/p",
+            json!({ "in_trash": false }),
+            ok(page("p", pp("root"), T2)),
+        )
+        .await;
         assert_eq!(push(&client(&s), &store).await.unwrap(), report(1, 0));
         assert!(!store.get_page("p").unwrap().unwrap().in_trash);
     }
@@ -6227,12 +6909,17 @@ mod tests {
     #[test]
     fn icon_and_cover_are_validated() {
         let store = Store::open_in_memory().unwrap();
-        store.upsert_page(&serde_json::from_value(page("p", pp("root"), T)).unwrap()).unwrap();
+        store
+            .upsert_page(&serde_json::from_value(page("p", pp("root"), T)).unwrap())
+            .unwrap();
         assert!(local_set_icon(&store, "p", Some("abc")).is_err());
         assert!(local_set_icon(&store, "p", Some("")).is_err());
         assert!(local_set_cover(&store, "p", Some("ftp://x/y.png")).is_err());
         assert!(local_set_cover(&store, "p", Some("javascript:alert(1)")).is_err());
-        assert_eq!(cover_host("https://img.example.com/a.png").unwrap(), "img.example.com");
+        assert_eq!(
+            cover_host("https://img.example.com/a.png").unwrap(),
+            "img.example.com"
+        );
         assert!(store.queued_ops().unwrap().is_empty());
     }
 
@@ -6258,7 +6945,12 @@ mod tests {
         local_trash_page(&store, "p", true).unwrap();
         local_set_icon(&store, "p", Some("🚀")).unwrap();
         get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
-        get(&s, "/v1/blocks/p/children", list(vec![blk("b", pp("p"), "b", T2, false)])).await;
+        get(
+            &s,
+            "/v1/blocks/p/children",
+            list(vec![blk("b", pp("p"), "b", T2, false)]),
+        )
+        .await;
         pull_page(&client(&s), &store, "p", true).await.unwrap();
         let p = store.get_page("p").unwrap().unwrap();
         assert!(p.in_trash);
@@ -6270,28 +6962,46 @@ mod tests {
         let s = MockServer::start().await;
         let store = Store::open_in_memory().unwrap();
         seed(&s, &store, &["b"]).await;
-        store.upsert_page(&serde_json::from_value(page("q", pp("root"), T)).unwrap()).unwrap();
-        store.upsert_page(&serde_json::from_value(page("r", pp("p"), T)).unwrap()).unwrap();
+        store
+            .upsert_page(&serde_json::from_value(page("q", pp("root"), T)).unwrap())
+            .unwrap();
+        store
+            .upsert_page(&serde_json::from_value(page("r", pp("p"), T)).unwrap())
+            .unwrap();
         assert!(local_move_page(&store, "p", "p").is_err());
-        assert!(local_move_page(&store, "p", "r").is_err(), "into a descendant");
+        assert!(
+            local_move_page(&store, "p", "r").is_err(),
+            "into a descendant"
+        );
         assert!(local_move_page(&store, "p", "nope").is_err());
         assert!(local_move_page(&store, "p", "root").is_err());
         assert!(store.queued_ops().unwrap().is_empty());
         local_move_page(&store, "p", "q").unwrap();
-        assert_eq!(store.get_page("p").unwrap().unwrap().parent, Parent::Page("q".into()));
-        assert!(local_move_page(&store, "q", "r").is_err(), "r is under p, now under q");
+        assert_eq!(
+            store.get_page("p").unwrap().unwrap().parent,
+            Parent::Page("q".into())
+        );
+        assert!(
+            local_move_page(&store, "q", "r").is_err(),
+            "r is under p, now under q"
+        );
 
         // the move endpoint is a POST
         get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
         Mock::given(method("POST"))
             .and(path("/v1/pages/p/move"))
-            .and(body_partial_json(json!({ "parent": { "type": "page_id", "page_id": "q" } })))
+            .and(body_partial_json(
+                json!({ "parent": { "type": "page_id", "page_id": "q" } }),
+            ))
             .respond_with(ok(page("p", pp("q"), T2)))
             .expect(1)
             .mount(&s)
             .await;
         assert_eq!(push(&client(&s), &store).await.unwrap(), report(1, 0));
-        assert_eq!(store.get_page("p").unwrap().unwrap().parent, Parent::Page("q".into()));
+        assert_eq!(
+            store.get_page("p").unwrap().unwrap().parent,
+            Parent::Page("q".into())
+        );
     }
 
     #[tokio::test]
@@ -6299,7 +7009,9 @@ mod tests {
         let s = MockServer::start().await;
         let store = Store::open_in_memory().unwrap();
         seed(&s, &store, &["b"]).await;
-        store.upsert_page(&serde_json::from_value(page("q", pp("root"), T)).unwrap()).unwrap();
+        store
+            .upsert_page(&serde_json::from_value(page("q", pp("root"), T)).unwrap())
+            .unwrap();
         local_move_page(&store, "p", "q").unwrap();
         get(&s, "/v1/pages/p", ok(page("p", pp("elsewhere"), T2))).await;
         assert_eq!(push(&client(&s), &store).await.unwrap(), report(0, 1));
@@ -6312,7 +7024,12 @@ mod tests {
         seed(&s, &store, &["b"]).await;
         let id = local_create_page(&store, "p", Some("b"), "New").unwrap();
         get(&s, "/v1/pages/p", ok(page("p", pp("root"), T2))).await;
-        get(&s, "/v1/blocks/p/children", list(vec![blk("b", pp("p"), "b", T2, false)])).await;
+        get(
+            &s,
+            "/v1/blocks/p/children",
+            list(vec![blk("b", pp("p"), "b", T2, false)]),
+        )
+        .await;
         pull_page(&client(&s), &store, "p", true).await.unwrap();
         assert_eq!(ids(&store.children("p").unwrap()), ["b", id.as_str()]);
         assert!(store.get_page(&id).unwrap().is_some());
@@ -6326,10 +7043,20 @@ mod tests {
         seed(&s, &store, &["b"]).await;
         let a = local_create_page(&store, "p", None, "A").unwrap();
         local_create_page(&store, &a, None, "B").unwrap();
-        post(&s, "/v1/pages", ResponseTemplate::new(400).set_body_json(json!({
-            "object": "error", "status": 400, "code": "validation_error", "message": "no" })), 1).await;
+        post(
+            &s,
+            "/v1/pages",
+            ResponseTemplate::new(400).set_body_json(json!({
+            "object": "error", "status": 400, "code": "validation_error", "message": "no" })),
+            1,
+        )
+        .await;
         let r = push(&client(&s), &store).await.unwrap();
-        assert_eq!((r.applied, r.failed), (0, 2), "the first fails at Notion, its child never starts");
+        assert_eq!(
+            (r.applied, r.failed),
+            (0, 2),
+            "the first fails at Notion, its child never starts"
+        );
     }
 
     #[tokio::test]
@@ -6339,8 +7066,14 @@ mod tests {
         seed(&s, &store, &["b"]).await;
         let a = local_create_page(&store, "p", None, "A").unwrap();
         local_create_block(&store, &a, None, BlockKind::Divider).unwrap();
-        post(&s, "/v1/pages", ResponseTemplate::new(400).set_body_json(json!({
-            "object": "error", "status": 400, "code": "validation_error", "message": "no" })), 1).await;
+        post(
+            &s,
+            "/v1/pages",
+            ResponseTemplate::new(400).set_body_json(json!({
+            "object": "error", "status": 400, "code": "validation_error", "message": "no" })),
+            1,
+        )
+        .await;
         let r = push(&client(&s), &store).await.unwrap();
         assert_eq!((r.applied, r.failed), (0, 2));
         let f = store.ops_by_status(OpStatus::Failed).unwrap();
@@ -6351,14 +7084,18 @@ mod tests {
     fn lock_and_trash_refuse_unpushed_pages_and_restore_needs_a_live_parent() {
         let store = Store::open_in_memory().unwrap();
         for (id, parent) in [("p", "root"), ("c", "p")] {
-            store.upsert_page(&serde_json::from_value(page(id, pp(parent), T)).unwrap()).unwrap();
+            store
+                .upsert_page(&serde_json::from_value(page(id, pp(parent), T)).unwrap())
+                .unwrap();
         }
         let new = local_create_page(&store, "p", None, "N").unwrap();
         assert!(local_set_locked(&store, &new, true).is_err());
         assert!(local_set_locked(&store, "c", true).is_ok());
         local_trash_page(&store, "c", true).unwrap();
         local_trash_page(&store, "p", true).unwrap();
-        let e = local_trash_page(&store, "c", false).unwrap_err().to_string();
+        let e = local_trash_page(&store, "c", false)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("restore the parent page first"), "{e}");
         local_trash_page(&store, "p", false).unwrap();
         local_trash_page(&store, "c", false).unwrap();
@@ -6379,15 +7116,27 @@ mod tests {
     fn ds_json() -> Value {
         let mut props = serde_json::Map::new();
         let mut add = |name: &str, kind: &str, config: Value| {
-            let id = if kind == "title" { "title".to_string() } else { format!("id-{name}") };
+            let id = if kind == "title" {
+                "title".to_string()
+            } else {
+                format!("id-{name}")
+            };
             props.insert(name.into(), prop(&id, name, kind, config));
         };
         add("Name", "title", json!({}));
         add("Notes", "rich_text", json!({}));
         add("Qty", "number", json!({ "format": "number" }));
-        add("Kind", "select", json!({ "options": [{ "id": "o1", "name": "A", "color": "red" }] }));
+        add(
+            "Kind",
+            "select",
+            json!({ "options": [{ "id": "o1", "name": "A", "color": "red" }] }),
+        );
         add("Tags", "multi_select", json!({ "options": [] }));
-        add("State", "status", json!({ "options": [{ "id": "s1", "name": "Done", "color": "green" }] }));
+        add(
+            "State",
+            "status",
+            json!({ "options": [{ "id": "s1", "name": "Done", "color": "green" }] }),
+        );
         add("Due", "date", json!({}));
         add("Done", "checkbox", json!({}));
         add("Site", "url", json!({}));
@@ -6410,41 +7159,75 @@ mod tests {
     /// A store with the data source "ds" and its row "r1" (at time T).
     fn rows_store() -> Store {
         let store = Store::open_in_memory().unwrap();
-        store.upsert_data_source(&serde_json::from_value(ds_json()).unwrap()).unwrap();
-        store.upsert_page(&serde_json::from_value(row("r1", T)).unwrap()).unwrap();
+        store
+            .upsert_data_source(&serde_json::from_value(ds_json()).unwrap())
+            .unwrap();
+        store
+            .upsert_page(&serde_json::from_value(row("r1", T)).unwrap())
+            .unwrap();
         store
     }
 
     #[tokio::test]
     async fn each_property_type_pushes_its_own_body() {
         let cases = [
-            ("Name", "Hi", json!({ "title": [{ "type": "text", "text": { "content": "Hi" } }] })),
-            ("Notes", "x", json!({ "rich_text": [{ "type": "text", "text": { "content": "x" } }] })),
+            (
+                "Name",
+                "Hi",
+                json!({ "title": [{ "type": "text", "text": { "content": "Hi" } }] }),
+            ),
+            (
+                "Notes",
+                "x",
+                json!({ "rich_text": [{ "type": "text", "text": { "content": "x" } }] }),
+            ),
             ("Qty", "3", json!({ "number": 3 })),
             ("Kind", "A", json!({ "select": { "name": "A" } })),
-            ("Tags", "x,y", json!({ "multi_select": [{ "name": "x" }, { "name": "y" }] })),
+            (
+                "Tags",
+                "x,y",
+                json!({ "multi_select": [{ "name": "x" }, { "name": "y" }] }),
+            ),
             ("State", "Done", json!({ "status": { "name": "Done" } })),
-            ("Due", "2025-01-01/2025-01-02", json!({ "date": { "start": "2025-01-01", "end": "2025-01-02", "time_zone": null } })),
+            (
+                "Due",
+                "2025-01-01/2025-01-02",
+                json!({ "date": { "start": "2025-01-01", "end": "2025-01-02", "time_zone": null } }),
+            ),
             ("Done", "true", json!({ "checkbox": true })),
             ("Site", "https://a.at", json!({ "url": "https://a.at" })),
             ("Mail", "a@b.at", json!({ "email": "a@b.at" })),
             ("Tel", "+43 1", json!({ "phone_number": "+43 1" })),
-            ("Who", "u1", json!({ "people": [{ "object": "user", "id": "u1" }] })),
+            (
+                "Who",
+                "u1",
+                json!({ "people": [{ "object": "user", "id": "u1" }] }),
+            ),
         ];
         for (name, text, sent) in cases {
             let s = MockServer::start().await;
             let store = rows_store();
             local_set_property(&store, "r1", name, text).unwrap();
-            assert_eq!(store.get_page("r1").unwrap().unwrap().raw["properties"][name]["type"], ds_json()["properties"][name]["type"], "{name} cached");
+            assert_eq!(
+                store.get_page("r1").unwrap().unwrap().raw["properties"][name]["type"],
+                ds_json()["properties"][name]["type"],
+                "{name} cached"
+            );
             get(&s, "/v1/pages/r1", ok(row("r1", T))).await;
             Mock::given(method("PATCH"))
                 .and(path("/v1/pages/r1"))
-                .and(wiremock::matchers::body_json(json!({ "properties": { name: sent } })))
+                .and(wiremock::matchers::body_json(
+                    json!({ "properties": { name: sent } }),
+                ))
                 .respond_with(ok(row("r1", T2)))
                 .expect(1)
                 .mount(&s)
                 .await;
-            assert_eq!(push(&client(&s), &store).await.unwrap(), report(1, 0), "{name}");
+            assert_eq!(
+                push(&client(&s), &store).await.unwrap(),
+                report(1, 0),
+                "{name}"
+            );
             s.verify().await;
         }
     }
@@ -6452,8 +7235,17 @@ mod tests {
     #[test]
     fn property_edits_are_refused_for_read_only_types_and_non_rows() {
         let store = rows_store();
-        for bad in [("Calc", "1"), ("Qty", "abc"), ("State", "Nope"), ("Site", "ftp://a"), ("Nope", "x")] {
-            assert!(local_set_property(&store, "r1", bad.0, bad.1).is_err(), "{bad:?}");
+        for bad in [
+            ("Calc", "1"),
+            ("Qty", "abc"),
+            ("State", "Nope"),
+            ("Site", "ftp://a"),
+            ("Nope", "x"),
+        ] {
+            assert!(
+                local_set_property(&store, "r1", bad.0, bad.1).is_err(),
+                "{bad:?}"
+            );
         }
         page_in_store(&store);
         assert!(local_set_property(&store, "pg", "Name", "x").is_err());
@@ -6461,14 +7253,18 @@ mod tests {
     }
 
     fn page_in_store(store: &Store) {
-        store.upsert_page(&serde_json::from_value(page("pg", pp("root"), T)).unwrap()).unwrap();
+        store
+            .upsert_page(&serde_json::from_value(page("pg", pp("root"), T)).unwrap())
+            .unwrap();
     }
 
     #[tokio::test]
     async fn several_cell_edits_on_one_row_are_one_op_and_other_rows_get_their_own() {
         let s = MockServer::start().await;
         let store = rows_store();
-        store.upsert_page(&serde_json::from_value(row("r2", T)).unwrap()).unwrap();
+        store
+            .upsert_page(&serde_json::from_value(row("r2", T)).unwrap())
+            .unwrap();
         local_set_property(&store, "r1", "Qty", "3").unwrap();
         local_set_property(&store, "r1", "Name", "Hi").unwrap();
         local_set_property(&store, "r1", "Qty", "4").unwrap();
@@ -6478,7 +7274,13 @@ mod tests {
             get(&s, &format!("/v1/pages/{id}"), ok(row(id, T))).await;
         }
         patch(&s, "/v1/pages/r1", json!({ "properties": { "Qty": { "number": 4 }, "Name": { "title": [{ "text": { "content": "Hi" } }] } } }), ok(row("r1", T2))).await;
-        patch(&s, "/v1/pages/r2", json!({ "properties": { "Qty": { "number": 9 } } }), ok(row("r2", T2))).await;
+        patch(
+            &s,
+            "/v1/pages/r2",
+            json!({ "properties": { "Qty": { "number": 9 } } }),
+            ok(row("r2", T2)),
+        )
+        .await;
         assert_eq!(push(&client(&s), &store).await.unwrap(), report(2, 0));
         s.verify().await;
     }
@@ -6491,13 +7293,23 @@ mod tests {
             v["properties"]["Done"]["checkbox"] = json!(done);
             v
         };
-        for (remote, applied, conflicts) in [(remote(json!(5), false), 0, 1), (remote(json!(null), true), 1, 0)] {
+        for (remote, applied, conflicts) in [
+            (remote(json!(5), false), 0, 1),
+            (remote(json!(null), true), 1, 0),
+        ] {
             let s = MockServer::start().await;
             let store = rows_store();
             local_set_property(&store, "r1", "Qty", "3").unwrap();
             get(&s, "/v1/pages/r1", ok(remote)).await;
-            Mock::given(method("PATCH")).and(path("/v1/pages/r1")).respond_with(ok(row("r1", T2))).mount(&s).await;
-            assert_eq!(push(&client(&s), &store).await.unwrap(), report(applied, conflicts));
+            Mock::given(method("PATCH"))
+                .and(path("/v1/pages/r1"))
+                .respond_with(ok(row("r1", T2)))
+                .mount(&s)
+                .await;
+            assert_eq!(
+                push(&client(&s), &store).await.unwrap(),
+                report(applied, conflicts)
+            );
             if conflicts == 1 {
                 let c = store.ops_by_status(OpStatus::Conflict).unwrap();
                 assert_eq!(c[0].error.as_deref(), Some("remote changed Qty"));
@@ -6531,7 +7343,12 @@ mod tests {
         assert_eq!(push(&client(&s), &store).await.unwrap(), report(1, 0));
         s.verify().await;
         assert_eq!(store.resolve_id(&id).unwrap(), "real1");
-        let mut ids: Vec<_> = store.rows("ds").unwrap().into_iter().map(|p| p.id).collect();
+        let mut ids: Vec<_> = store
+            .rows("ds")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
         ids.sort();
         assert_eq!(ids, ["r1", "real1"]);
         assert_eq!(store.get_page("real1").unwrap().unwrap().title(), "Hello");
@@ -6546,7 +7363,13 @@ mod tests {
         assert!(store.get_page("r1").unwrap().unwrap().in_trash);
         // a pull before the push keeps the queued trash
         get(&s, "/v1/data_sources/ds", ok(ds_json())).await;
-        post(&s, "/v1/data_sources/ds/query", list(vec![row("r1", T2)]), 1).await;
+        post(
+            &s,
+            "/v1/data_sources/ds/query",
+            list(vec![row("r1", T2)]),
+            1,
+        )
+        .await;
         pull_data_source(&client(&s), &store, "ds").await.unwrap();
         assert!(store.get_page("r1").unwrap().unwrap().in_trash);
         s.reset().await;
@@ -6561,37 +7384,74 @@ mod tests {
     async fn pulling_a_database_caches_its_data_sources_and_the_first_ones_rows() {
         let s = MockServer::start().await;
         let store = Store::open_in_memory().unwrap();
-        get(&s, "/v1/databases/db", ok(json!({ "object": "database", "id": "db",
-            "data_sources": [{ "id": "ds", "name": "Tasks" }, { "id": "ds2", "name": "More" }] }))).await;
+        get(
+            &s,
+            "/v1/databases/db",
+            ok(json!({ "object": "database", "id": "db",
+            "data_sources": [{ "id": "ds", "name": "Tasks" }, { "id": "ds2", "name": "More" }] })),
+        )
+        .await;
         get(&s, "/v1/data_sources/ds", ok(ds_json())).await;
         let mut two = ds_json();
         two["id"] = json!("ds2");
         two["title"] = json!([]);
         get(&s, "/v1/data_sources/ds2", ok(two)).await;
-        post(&s, "/v1/data_sources/ds/query", list(vec![row("r1", T), row("r2", T)]), 1).await;
+        post(
+            &s,
+            "/v1/data_sources/ds/query",
+            list(vec![row("r1", T), row("r2", T)]),
+            1,
+        )
+        .await;
         post(&s, "/v1/data_sources/ds2/query", list(vec![]), 0).await;
         let r = pull_database(&client(&s), &store, "db").await.unwrap();
         assert_eq!(r.updated, 2);
-        assert_eq!(store.data_sources_of("db").unwrap().iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), ["ds2", "ds"]);
+        assert_eq!(
+            store
+                .data_sources_of("db")
+                .unwrap()
+                .iter()
+                .map(|d| d.id.as_str())
+                .collect::<Vec<_>>(),
+            ["ds2", "ds"]
+        );
         assert_eq!(store.rows("ds").unwrap().len(), 2);
         s.verify().await;
     }
 
     async fn setup(s: &MockServer) {
         get(s, "/v1/data_sources/ds", ok(ds_json())).await;
-        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query")).respond_with(list(vec![row("r1", T)])).mount(s).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data_sources/ds/query"))
+            .respond_with(list(vec![row("r1", T)]))
+            .mount(s)
+            .await;
     }
 
     #[tokio::test]
     async fn pull_any_tells_data_sources_databases_and_pages_apart() {
-        let err = |status: u16| ResponseTemplate::new(status).set_body_json(json!({ "object": "error", "status": status, "code": "x", "message": "m" }));
-        let db = || ok(json!({ "object": "database", "id": "x", "data_sources": [{ "id": "ds", "name": "T" }] }));
+        let err = |status: u16| {
+            ResponseTemplate::new(status).set_body_json(
+                json!({ "object": "error", "status": status, "code": "x", "message": "m" }),
+            )
+        };
+        let db = || {
+            ok(
+                json!({ "object": "database", "id": "x", "data_sources": [{ "id": "ds", "name": "T" }] }),
+            )
+        };
         // a cached data source: its rows, no page request
         let s = MockServer::start().await;
         let store = rows_store();
         setup(&s).await;
         get(&s, "/v1/pages/ds", err(500)).await;
-        assert_eq!(pull_any(&client(&s), &store, "ds", false).await.unwrap().fetched, 1);
+        assert_eq!(
+            pull_any(&client(&s), &store, "ds", false)
+                .await
+                .unwrap()
+                .fetched,
+            1
+        );
         // a child_database block's id is a database, without asking for a page
         let s = MockServer::start().await;
         let store = Store::open_in_memory().unwrap();
@@ -6601,25 +7461,44 @@ mod tests {
         let blk: Block = serde_json::from_value(json!({ "object": "block", "id": "cd", "parent": pp("p"), "type": "child_database",
             "child_database": { "title": "T" }, "has_children": false, "in_trash": false, "created_time": T, "last_edited_time": T })).unwrap();
         store.put_block(&blk).unwrap();
-        assert_eq!(pull_any(&client(&s), &store, "cd", false).await.unwrap().fetched, 1);
+        assert_eq!(
+            pull_any(&client(&s), &store, "cd", false)
+                .await
+                .unwrap()
+                .fetched,
+            1
+        );
         // Notion says the id is a database, not a page
         let s = MockServer::start().await;
         let store = Store::open_in_memory().unwrap();
         setup(&s).await;
         get(&s, "/v1/pages/x", err(400)).await;
         get(&s, "/v1/databases/x", db()).await;
-        assert_eq!(pull_any(&client(&s), &store, "x", false).await.unwrap().fetched, 1);
+        assert_eq!(
+            pull_any(&client(&s), &store, "x", false)
+                .await
+                .unwrap()
+                .fetched,
+            1
+        );
         // neither: the page's error
         let s = MockServer::start().await;
         get(&s, "/v1/pages/x", err(404)).await;
         get(&s, "/v1/databases/x", err(404)).await;
-        let e = pull_any(&client(&s), &Store::open_in_memory().unwrap(), "x", false).await.unwrap_err();
+        let e = pull_any(&client(&s), &Store::open_in_memory().unwrap(), "x", false)
+            .await
+            .unwrap_err();
         assert!(matches!(e, Error::Api { status: 404, .. }));
         // anything else is a page
         let s = MockServer::start().await;
         get(&s, "/v1/pages/p", ok(page("p", pp("root"), T))).await;
         get(&s, "/v1/blocks/p/children", list(vec![])).await;
-        assert!(!pull_any(&client(&s), &Store::open_in_memory().unwrap(), "p", false).await.unwrap().skipped);
+        assert!(
+            !pull_any(&client(&s), &Store::open_in_memory().unwrap(), "p", false)
+                .await
+                .unwrap()
+                .skipped
+        );
     }
 
     #[tokio::test]
@@ -6629,15 +7508,24 @@ mod tests {
         let c = client(&s);
         get(&s, "/v1/data_sources/ds", ok(ds_json())).await;
         let rows_at = |v: Vec<Value>| list(v);
-        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query")).respond_with(rows_at(vec![row("r1", T), row("r2", T2)])).mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data_sources/ds/query"))
+            .respond_with(rows_at(vec![row("r1", T), row("r2", T2)]))
+            .mount(&s)
+            .await;
         // nothing cached: a full pull (and the schema)
         assert!(!poll_data_source(&c, &store, "ds").await.unwrap().skipped);
         assert_eq!(store.rows("ds").unwrap().len(), 2);
         s.reset().await;
         // nothing changed: one request, skipped
         let q = json!({ "filter": { "timestamp": "last_edited_time", "last_edited_time": { "on_or_after": "2025-01-02T00:00:00.000Z" } } });
-        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query")).and(body_partial_json(q.clone()))
-            .respond_with(rows_at(vec![row("r2", T2)])).expect(1).mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data_sources/ds/query"))
+            .and(body_partial_json(q.clone()))
+            .respond_with(rows_at(vec![row("r2", T2)]))
+            .expect(1)
+            .mount(&s)
+            .await;
         let r = poll_data_source(&c, &store, "ds").await.unwrap();
         assert!(r.skipped && r.updated == 0, "{r:?}");
         // a same-minute edit of another row is seen through its properties
@@ -6645,14 +7533,27 @@ mod tests {
         let mut edited = row("r2", T2);
         edited["properties"]["Qty"]["number"] = json!(7);
         let new = row("r3", "2025-01-03T00:00:00.000Z");
-        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query")).and(body_partial_json(q))
-            .respond_with(rows_at(vec![edited, new])).expect(1).mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data_sources/ds/query"))
+            .and(body_partial_json(q))
+            .respond_with(rows_at(vec![edited, new]))
+            .expect(1)
+            .mount(&s)
+            .await;
         let r = poll_data_source(&c, &store, "ds").await.unwrap();
         assert!(!r.skipped && r.updated == 2, "{r:?}");
-        assert_eq!(store.get_page("r2").unwrap().unwrap().raw["properties"]["Qty"]["number"], 7);
+        assert_eq!(
+            store.get_page("r2").unwrap().unwrap().raw["properties"]["Qty"]["number"],
+            7
+        );
         assert_eq!(store.rows("ds").unwrap().len(), 3);
         // only the filtered queries were sent (no second data source GET)
-        assert!(s.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "POST"));
+        assert!(s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method.as_str() == "POST"));
     }
 
     #[tokio::test]
@@ -6661,7 +7562,11 @@ mod tests {
         let store = rows_store();
         local_set_property(&store, "r1", "Qty", "9").unwrap();
         get(&s, "/v1/data_sources/ds", ok(ds_json())).await;
-        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query")).respond_with(list(vec![row("r1", T2)])).mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data_sources/ds/query"))
+            .respond_with(list(vec![row("r1", T2)]))
+            .mount(&s)
+            .await;
         for _ in 0..2 {
             let r = poll_data_source(&client(&s), &store, "ds").await.unwrap();
             assert!(r.skipped && r.updated == 0, "{r:?}");
@@ -6675,11 +7580,17 @@ mod tests {
         let store = rows_store();
         let local = local_create_row(&store, "ds").unwrap();
         for id in ["r2", "r3"] {
-            store.upsert_page(&serde_json::from_value(row(id, T)).unwrap()).unwrap();
+            store
+                .upsert_page(&serde_json::from_value(row(id, T)).unwrap())
+                .unwrap();
         }
         local_set_property(&store, "r3", "Qty", "1").unwrap();
         get(&s, "/v1/data_sources/ds", ok(ds_json())).await;
-        Mock::given(method("POST")).and(path("/v1/data_sources/ds/query")).respond_with(list(vec![row("r1", T)])).mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data_sources/ds/query"))
+            .respond_with(list(vec![row("r1", T)]))
+            .mount(&s)
+            .await;
         pull_data_source(&client(&s), &store, "ds").await.unwrap();
         let trashed = |id: &str| store.get_page(id).unwrap().unwrap().in_trash;
         assert!(trashed("r2") && !trashed("r1") && !trashed("r3") && !trashed(&local));
@@ -6689,4 +7600,3 @@ mod tests {
         DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc)
     }
 }
-

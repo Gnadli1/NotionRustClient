@@ -4,18 +4,22 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use notion_core::api::Client;
+use notion_core::api::{Client, ClientConfig};
 use notion_core::model::{plain_text, Block, BlockKind, SearchResult};
 use notion_core::ops::OpStatus;
+use notion_core::private::PrivateAuth;
 use notion_core::store::Store;
 use notion_core::sync;
 
 #[derive(Parser)]
 #[command(about = "Notion client test harness")]
 struct Cli {
-    /// SQLite cache path [default: $XDG_DATA_HOME/notion-client/cache.db]
+    /// SQLite cache path [default: the app's cache.db in the data folder]
     #[arg(long, global = true)]
     db: Option<PathBuf>,
+    /// Use the browser-session backend (NOTION_TOKEN_V2 + NOTION_SPACE_ID)
+    #[arg(long, global = true)]
+    browser: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -43,17 +47,37 @@ enum Cmd {
     Status,
 }
 
+fn client(browser: bool) -> anyhow::Result<Client> {
+    if browser {
+        let token_v2 =
+            std::env::var("NOTION_TOKEN_V2").context("NOTION_TOKEN_V2 not set for --browser")?;
+        let space_id =
+            std::env::var("NOTION_SPACE_ID").context("NOTION_SPACE_ID not set for --browser")?;
+        let user_id = std::env::var("NOTION_USER_ID")
+            .ok()
+            .filter(|u| !u.is_empty());
+        let cookies = std::env::var("NOTION_COOKIES")
+            .ok()
+            .filter(|c| !c.trim().is_empty());
+        Ok(Client::new_private(
+            PrivateAuth {
+                token_v2,
+                space_id,
+                user_id,
+                cookies,
+            },
+            ClientConfig::default(),
+        ))
+    } else {
+        Ok(Client::from_env()?)
+    }
+}
+
 fn db_path(arg: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     if let Some(p) = arg {
         return Ok(p);
     }
-    let base = match std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        Some(d) => PathBuf::from(d),
-        None => {
-            PathBuf::from(std::env::var_os("HOME").context("HOME not set")?).join(".local/share")
-        }
-    };
-    Ok(base.join("notion-client/cache.db"))
+    notion_core::paths::default_db().context("cannot find a data folder; pass --db <path>")
 }
 
 fn open_store(arg: Option<PathBuf>) -> anyhow::Result<Store> {
@@ -150,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Search { query } => {
-            let client = Client::from_env()?;
+            let client = client(cli.browser)?;
             for r in client.search(&query).await? {
                 match r {
                     SearchResult::Page(p) => println!("page  {}  {}", p.id, p.title()),
@@ -160,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Pull { page_id, full } => {
             let id = normalize_id(&page_id)?;
-            let client = Client::from_env()?;
+            let client = client(cli.browser)?;
             let store = open_store(cli.db)?;
             let r = sync::pull_page(&client, &store, &id, full).await?;
             if r.skipped {
@@ -170,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::SyncAll => {
-            let client = Client::from_env()?;
+            let client = client(cli.browser)?;
             let store = open_store(cli.db)?;
             let r = sync::pull_all(&client, &store, |done, total, title| {
                 println!("[{done}/{total}] {title}")
@@ -200,7 +224,7 @@ async fn main() -> anyhow::Result<()> {
             println!("queued op {op}");
         }
         Cmd::Push => {
-            let client = Client::from_env()?;
+            let client = client(cli.browser)?;
             let r = sync::push(&client, &open_store(cli.db)?).await?;
             println!(
                 "applied {}, conflicts {}, failed {}",

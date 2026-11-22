@@ -57,23 +57,35 @@ impl Store {
     }
 
     fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        self.conn
-            .execute("INSERT OR REPLACE INTO meta VALUES (?1, ?2)", params![key, value])?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta VALUES (?1, ?2)",
+            params![key, value],
+        )?;
         Ok(())
     }
 
     /// Saves who you are (from `Client::me_identity`). `env_user` (the
     /// `NOTION_USER_ID` setting) wins over the integration's owner, which an
     /// internal integration doesn't have as a person.
-    pub fn set_identity(&self, bot: &str, owner: Option<&str>, env_user: Option<&str>) -> Result<()> {
+    pub fn set_identity(
+        &self,
+        bot: &str,
+        owner: Option<&str>,
+        env_user: Option<&str>,
+    ) -> Result<()> {
         self.set_meta("bot_id", bot)?;
-        self.set_meta("owner_id", env_user.filter(|u| !u.is_empty()).or(owner).unwrap_or(""))
+        self.set_meta(
+            "owner_id",
+            env_user.filter(|u| !u.is_empty()).or(owner).unwrap_or(""),
+        )
     }
 
     /// None until `set_identity` ran. Recording needs a person, see
     /// [`person`](Self::person).
     pub fn identity(&self) -> Result<Option<Identity>> {
-        let Some(bot) = self.meta("bot_id")? else { return Ok(None) };
+        let Some(bot) = self.meta("bot_id")? else {
+            return Ok(None);
+        };
         let owner = self.meta("owner_id")?.filter(|o| !o.is_empty());
         Ok(Some(Identity { bot, owner }))
     }
@@ -95,7 +107,9 @@ impl Store {
     /// page or block) created after the inbox began; one that mentions you is
     /// a mention. Already known ones (read or not) stay as they are.
     pub fn note_comments(&self, parent_id: &str, list: &[Comment]) -> Result<()> {
-        let Some(me) = self.person()? else { return Ok(()) };
+        let Some(me) = self.person()? else {
+            return Ok(());
+        };
         let since = self.since()?;
         // the page must be cached (parent_id is it, or a block of it), else
         // the entry couldn't open anything
@@ -135,10 +149,16 @@ impl Store {
     /// opened it here (and after the inbox began). A newer edit of an entry
     /// already there makes it unread again.
     pub fn note_page(&self, page: &Page) -> Result<()> {
-        let (Some(me), Some(by)) = (self.person()?, page.last_edited_by()) else { return Ok(()) };
+        let (Some(me), Some(by)) = (self.person()?, page.last_edited_by()) else {
+            return Ok(());
+        };
         let opened = self
             .conn
-            .query_row("SELECT at FROM opened WHERE page_id = ?1", [&page.id], |r| r.get::<_, String>(0))
+            .query_row(
+                "SELECT at FROM opened WHERE page_id = ?1",
+                [&page.id],
+                |r| r.get::<_, String>(0),
+            )
             .optional()?
             .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
             .map_or(DateTime::UNIX_EPOCH, |t| t.with_timezone(&Utc));
@@ -157,26 +177,37 @@ impl Store {
     /// The page was opened (now): its entries are read, and edits from before
     /// now are no longer news.
     pub fn mark_page_read(&self, page_id: &str) -> Result<()> {
-        self.conn
-            .execute("INSERT OR REPLACE INTO opened VALUES (?1, ?2)", params![page_id, ts(&Utc::now())])?;
-        self.conn
-            .execute("UPDATE activity SET unread = 0 WHERE page_id = ?1 AND unread = 1", [page_id])?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO opened VALUES (?1, ?2)",
+            params![page_id, ts(&Utc::now())],
+        )?;
+        self.conn.execute(
+            "UPDATE activity SET unread = 0 WHERE page_id = ?1 AND unread = 1",
+            [page_id],
+        )?;
         Ok(())
     }
 
     pub fn mark_entry_read(&self, kind: &str, target: &str) -> Result<()> {
-        self.conn
-            .execute("UPDATE activity SET unread = 0 WHERE kind = ?1 AND target = ?2", [kind, target])?;
+        self.conn.execute(
+            "UPDATE activity SET unread = 0 WHERE kind = ?1 AND target = ?2",
+            [kind, target],
+        )?;
         Ok(())
     }
 
     pub fn mark_all_read(&self) -> Result<()> {
-        self.conn.execute("UPDATE activity SET unread = 0 WHERE unread = 1", [])?;
+        self.conn
+            .execute("UPDATE activity SET unread = 0 WHERE unread = 1", [])?;
         Ok(())
     }
 
     pub fn unread_count(&self) -> Result<usize> {
-        Ok(self.conn.query_row("SELECT COUNT(*) FROM activity WHERE unread = 1", [], |r| r.get::<_, i64>(0))? as usize)
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM activity WHERE unread = 1", [], |r| {
+                r.get::<_, i64>(0)
+            })? as usize)
     }
 
     /// Newest first, read and unread.
@@ -193,7 +224,8 @@ impl Store {
                 parent_id: r.get(3)?,
                 author: r.get(4)?,
                 summary: r.get(5)?,
-                at: DateTime::parse_from_rfc3339(&at).map_or(DateTime::UNIX_EPOCH, |t| t.with_timezone(&Utc)),
+                at: DateTime::parse_from_rfc3339(&at)
+                    .map_or(DateTime::UNIX_EPOCH, |t| t.with_timezone(&Utc)),
                 unread: r.get::<_, i64>(7)? != 0,
             })
         })?;
@@ -211,7 +243,8 @@ mod tests {
     fn store() -> Store {
         let s = Store::open_in_memory().unwrap();
         s.set_identity("bot", None, Some(ME)).unwrap();
-        s.set_meta("activity_since", "2020-01-01T00:00:00.000Z").unwrap();
+        s.set_meta("activity_since", "2020-01-01T00:00:00.000Z")
+            .unwrap();
         for id in ["p", "q"] {
             let mut p = page("x", "2000-01-01T00:00:00.000Z");
             p.id = id.into();
@@ -248,12 +281,16 @@ mod tests {
         let c = comment("c1", "u1", text("hello"));
         s.note_comments("p", std::slice::from_ref(&c)).unwrap();
         s.mark_all_read().unwrap();
-        s.note_comments("p", &[c, comment("c2", "u1", text("again"))]).unwrap();
+        s.note_comments("p", &[c, comment("c2", "u1", text("again"))])
+            .unwrap();
         let list = s.activity().unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(s.unread_count().unwrap(), 1, "c1 stays read, c2 is new");
         let c1 = list.iter().find(|e| e.target == "c1").unwrap();
-        assert_eq!((c1.kind.as_str(), c1.page_id.as_str(), c1.summary.as_str()), (COMMENT, "p", "hello"));
+        assert_eq!(
+            (c1.kind.as_str(), c1.page_id.as_str(), c1.summary.as_str()),
+            (COMMENT, "p", "hello")
+        );
     }
 
     #[test]
@@ -272,9 +309,17 @@ mod tests {
             ],
         )
         .unwrap();
-        let kinds: Vec<_> = s.activity().unwrap().into_iter().map(|e| (e.target, e.kind)).collect();
+        let kinds: Vec<_> = s
+            .activity()
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.target, e.kind))
+            .collect();
         assert_eq!(kinds.len(), 2, "{kinds:?}");
-        assert!(kinds.contains(&("m".into(), MENTION.into())) && kinds.contains(&("o".into(), COMMENT.into())));
+        assert!(
+            kinds.contains(&("m".into(), MENTION.into()))
+                && kinds.contains(&("o".into(), COMMENT.into()))
+        );
     }
 
     #[test]
@@ -282,64 +327,95 @@ mod tests {
         let s = store();
         s.set_meta("bot_id", "").unwrap();
         s.set_meta("owner_id", "").unwrap();
-        s.note_comments("p", &[comment("c", "u1", text("x"))]).unwrap();
-        s.note_page(&page("u1", "2030-01-01T00:00:00.000Z")).unwrap();
+        s.note_comments("p", &[comment("c", "u1", text("x"))])
+            .unwrap();
+        s.note_page(&page("u1", "2030-01-01T00:00:00.000Z"))
+            .unwrap();
         assert!(s.activity().unwrap().is_empty(), "no identity");
         s.set_identity("bot", None, None).unwrap();
-        s.note_comments("p", &[comment("c", "u1", text("x"))]).unwrap();
-        s.note_page(&page("u1", "2030-01-01T00:00:00.000Z")).unwrap();
-        assert!(s.activity().unwrap().is_empty(), "workspace-owned and NOTION_USER_ID unset: no person");
+        s.note_comments("p", &[comment("c", "u1", text("x"))])
+            .unwrap();
+        s.note_page(&page("u1", "2030-01-01T00:00:00.000Z"))
+            .unwrap();
+        assert!(
+            s.activity().unwrap().is_empty(),
+            "workspace-owned and NOTION_USER_ID unset: no person"
+        );
     }
 
     #[test]
     fn the_env_user_wins_over_the_api_owner_and_is_who_you_are() {
         let s = store();
-        s.set_identity("bot", Some("api-owner"), Some("env-user")).unwrap();
-        assert_eq!(s.identity().unwrap().unwrap().owner.as_deref(), Some("env-user"));
+        s.set_identity("bot", Some("api-owner"), Some("env-user"))
+            .unwrap();
+        assert_eq!(
+            s.identity().unwrap().unwrap().owner.as_deref(),
+            Some("env-user")
+        );
         s.set_identity("bot", Some("api-owner"), None).unwrap();
-        assert_eq!(s.identity().unwrap().unwrap().owner.as_deref(), Some("api-owner"));
+        assert_eq!(
+            s.identity().unwrap().unwrap().owner.as_deref(),
+            Some("api-owner")
+        );
         s.set_identity("bot", None, Some("env-user")).unwrap();
-        s.note_comments("p", &[comment("mine", "env-user", text("me"))]).unwrap();
-        s.note_page(&page("env-user", "2030-01-01T00:00:00.000Z")).unwrap();
+        s.note_comments("p", &[comment("mine", "env-user", text("me"))])
+            .unwrap();
+        s.note_page(&page("env-user", "2030-01-01T00:00:00.000Z"))
+            .unwrap();
         assert!(s.activity().unwrap().is_empty());
     }
 
     #[test]
     fn a_comment_on_an_uncached_page_or_block_is_skipped() {
         let s = store();
-        s.note_comments("nowhere", &[comment("c", "u1", text("x"))]).unwrap();
+        s.note_comments("nowhere", &[comment("c", "u1", text("x"))])
+            .unwrap();
         assert!(s.activity().unwrap().is_empty());
     }
 
     #[test]
     fn comments_from_before_the_inbox_began_are_not_news() {
         let s = store();
-        s.set_meta("activity_since", "2022-01-01T00:00:00.000Z").unwrap();
-        s.note_comments("p", &[comment("c", "u1", text("old"))]).unwrap();
+        s.set_meta("activity_since", "2022-01-01T00:00:00.000Z")
+            .unwrap();
+        s.note_comments("p", &[comment("c", "u1", text("old"))])
+            .unwrap();
         assert!(s.activity().unwrap().is_empty());
     }
 
     #[test]
     fn pages_others_edited_after_you_opened_them_are_entries_yours_are_not() {
         let s = store();
-        s.note_page(&page("bot", "2030-01-01T00:00:00.000Z")).unwrap();
+        s.note_page(&page("bot", "2030-01-01T00:00:00.000Z"))
+            .unwrap();
         s.note_page(&page(ME, "2030-01-01T00:00:00.000Z")).unwrap();
         assert!(s.activity().unwrap().is_empty());
-        s.note_page(&page("u1", "2030-01-01T00:00:00.000Z")).unwrap();
-        s.note_page(&page("u1", "2030-01-01T00:00:00.000Z")).unwrap();
-        assert_eq!((s.activity().unwrap().len(), s.unread_count().unwrap()), (1, 1));
+        s.note_page(&page("u1", "2030-01-01T00:00:00.000Z"))
+            .unwrap();
+        s.note_page(&page("u1", "2030-01-01T00:00:00.000Z"))
+            .unwrap();
+        assert_eq!(
+            (s.activity().unwrap().len(), s.unread_count().unwrap()),
+            (1, 1)
+        );
         // opening reads it; the same edit isn't news again, a later one is
         s.mark_page_read("p").unwrap();
         assert_eq!(s.unread_count().unwrap(), 0);
-        s.note_page(&page("u1", "2030-01-01T00:00:00.000Z")).unwrap();
+        s.note_page(&page("u1", "2030-01-01T00:00:00.000Z"))
+            .unwrap();
         assert_eq!(s.unread_count().unwrap(), 0);
-        s.note_page(&page("u1", "2031-01-01T00:00:00.000Z")).unwrap();
-        assert_eq!((s.activity().unwrap().len(), s.unread_count().unwrap()), (1, 1));
+        s.note_page(&page("u1", "2031-01-01T00:00:00.000Z"))
+            .unwrap();
+        assert_eq!(
+            (s.activity().unwrap().len(), s.unread_count().unwrap()),
+            (1, 1)
+        );
         // an edit from before you opened it is not news
         let t = Store::open_in_memory().unwrap();
         t.set_identity("bot", None, Some(ME)).unwrap();
         t.mark_page_read("p").unwrap();
-        t.note_page(&page("u1", "2020-01-01T00:00:00.000Z")).unwrap();
+        t.note_page(&page("u1", "2020-01-01T00:00:00.000Z"))
+            .unwrap();
         assert!(t.activity().unwrap().is_empty());
     }
 
@@ -348,16 +424,21 @@ mod tests {
         let s = store();
         let mut other = comment("c2", "u1", text("on q"));
         other.parent = crate::model::Parent::Page("q".into());
-        s.note_comments("p", &[comment("c1", "u1", text("on p"))]).unwrap();
+        s.note_comments("p", &[comment("c1", "u1", text("on p"))])
+            .unwrap();
         s.note_comments("q", &[other]).unwrap();
         assert_eq!(s.unread_count().unwrap(), 2);
         s.mark_page_read("p").unwrap();
         assert_eq!(s.unread_count().unwrap(), 1);
         s.mark_entry_read(COMMENT, "c2").unwrap();
         assert_eq!(s.unread_count().unwrap(), 0);
-        s.note_comments("p", &[comment("c3", "u1", text("n"))]).unwrap();
+        s.note_comments("p", &[comment("c3", "u1", text("n"))])
+            .unwrap();
         s.mark_all_read().unwrap();
-        assert_eq!((s.unread_count().unwrap(), s.activity().unwrap().len()), (0, 3));
+        assert_eq!(
+            (s.unread_count().unwrap(), s.activity().unwrap().len()),
+            (0, 3)
+        );
     }
 
     #[test]
@@ -376,7 +457,10 @@ mod tests {
         }
         let s = Store::open(&path).unwrap();
         assert_eq!(s.users().unwrap()[0].name, "Ada");
-        assert_eq!((s.unread_count().unwrap(), s.identity().unwrap()), (0, None));
+        assert_eq!(
+            (s.unread_count().unwrap(), s.identity().unwrap()),
+            (0, None)
+        );
         assert!(s.since().unwrap() > DateTime::UNIX_EPOCH);
     }
 }

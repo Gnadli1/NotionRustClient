@@ -27,7 +27,10 @@ impl App {
         let Some(page) = pages.first().cloned().filter(|_| !self.stepping) else {
             return f(self);
         };
-        let cp = sync::checkpoint(&self.store, &pages.iter().map(String::as_str).collect::<Vec<_>>());
+        let cp = sync::checkpoint(
+            &self.store,
+            &pages.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
         self.stepping = true;
         let r = f(self);
         self.stepping = false;
@@ -50,7 +53,12 @@ impl App {
     /// command is in flight (a pull writes rows it read before the undo) or
     /// the switcher is open; refused once the edit's op was completed.
     pub(crate) fn undo_redo(&mut self, back: bool) {
-        if self.sent.iter().any(|c| !matches!(c, Cmd::Media { .. })) || self.switcher.is_some() || self.dlg.is_some() || self.inbox.is_some() || !self.flush() {
+        if self.sent.iter().any(|c| !matches!(c, Cmd::Media { .. }))
+            || self.switcher.is_some()
+            || self.dlg.is_some()
+            || self.inbox.is_some()
+            || !self.flush()
+        {
             return;
         }
         let Some((page, c)) = (if back { &mut self.undo } else { &mut self.redo }).pop() else {
@@ -72,7 +80,13 @@ impl App {
                 if back { &mut self.redo } else { &mut self.undo }.push(inv);
                 // not into a trashed page (redoing a trash, undoing a restore)
                 let is_table = self.store.data_source(&page).ok().flatten().is_some();
-                let trashed = !is_table && self.store.get_page(&page).ok().flatten().is_none_or(|p| p.in_trash);
+                let trashed = !is_table
+                    && self
+                        .store
+                        .get_page(&page)
+                        .ok()
+                        .flatten()
+                        .is_none_or(|p| p.in_trash);
                 if self.current.as_deref() != Some(page.as_str()) && !trashed {
                     self.pending_open = None;
                     self.set_current(&page);
@@ -88,7 +102,15 @@ impl App {
             }
         }
         // redoing a trash of the open page, or undoing its creation
-        if let Some(id) = self.current.clone().filter(|id| !self.cached(id) || self.store.get_page(id).ok().flatten().is_some_and(|p| p.in_trash)) {
+        if let Some(id) = self.current.clone().filter(|id| {
+            !self.cached(id)
+                || self
+                    .store
+                    .get_page(id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|p| p.in_trash)
+        }) {
             self.current = None;
             self.info = Some(format!("page {id} is gone"));
         }

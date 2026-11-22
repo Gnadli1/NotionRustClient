@@ -30,9 +30,10 @@ pub struct Problem {
 fn comment_problem(store: &Store, op: &Op) -> notion_core::Result<Option<Problem>> {
     let (kind, comment) = match &op.kind {
         OpKind::CreateComment { local_id, .. } => ("comment", store.get_comment(local_id)?),
-        OpKind::UpdateComment { comment_id, .. } => {
-            ("edit comment", store.get_comment(&store.resolve_id(comment_id)?)?)
-        }
+        OpKind::UpdateComment { comment_id, .. } => (
+            "edit comment",
+            store.get_comment(&store.resolve_id(comment_id)?)?,
+        ),
         OpKind::DeleteComment { comment_id } => (
             "delete comment",
             // gone from the cache: its base snapshot remains
@@ -49,7 +50,9 @@ fn comment_problem(store: &Store, op: &Op) -> notion_core::Result<Option<Problem
         (None, OpKind::CreateComment { parent, .. }) => Some(parent.id().to_string()),
         _ => None,
     };
-    let Some(parent) = parent else { return Ok(None) };
+    let Some(parent) = parent else {
+        return Ok(None);
+    };
     let parent = store.resolve_id(&parent)?;
     let page = if store.get_page(&parent)?.is_some() {
         Some(parent.clone())

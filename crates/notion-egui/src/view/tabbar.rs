@@ -1,13 +1,16 @@
-//! The tab bar across the top, as in the Notion desktop app.
+//! The tab strip over the content area, as in the Notion desktop app: the
+//! active tab drops to the page colour, a hovered tab shows its close button,
+//! then the new-tab `+`.
 
-use eframe::egui::{self, Align2, FontId, Rect, Sense, Ui};
+use eframe::egui::{self, FontId, Rect, Sense, Ui};
 
 use crate::app::Action;
+use crate::icons::{self, Icon};
 use crate::theme::Colors;
 
-const H: f32 = 28.0;
+const H: f32 = 32.0;
 /// The `+` button: a square hit target, and the gap before it.
-const PLUS: f32 = 26.0;
+const PLUS: f32 = 28.0;
 const PLUS_GAP: f32 = 8.0;
 
 /// `tabs`: (icon, title). Click switches, × (on hover) or a middle click
@@ -18,7 +21,7 @@ pub fn show(ui: &mut Ui, c: &Colors, tabs: &[(String, String)], active: usize) -
         ui.spacing_mut().item_spacing.x = 2.0;
         let n = tabs.len().max(1) as f32;
         // `+` keeps its room even when the tabs shrink to their minimum
-        let w = ((ui.available_width() - PLUS - PLUS_GAP - 12.0 - 2.0 * n) / n).clamp(24.0, 200.0);
+        let w = ((ui.available_width() - PLUS - PLUS_GAP - 10.0 - 2.0 * n) / n).clamp(40.0, 220.0);
         for (i, (icon, title)) in tabs.iter().enumerate() {
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, H), Sense::click());
             let fill = if i == active {
@@ -30,36 +33,40 @@ pub fn show(ui: &mut Ui, c: &Colors, tabs: &[(String, String)], active: usize) -
             };
             ui.painter().rect_filled(rect, 6.0, fill);
             let x_rect = Rect::from_center_size(
-                egui::pos2(rect.right() - 14.0, rect.center().y),
-                egui::vec2(18.0, 18.0),
+                egui::pos2(rect.right() - 16.0, rect.center().y),
+                egui::vec2(22.0, 22.0),
             );
             // registered after the tab, so it wins where they overlap
             let x = ui.interact(x_rect, resp.id.with("close"), Sense::click());
             let color = if i == active { c.text } else { c.secondary };
-            let label = if icon.is_empty() {
-                title.clone()
-            } else {
-                format!("{icon} {title}")
-            };
-            let clip = Rect::from_min_max(rect.min, egui::pos2(rect.right() - 24.0, rect.max.y));
+            let icon_rect = Rect::from_center_size(
+                egui::pos2(rect.left() + 17.0, rect.center().y),
+                egui::vec2(18.0, 18.0),
+            );
+            icons::page_glyph(
+                ui,
+                icon_rect,
+                Some(icon.as_str()).filter(|i| !i.is_empty()),
+                false,
+                color,
+            );
+            let clip = Rect::from_min_max(
+                egui::pos2(icon_rect.right() + 4.0, rect.top()),
+                egui::pos2(rect.right() - 28.0, rect.max.y),
+            );
             ui.painter().with_clip_rect(clip).text(
-                egui::pos2(rect.left() + 10.0, rect.center().y),
-                Align2::LEFT_CENTER,
-                label,
+                egui::pos2(icon_rect.right() + 7.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                title,
                 FontId::proportional(13.0),
                 color,
             );
             if resp.hovered() || x.hovered() {
                 if x.hovered() {
-                    ui.painter().rect_filled(x_rect, 4.0, c.hover.gamma_multiply(2.0));
+                    ui.painter()
+                        .rect_filled(x_rect, 4.0, c.hover.gamma_multiply(2.0));
                 }
-                ui.painter().text(
-                    x_rect.center(),
-                    Align2::CENTER_CENTER,
-                    "×",
-                    FontId::proportional(14.0),
-                    c.secondary,
-                );
+                icons::paint(ui, x_rect.shrink(5.0), Icon::Close, c.secondary);
             }
             if x.clicked() || resp.middle_clicked() {
                 act = Some(Action::CloseTab(i));
@@ -72,8 +79,8 @@ pub fn show(ui: &mut Ui, c: &Colors, tabs: &[(String, String)], active: usize) -
         if resp.hovered() {
             ui.painter().rect_filled(rect, 6.0, c.hover);
         }
-        ui.painter().text(rect.center(), Align2::CENTER_CENTER, "+", FontId::proportional(20.0), c.secondary);
-        if resp.clicked() {
+        icons::paint(ui, rect.shrink(6.0), Icon::Plus, c.secondary);
+        if resp.on_hover_text("New tab").clicked() {
             act = Some(Action::NewTab);
         }
     });
@@ -90,7 +97,10 @@ mod tests {
     fn plus_is_a_big_target_with_a_gap_after_the_last_tab() {
         let ctx = egui::Context::default();
         crate::theme::install(&ctx);
-        let tabs = vec![(String::new(), "one".to_string()), (String::new(), "two".to_string())];
+        let tabs = vec![
+            (String::new(), "one".to_string()),
+            (String::new(), "two".to_string()),
+        ];
         // the filled rects of a frame with the pointer at x (a warm-up frame first: hover is a frame late)
         let hover = |x: f32| {
             let mut rects = Vec::new();
@@ -104,15 +114,35 @@ mod tests {
                     let c = crate::theme::colors(ui);
                     show(ui, c, &tabs, 0);
                 });
-                rects = out.shapes.iter().filter_map(|s| match &s.shape { Shape::Rect(r) => Some(r.rect), _ => None }).collect();
+                rects = out
+                    .shapes
+                    .iter()
+                    .filter_map(|s| match &s.shape {
+                        Shape::Rect(r) => Some(r.rect),
+                        _ => None,
+                    })
+                    .collect();
                 out.drop_without_applying_deltas();
             }
             rects
         };
-        // tabs are 200 wide here: the second one spans ~202..402
-        let tab = hover(300.0).into_iter().rfind(|r| r.width() > 100.0).expect("hovered tab rect");
-        let plus = hover(tab.right() + 20.0).into_iter().find(|r| r.width() > 0.0 && r.width() < 50.0).expect("hovered plus rect");
-        assert!(plus.width() >= 24.0 && plus.height() >= 24.0, "plus hit rect {plus:?}");
-        assert!(plus.left() - tab.right() >= 8.0 - 0.01, "gap {} between tab {tab:?} and plus {plus:?}", plus.left() - tab.right());
+        // tabs are 220 wide here: the second one spans ~222..442
+        let tab = hover(300.0)
+            .into_iter()
+            .rfind(|r| r.width() > 100.0)
+            .expect("hovered tab rect");
+        let plus = hover(tab.right() + 20.0)
+            .into_iter()
+            .find(|r| r.width() > 0.0 && r.width() < 50.0)
+            .expect("hovered plus rect");
+        assert!(
+            plus.width() >= 24.0 && plus.height() >= 24.0,
+            "plus hit rect {plus:?}"
+        );
+        assert!(
+            plus.left() - tab.right() >= 8.0 - 0.01,
+            "gap {} between tab {tab:?} and plus {plus:?}",
+            plus.left() - tab.right()
+        );
     }
 }

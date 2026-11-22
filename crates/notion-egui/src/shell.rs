@@ -3,6 +3,7 @@
 //! frame. It mirrors notion-gui's `update()`; no editor features (E2).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use notion_core::ops::OpStatus;
 use notion_core::sync::{self, Skip};
 
 use crate::app::{blur_first, Action, App, Grab};
+use crate::keys::{self, Command};
 use crate::nav::{self, Find, History};
 use crate::outline::{self, Marker, Row};
 use crate::problems::{self, problem};
@@ -21,7 +23,6 @@ use crate::switcher::{Out, Switcher};
 use crate::tabs::{self, Tab};
 use crate::view::{self, untitled, FindOut};
 use crate::worker::{Cmd, Event};
-use crate::keys::{self, Command};
 use crate::{sidebar, theme};
 
 /// The open page is polled this often while the window has focus (near
@@ -81,9 +82,10 @@ impl App {
             let found = self.rows.iter().position(|r| r.block_id == f.block_id);
             // a cell needs its row and column too
             let found = found.filter(|&i| match (&f.cell, &self.rows[i].marker) {
-                (Some((row, col)), Marker::Table(t)) => {
-                    t.rows.iter().any(|tr| tr.id == *row && tr.cells.len() > *col)
-                }
+                (Some((row, col)), Marker::Table(t)) => t
+                    .rows
+                    .iter()
+                    .any(|tr| tr.id == *row && tr.cells.len() > *col),
                 (Some(_), _) => false,
                 (None, _) => true,
             });
@@ -144,15 +146,25 @@ impl App {
         }
         self.db = None;
         let page = self.store.get_page(id)?;
-        self.page_edit = page
-            .as_ref()
-            .map(|p| (p.last_edited_by().map(str::to_string), p.last_edited_time.timestamp()));
+        self.page_edit = page.as_ref().map(|p| {
+            (
+                p.last_edited_by().map(str::to_string),
+                p.last_edited_time.timestamp(),
+            )
+        });
         self.page_head = None;
-        self.meta = page.as_ref().map(crate::pages::Meta::of).unwrap_or_default();
+        self.meta = page
+            .as_ref()
+            .map(crate::pages::Meta::of)
+            .unwrap_or_default();
         self.block_edits = self.store.block_edits(id)?;
         // viewing the page reads its Updates entries (C5), once the window is
         // focused (on focus gain the frame loop marks it)
-        if let Some(e) = self.was_focused.then(|| self.store.mark_page_read(id)).and_then(Result::err) {
+        if let Some(e) = self
+            .was_focused
+            .then(|| self.store.mark_page_read(id))
+            .and_then(Result::err)
+        {
             self.last_error = Some(e.to_string());
         }
         self.title = page
@@ -207,7 +219,8 @@ impl App {
 
     /// A cached page or data source.
     pub(crate) fn cached(&self, id: &str) -> bool {
-        matches!(self.store.get_page(id), Ok(Some(_))) || matches!(self.store.data_source(id), Ok(Some(_)))
+        matches!(self.store.get_page(id), Ok(Some(_)))
+            || matches!(self.store.data_source(id), Ok(Some(_)))
     }
 
     /// Expands the sidebar pages above the current one.
@@ -230,7 +243,10 @@ impl App {
         if self.db.is_some() {
             return self.db_flush();
         }
-        let dirty = self.title_edit.as_ref().is_some_and(|t| t.text != t.original)
+        let dirty = self
+            .title_edit
+            .as_ref()
+            .is_some_and(|t| t.text != t.original)
             || self.focus.as_ref().is_some_and(|f| f.text != f.original);
         if !dirty {
             return true;
@@ -278,7 +294,9 @@ impl App {
         // the block's kind in the store decides, not the row's marker
         let written = self.store.resolve_id(&f.block_id).and_then(|id| {
             match self.store.get_block(&id)?.map(|b| b.kind) {
-                Some(BlockKind::Equation { .. }) => sync::local_edit_equation(&self.store, &id, &text),
+                Some(BlockKind::Equation { .. }) => {
+                    sync::local_edit_equation(&self.store, &id, &text)
+                }
                 _ => sync::local_edit_rich(&self.store, &id, rich.clone()),
             }
         });
@@ -302,7 +320,11 @@ impl App {
     /// [`flush`](Self::flush), then stop editing; the editor stays if the
     /// write failed.
     pub(crate) fn commit(&mut self) -> bool {
-        let ok = if self.db.is_some() { self.db_commit(true) } else { self.flush() && self.db_commit(true) };
+        let ok = if self.db.is_some() {
+            self.db_commit(true)
+        } else {
+            self.flush() && self.db_commit(true)
+        };
         if ok {
             self.focus = None;
             self.title_edit = None;
@@ -327,8 +349,15 @@ impl App {
         if self.worker_gone || self.cmds.is_none() {
             return;
         }
-        let out = self.sent.iter().filter(|c| matches!(c, Cmd::Media { .. })).count();
-        for (id, page) in self.media.take_wants(crate::media::IN_FLIGHT.saturating_sub(out)) {
+        let out = self
+            .sent
+            .iter()
+            .filter(|c| matches!(c, Cmd::Media { .. }))
+            .count();
+        for (id, page) in self
+            .media
+            .take_wants(crate::media::IN_FLIGHT.saturating_sub(out))
+        {
             self.send(Cmd::Media { id, page });
         }
     }
@@ -379,7 +408,9 @@ impl App {
     /// The startup pull (`users_at` is None) and the hourly refresh, only
     /// when nothing else is in flight: never ahead of the restore page pull.
     pub(crate) fn users_tick(&mut self, now: Instant) {
-        let due = self.users_at.is_none_or(|t| now.saturating_duration_since(t) >= USERS_EVERY);
+        let due = self
+            .users_at
+            .is_none_or(|t| now.saturating_duration_since(t) >= USERS_EVERY);
         if due && !self.users_stop && !self.worker_gone && !self.busy() {
             self.users_at = Some(now);
             self.send(Cmd::PullUsers);
@@ -401,10 +432,19 @@ impl App {
     /// The pages to poll with their period: the open one, then the other
     /// tabs' (once each).
     pub(crate) fn poll_pages(&self) -> Vec<(String, Duration)> {
-        let open = if self.was_focused { POLL_LIVE } else { POLL_OPEN };
-        let mut v: Vec<(String, Duration)> = self.current.iter().map(|p| (p.clone(), open)).collect();
+        let open = if self.was_focused {
+            POLL_LIVE
+        } else {
+            POLL_OPEN
+        };
+        let mut v: Vec<(String, Duration)> =
+            self.current.iter().map(|p| (p.clone(), open)).collect();
         for (i, t) in self.tabs.iter().enumerate() {
-            if let Some(p) = t.page.as_ref().filter(|p| i != self.active && v.iter().all(|(q, _)| q != *p)) {
+            if let Some(p) = t
+                .page
+                .as_ref()
+                .filter(|p| i != self.active && v.iter().all(|(q, _)| q != *p))
+            {
                 v.push((p.clone(), POLL_BG));
             }
         }
@@ -482,7 +522,10 @@ impl App {
             self.media.downloaded(id, path);
             return;
         }
-        if matches!(ev, Event::Pulled { .. } | Event::Pushed(_) | Event::SyncedAll(_)) {
+        if matches!(
+            ev,
+            Event::Pulled { .. } | Event::Pushed(_) | Event::SyncedAll(_)
+        ) {
             self.media.retry_failed();
         }
         // pushed ops can't be undone, nor edits a pull rewrote under them; a
@@ -556,7 +599,10 @@ impl App {
                     self.undo.clear();
                     self.redo.clear();
                 }
-                self.last_error = r.errors.first().map(|e| format!("{} failed, first: {e}", r.errors.len()));
+                self.last_error = r
+                    .errors
+                    .first()
+                    .map(|e| format!("{} failed, first: {e}", r.errors.len()));
                 self.info = Some(format!(
                     "synced: {} pages, {} databases, {} up to date",
                     r.pages, r.data_sources, r.skipped
@@ -612,14 +658,27 @@ impl App {
                     self.progress = None;
                 }
                 // a failed comment fetch says nothing about the page being opened
-                if !matches!(answered, Some(Cmd::PullComments { .. } | Cmd::Me | Cmd::Fetch { .. } | Cmd::Resolve { .. } | Cmd::SyncAll)) {
+                if !matches!(
+                    answered,
+                    Some(
+                        Cmd::PullComments { .. }
+                            | Cmd::Me
+                            | Cmd::Fetch { .. }
+                            | Cmd::Resolve { .. }
+                            | Cmd::SyncAll
+                    )
+                ) {
                     self.pending_open = None;
                 }
                 match (&answered, &mut self.conflict) {
                     // only the open panel's own fetch: a late answer for a closed one is not its
-                    (Some(Cmd::Fetch { op }), Some(p)) if p.op == *op => p.error_fetching = Some(e.clone()),
+                    (Some(Cmd::Fetch { op }), Some(p)) if p.op == *op => {
+                        p.error_fetching = Some(e.clone())
+                    }
                     // Notion's text moved on: show the new one
-                    (Some(Cmd::Resolve { op, .. }), Some(p)) if p.op == *op && e.contains("changed again") => {
+                    (Some(Cmd::Resolve { op, .. }), Some(p))
+                        if p.op == *op && e.contains("changed again") =>
+                    {
                         p.fetched = None;
                         p.error_fetching = None;
                         self.send(Cmd::Fetch { op: *op });
@@ -652,28 +711,51 @@ impl App {
         let old = self.rows.clone();
         self.refresh();
         let here = self.current.as_ref() == Some(&id);
-        let changed = if here { changed_ids(&old, &self.rows) } else { Vec::new() };
-        let moved = here && old.iter().map(|r| &r.block_id).ne(self.rows.iter().map(|r| &r.block_id));
+        let changed = if here {
+            changed_ids(&old, &self.rows)
+        } else {
+            Vec::new()
+        };
+        let moved = here
+            && old
+                .iter()
+                .map(|r| &r.block_id)
+                .ne(self.rows.iter().map(|r| &r.block_id));
         if report.updated > 0 || !changed.is_empty() || moved {
             self.undo.retain(|(p, _)| *p != id);
             self.redo.retain(|(p, _)| *p != id);
         }
         let until = Instant::now() + FLASH;
-        self.flash.extend(changed.iter().map(|b| (b.clone(), until)));
+        self.flash
+            .extend(changed.iter().map(|b| (b.clone(), until)));
         // typed in since the poll was sent: the buffer stays, but the push
         // would write it over the remote edit
-        if self.focus.as_ref().is_some_and(|f| f.text != f.original && changed.contains(&f.block_id)) {
-            self.info = Some("this block was edited in Notion meanwhile — your push may overwrite it".into());
+        if self
+            .focus
+            .as_ref()
+            .is_some_and(|f| f.text != f.original && changed.contains(&f.block_id))
+        {
+            self.info = Some(
+                "this block was edited in Notion meanwhile — your push may overwrite it".into(),
+            );
         }
         // a clean editor on a changed block would write its stale text over
         // the remote edit with the new base: show the new text (egui clamps
         // the cursor); a table cell is simply closed
-        if self.focus.as_ref().is_some_and(|f| f.text == f.original && changed.contains(&f.block_id)) {
+        if self
+            .focus
+            .as_ref()
+            .is_some_and(|f| f.text == f.original && changed.contains(&f.block_id))
+        {
             let f = self.focus.as_mut().expect("checked");
             match self.rows.get(f.idx).filter(|_| f.cell.is_none()) {
                 Some(r) => {
                     f.code = r.marker == Marker::Equation || matches!(r.marker, Marker::Code(_));
-                    let t = if f.code { plain_text(&r.rich_text) } else { to_markdown(&r.rich_text) };
+                    let t = if f.code {
+                        plain_text(&r.rich_text)
+                    } else {
+                        to_markdown(&r.rich_text)
+                    };
                     (f.prev_len, f.original, f.text) = (t.len(), t.clone(), t);
                 }
                 None => self.focus = None,
@@ -704,7 +786,7 @@ impl App {
     }
 
     /// Back / forward in the tab's history; it is not a new step.
-    fn go_history(&mut self, back: bool) {
+    pub(crate) fn go_history(&mut self, back: bool) {
         if !self.commit() {
             return;
         }
@@ -716,8 +798,14 @@ impl App {
 
     /// Ctrl+Shift+U: the page above the open one, if it is cached.
     fn open_parent(&mut self) {
-        let parent = self.current.as_ref().and_then(|id| self.tree.iter().find(|e| e.id == *id));
-        match parent.and_then(|e| e.parent.clone()).filter(|p| self.cached(p)) {
+        let parent = self
+            .current
+            .as_ref()
+            .and_then(|id| self.tree.iter().find(|e| e.id == *id));
+        match parent
+            .and_then(|e| e.parent.clone())
+            .filter(|p| self.cached(p))
+        {
             Some(p) => self.open_or_pull(&p),
             None => self.info = Some("no cached parent page".into()),
         }
@@ -768,7 +856,10 @@ impl App {
             }
             let text = b.kind.text().map(|t| plain_text(&t.rich_text));
             out.extend(text.filter(|t| !t.is_empty()));
-            if !matches!(b.kind, BlockKind::ChildPage { .. } | BlockKind::ChildDatabase { .. }) {
+            if !matches!(
+                b.kind,
+                BlockKind::ChildPage { .. } | BlockKind::ChildDatabase { .. }
+            ) {
                 self.preview_under(&b.id, out);
             }
         }
@@ -864,7 +955,11 @@ impl App {
         self.refresh();
         self.reveal_current();
         // e.g. a restored tab: pulled like any uncached page
-        if let Some(id) = self.current.clone().filter(|id| !self.cached(id) && !id.starts_with("local-")) {
+        if let Some(id) = self
+            .current
+            .clone()
+            .filter(|id| !self.cached(id) && !id.starts_with("local-"))
+        {
             self.pending_open = Some(id.clone());
             self.send(Cmd::Pull { id, force: false });
         }
@@ -953,10 +1048,13 @@ impl App {
         self.redo.clear();
         // a never-created page can't be pulled; if it is gone, its tabs leave it
         let gone = p.page.clone().filter(|id| id.starts_with("local-"));
-        let up = gone.as_ref().and_then(|id| self.store.get_page(id).ok().flatten()).and_then(|pg| match pg.parent {
-            notion_core::model::Parent::Page(x) => Some(x),
-            _ => None,
-        });
+        let up = gone
+            .as_ref()
+            .and_then(|id| self.store.get_page(id).ok().flatten())
+            .and_then(|pg| match pg.parent {
+                notion_core::model::Parent::Page(x) => Some(x),
+                _ => None,
+            });
         if let Err(e) = problems::discard(&self.store, &p) {
             self.last_error = Some(e.to_string());
         }
@@ -1014,6 +1112,34 @@ impl App {
         self.worker = Some(handle);
     }
 
+    /// The workspace profiles, and where their files live.
+    pub fn set_profiles(
+        &mut self,
+        profiles: crate::profiles::Profiles,
+        profiles_dir: Option<PathBuf>,
+        data_dir: Option<PathBuf>,
+        session_file: String,
+    ) {
+        self.profiles = profiles;
+        self.profiles_dir = profiles_dir;
+        self.data_dir = data_dir;
+        self.session_file = session_file;
+    }
+
+    pub(crate) fn workspace_name(&self) -> &str {
+        self.profiles
+            .active_profile()
+            .map_or("No workspace", |p| p.name.as_str())
+    }
+
+    /// Writes the active workspace's session, if there is a config dir.
+    pub(crate) fn save_session(&self) {
+        let Some(dir) = &self.session_dir else { return };
+        if let Err(e) = session::save_to(dir, &self.session_file, &self.session()) {
+            eprintln!("cannot write the session: {e}");
+        }
+    }
+
     /// Exit: the edit is written (unless a push owns the ops), the session
     /// saved, and the worker stopped, waiting for the command in flight: a
     /// push killed mid-way would re-send applied ops.
@@ -1021,15 +1147,429 @@ impl App {
         if !self.pushing() {
             self.commit();
         }
-        if let Some(dir) = &self.session_dir {
-            if let Err(e) = session::save_to(dir, SESSION_FILE, &self.session()) {
-                eprintln!("cannot write the session: {e}");
-            }
-        }
+        self.save_session();
         // the worker ends when its command sender is gone
         self.cmds = None;
         if let Some(h) = self.worker.take() {
             join_within(h, WORKER_JOIN);
+        }
+    }
+
+    // --------------------------------------------------------- workspaces
+
+    /// Saves the add/edit workspace form. Adding a workspace, or editing the
+    /// active one, switches to it (a token change restarts the worker).
+    pub(crate) fn save_workspace_form(&mut self) {
+        let Some(form) = self.ws_form.clone() else {
+            return;
+        };
+        let before = form
+            .original
+            .as_deref()
+            .and_then(|n| self.profiles.get(n))
+            .cloned();
+        let profile = match form.to_profile(before.as_ref()) {
+            Ok(p) => p,
+            Err(e) => {
+                if let Some(f) = &mut self.ws_form {
+                    f.error = Some(e);
+                }
+                return;
+            }
+        };
+        if let Some(existing) = self.profiles.get(&profile.name) {
+            if before.as_ref().map(|p| p.name.as_str()) != Some(existing.name.as_str()) {
+                if let Some(f) = &mut self.ws_form {
+                    f.error = Some(format!(
+                        "a workspace named {:?} already exists",
+                        profile.name
+                    ));
+                }
+                return;
+            }
+        }
+        let editing_active = before
+            .as_ref()
+            .is_some_and(|p| self.profiles.active.as_deref() == Some(p.name.as_str()));
+        let adding = before.is_none();
+        let mut next = self.profiles.clone();
+        if let Some(old) = before.as_ref() {
+            if old.name != profile.name {
+                next.remove(&old.name);
+            }
+        }
+        next.upsert(profile.clone());
+        if adding || editing_active {
+            next.set_active(&profile.name);
+        }
+        if let Some(dir) = self.profiles_dir.as_deref() {
+            if let Err(e) = next.save(dir) {
+                if let Some(f) = &mut self.ws_form {
+                    f.error = Some(format!("cannot save profiles.json: {e}"));
+                }
+                return;
+            }
+        }
+        self.profiles = next;
+        self.ws_form = None;
+        if adding || editing_active {
+            self.pending_switch = Some((profile.name, true));
+        }
+    }
+
+    /// Replaces the store, worker and session with another workspace. The
+    /// current edit must be committed; a running push is waited for.
+    pub(crate) fn switch_workspace(&mut self, name: &str, force: bool, ctx: &egui::Context) {
+        if !force && self.workspace_name() == name {
+            return;
+        }
+        let Some(profile) = self.profiles.get(name).cloned() else {
+            self.last_error = Some(format!("unknown workspace {name:?}"));
+            return;
+        };
+        if self.pushing() {
+            self.last_error =
+                Some("wait for the push to finish before switching workspaces".into());
+            return;
+        }
+        if !self.commit() {
+            return;
+        }
+        let Some(db) = profile.cache_path(self.data_dir.as_deref()) else {
+            self.last_error = Some("no data folder for the workspace cache".into());
+            return;
+        };
+        if let Some(dir) = db.parent().filter(|d| !d.as_os_str().is_empty()) {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                self.last_error = Some(format!("cannot create {}: {e}", dir.display()));
+                return;
+            }
+        }
+        let store = match notion_core::store::Store::open(&db) {
+            Ok(s) => s,
+            Err(e) => {
+                self.last_error = Some(format!("cannot open {}: {e}", db.display()));
+                return;
+            }
+        };
+        let session_file = profile.session_file();
+        let (sess, problem) = self
+            .session_dir
+            .as_deref()
+            .map(|d| session::load_from(d, &session_file))
+            .unwrap_or_default();
+        let token = profile.has_token().then(|| profile.token.clone());
+        let browser = (profile.kind == crate::profiles::AuthKind::Browser)
+            .then(|| {
+                self.profiles
+                    .browser
+                    .clone()
+                    .and_then(|b| profile.space_id.clone().map(|space| (b, space)))
+            })
+            .flatten();
+        let user_id = profile
+            .user_id
+            .clone()
+            .or_else(|| browser.as_ref().and_then(|(b, _)| b.user_id.clone()))
+            .or_else(|| {
+                std::env::var("NOTION_USER_ID")
+                    .ok()
+                    .filter(|u| !u.trim().is_empty())
+            });
+        self.save_session();
+        // the old worker ends when its command sender is gone
+        self.cmds = None;
+        if let Some(h) = self.worker.take() {
+            join_within(h, WORKER_JOIN);
+        }
+        let (cmds, events, worker) = match browser {
+            Some((browser, space)) if !browser.token_v2.trim().is_empty() => {
+                let cookies = browser.cookies.clone();
+                crate::worker::spawn_browser(
+                    db,
+                    ctx.clone(),
+                    browser.token_v2,
+                    space,
+                    user_id,
+                    cookies,
+                )
+            }
+            _ => crate::worker::spawn_profile(db, ctx.clone(), token, user_id),
+        };
+        let mut fresh = App::new(store, cmds, events, self.keylog);
+        fresh.keys = self.keys.clone();
+        fresh.opener = std::mem::replace(&mut self.opener, Box::new(|_| Ok(())));
+        fresh.window = self.window;
+        fresh.session_dir = self.session_dir.clone();
+        fresh.session_file = session_file;
+        fresh.profiles_dir = self.profiles_dir.clone();
+        fresh.data_dir = self.data_dir.clone();
+        fresh.clock = self.clock;
+        let mut profiles = std::mem::take(&mut self.profiles);
+        profiles.set_active(&profile.name);
+        fresh.profiles = profiles;
+        fresh.set_worker(worker);
+        match fresh.session_dir.clone() {
+            Some(dir) => fresh.restore(dir, sess, problem),
+            None => fresh.last_error = problem,
+        }
+        *self = fresh;
+        if let Some(dir) = self.profiles_dir.as_deref() {
+            if let Err(e) = self.profiles.save(dir) {
+                self.last_error = Some(format!("cannot save profiles.json: {e}"));
+            }
+        }
+        // A browser workspace that has never been opened has an empty cache.
+        // Discover its pages on first entry instead of showing a blank sidebar.
+        if self.tree.is_empty()
+            && self
+                .profiles
+                .active_profile()
+                .is_some_and(|p| p.kind == crate::profiles::AuthKind::Browser)
+        {
+            self.sync_all();
+        }
+        ctx.request_repaint();
+    }
+
+    /// Runs a workspace switch asked for by an action this frame.
+    pub(crate) fn apply_pending_switch(&mut self, ctx: &egui::Context) {
+        if let Some((name, force)) = self.pending_switch.take() {
+            self.switch_workspace(&name, force, ctx);
+        }
+    }
+
+    fn save_profiles(&mut self) {
+        if let Some(dir) = self.profiles_dir.as_deref() {
+            if let Err(e) = self.profiles.save(dir) {
+                self.last_error = Some(format!("cannot save profiles.json: {e}"));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ sign in
+
+    /// "Sign in with Notion…": starts the stored OAuth app, or asks for its
+    /// client id/secret the first time.
+    pub(crate) fn start_oauth(&mut self) {
+        self.ws_form = None;
+        let app = self.profiles.oauth.clone().unwrap_or_default();
+        if !app.is_configured() {
+            self.oauth_setup = Some(app);
+            self.oauth_error = None;
+            return;
+        }
+        self.begin_oauth(app);
+    }
+
+    fn begin_oauth(&mut self, app: crate::profiles::OAuthApp) {
+        match crate::oauth::Flow::start(app.clone()) {
+            Ok(mut flow) => {
+                if let Err(e) = flow.open_again() {
+                    flow.error = Some(e);
+                }
+                self.profiles.oauth = Some(app);
+                self.save_profiles();
+                self.oauth = Some(flow);
+                self.oauth_setup = None;
+                self.oauth_error = None;
+            }
+            Err(e) => {
+                self.oauth_setup = Some(app);
+                self.oauth_error = Some(e);
+            }
+        }
+    }
+
+    pub(crate) fn save_oauth_setup(&mut self) {
+        let Some(mut app) = self.oauth_setup.clone() else {
+            return;
+        };
+        app.client_id = app.client_id.trim().to_string();
+        app.client_secret = app.client_secret.trim().to_string();
+        app.redirect_uri = app.redirect_uri.trim().to_string();
+        let problem = if !app.is_configured() {
+            Some("Both the OAuth client id and client secret are required.".to_string())
+        } else if !(app.redirect_uri.starts_with("http://")
+            || app.redirect_uri.starts_with("https://"))
+        {
+            Some("The redirect URI must be an http:// or https:// URL.".to_string())
+        } else {
+            None
+        };
+        if let Some(p) = problem {
+            self.oauth_setup = Some(app);
+            self.oauth_error = Some(p);
+            return;
+        }
+        self.oauth_setup = None;
+        self.oauth_error = None;
+        self.begin_oauth(app);
+    }
+
+    pub(crate) fn start_browser_login(&mut self) {
+        self.ws_form = None;
+        self.oauth_setup = None;
+        let (prefill, cookies) = self
+            .profiles
+            .browser
+            .as_ref()
+            .map(|b| (b.token_v2.as_str(), b.cookies.as_deref().unwrap_or("")))
+            .unwrap_or(("", ""));
+        self.browser_login = Some(crate::browser_login::Flow::new(prefill, cookies));
+    }
+
+    /// Discovers the account's shared workspaces in the background, so they
+    /// appear in the picker even when the cookie was saved on an earlier run.
+    pub(crate) fn start_space_refresh(&mut self) {
+        if self.space_refresh.is_some() {
+            return;
+        }
+        let Some(browser) = self.profiles.browser.as_ref() else {
+            return;
+        };
+        let token = browser.token_v2.trim();
+        if token.is_empty()
+            || !self
+                .profiles
+                .profiles
+                .iter()
+                .any(|p| p.kind == crate::profiles::AuthKind::Browser)
+        {
+            return;
+        }
+        let cookies = browser.cookies.as_deref().unwrap_or("").to_string();
+        let mut flow = crate::browser_login::Flow::new(token, &cookies);
+        flow.connect();
+        self.space_refresh = Some(flow);
+    }
+
+    pub(crate) fn poll_space_refresh(&mut self, ctx: &egui::Context) {
+        let Some(flow) = self.space_refresh.as_mut() else {
+            return;
+        };
+        let Some(result) = flow.poll() else {
+            flow.tick(ctx);
+            return;
+        };
+        let token = flow.token.trim().to_string();
+        let cookies = crate::browser_login::normalize_header(&flow.cookies);
+        self.space_refresh = None;
+        let Ok((user_id, spaces)) = result else {
+            return;
+        };
+        if spaces.is_empty() {
+            return;
+        }
+        let before = self.profiles.profiles.len();
+        let cookies = (!cookies.is_empty()).then_some(cookies);
+        self.profiles
+            .sync_browser_spaces(&token, user_id, cookies, &spaces);
+        let added = self.profiles.profiles.len().saturating_sub(before);
+        self.save_profiles();
+        if added > 0 {
+            self.info = Some(format!(
+                "browser session: {added} more workspace{}",
+                if added == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
+    /// Polls the browser login; on success creates one profile per workspace.
+    pub(crate) fn poll_browser_login(&mut self, ctx: &egui::Context) {
+        let result = self
+            .browser_login
+            .as_mut()
+            .and_then(crate::browser_login::Flow::poll);
+        let Some(result) = result else {
+            if let Some(flow) = &self.browser_login {
+                flow.tick(ctx);
+            }
+            return;
+        };
+        match result {
+            Ok((user_id, spaces)) => {
+                if spaces.is_empty() {
+                    if let Some(flow) = &mut self.browser_login {
+                        flow.error = Some(
+                            "No workspaces found. The cookie may be expired, or the account has \
+                             no workspace access."
+                                .into(),
+                        );
+                    }
+                    return;
+                }
+                let (token, cookies) = self
+                    .browser_login
+                    .as_ref()
+                    .map(|f| {
+                        (
+                            f.token.clone(),
+                            crate::browser_login::normalize_header(&f.cookies),
+                        )
+                    })
+                    .unwrap_or_default();
+                let cookies = (!cookies.is_empty()).then_some(cookies);
+                let names = self
+                    .profiles
+                    .sync_browser_spaces(&token, user_id, cookies, &spaces);
+                self.save_profiles();
+                self.browser_login = None;
+                // Restart the current browser workspace so it gets the new
+                // cookies; a first browser login falls back to the first one.
+                let target = self
+                    .profiles
+                    .active
+                    .clone()
+                    .filter(|name| {
+                        self.profiles.profiles.iter().any(|p| {
+                            &p.name == name && p.kind == crate::profiles::AuthKind::Browser
+                        })
+                    })
+                    .or_else(|| names.first().cloned());
+                if let Some(target) = target {
+                    self.pending_switch = Some((target, true));
+                }
+                self.info = Some(format!(
+                    "browser session: {} workspace{}",
+                    names.len(),
+                    if names.len() == 1 { "" } else { "s" }
+                ));
+            }
+            Err(e) => {
+                if let Some(flow) = &mut self.browser_login {
+                    flow.error = Some(e);
+                }
+            }
+        }
+    }
+
+    fn finish_oauth(&mut self, token: notion_core::oauth::TokenResponse) {
+        let profile = self.profiles.upsert_oauth(&token, "Notion workspace");
+        self.save_profiles();
+        self.info = Some(format!("signed in to {}", profile.name));
+        self.pending_switch = Some((profile.name, true));
+    }
+
+    /// Polls the callback/listener once a frame while a sign-in is open.
+    pub(crate) fn poll_oauth(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.oauth.as_mut().and_then(crate::oauth::Flow::poll) else {
+            if self.oauth.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+            return;
+        };
+        match result {
+            Ok(token) => {
+                self.oauth = None;
+                self.finish_oauth(token);
+            }
+            Err(e) => {
+                if let Some(f) = &mut self.oauth {
+                    f.error = Some(e);
+                    f.busy = false;
+                }
+            }
         }
     }
 
@@ -1071,7 +1611,7 @@ impl App {
                 };
                 match self.tree.iter().find(|e| e.id == *id) {
                     Some(e) => (icon_of(e), untitled(&e.title).to_string()),
-                    None => ("📄".to_string(), untitled(parked).to_string()),
+                    None => (String::new(), untitled(parked).to_string()),
                 }
             })
             .collect()
@@ -1087,11 +1627,24 @@ impl App {
         let mut out =
             ctx.input_mut(|i| keys::take_commands(&mut i.events, ctrl, map, Command::is_global));
         out.extend(ctx.input(|i| keys::mouse_nav(&i.events)));
-        if out.contains(&Command::ToggleSidebar) {
+        if self.ws_form.is_some()
+            || self.oauth_setup.is_some()
+            || self.oauth.is_some()
+            || self.browser_login.is_some()
+        {
+            // a workspace/OAuth dialog has the keys
+            out.clear();
+        } else if out.contains(&Command::ToggleSidebar) {
             self.sidebar = !self.sidebar;
             out.retain(|c| *c != Command::ToggleSidebar);
         }
-        if self.inbox.is_some() {
+        if self.ws_form.is_some()
+            || self.oauth_setup.is_some()
+            || self.oauth.is_some()
+            || self.browser_login.is_some()
+        {
+            // modal: nothing else runs
+        } else if self.inbox.is_some() {
             // the inbox is modal: it has the keys, bar its own two
             out.retain(|c| matches!(c, Command::Updates | Command::MarkAllRead));
         } else if self.dlg.is_some() {
@@ -1133,7 +1686,13 @@ impl App {
                 });
                 let last = self.problems.len().saturating_sub(1);
                 let sel = self.problem_sel.min(last);
-                self.problem_sel = if up { sel.saturating_sub(1) } else if down { (sel + 1).min(last) } else { sel };
+                self.problem_sel = if up {
+                    sel.saturating_sub(1)
+                } else if down {
+                    (sel + 1).min(last)
+                } else {
+                    sel
+                };
                 if enter {
                     if let Some(p) = self.problems.get(self.problem_sel) {
                         self.open_conflict(p.op);
@@ -1150,7 +1709,10 @@ impl App {
             && !self.problems_open
             && self.focus.as_ref().is_none_or(|f| f.menu.is_none())
             && !ctx.egui_wants_keyboard_input();
-        if self.find.is_some() && free && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        if self.find.is_some()
+            && free
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
             self.find = None;
         }
         out
@@ -1158,7 +1720,11 @@ impl App {
 
     fn run_shortcut(&mut self, c: Command, ctx: &egui::Context) {
         match c {
-            Command::Back | Command::Forward | Command::Parent | Command::Find | Command::CopyLink
+            Command::Back
+            | Command::Forward
+            | Command::Parent
+            | Command::Find
+            | Command::CopyLink
                 if self.switcher.is_some() || self.conflict.is_some() => {}
             Command::NewPage
             | Command::TrashPage
@@ -1198,7 +1764,10 @@ impl App {
                 self.find.get_or_insert_with(Find::default).focus = true;
             }
             Command::CopyLink => {
-                let page = self.current.as_deref().and_then(|id| self.store.get_page(id).ok().flatten());
+                let page = self
+                    .current
+                    .as_deref()
+                    .and_then(|id| self.store.get_page(id).ok().flatten());
                 if let Some(p) = page.filter(|p| !p.url.is_empty()) {
                     ctx.copy_text(p.url);
                     self.info = Some("link copied".into());
@@ -1248,7 +1817,11 @@ impl App {
         let open = self.current.clone();
         let due = self.poll_pages().into_iter().find(|(id, every)| {
             let focus = gained_focus && open.as_ref() == Some(id);
-            let first = if focus { now.checked_sub(FOCUS_GAP).unwrap_or(now) } else { now };
+            let first = if focus {
+                now.checked_sub(FOCUS_GAP).unwrap_or(now)
+            } else {
+                now
+            };
             let last = *self.polled.entry(id.clone()).or_insert(first);
             now.saturating_duration_since(last) >= if focus { FOCUS_GAP } else { *every }
         });
@@ -1260,11 +1833,20 @@ impl App {
             return;
         }
         let gap = match self.pull_took.get(&id) {
-            Some(t) if self.was_focused && open.as_ref() == Some(&id) => (*t * FULL_COST).clamp(FULL_LIVE_MIN, FULL_MIN),
+            Some(t) if self.was_focused && open.as_ref() == Some(&id) => {
+                (*t * FULL_COST).clamp(FULL_LIVE_MIN, FULL_MIN)
+            }
             _ => FULL_MIN,
         };
-        let full_due = self.full_at.get(&id).is_none_or(|t| now.saturating_duration_since(*t) >= gap);
-        let skip = if full_due { sync::poll_settle() } else { Skip::IfUnchanged };
+        let full_due = self
+            .full_at
+            .get(&id)
+            .is_none_or(|t| now.saturating_duration_since(*t) >= gap);
+        let skip = if full_due {
+            sync::poll_settle()
+        } else {
+            Skip::IfUnchanged
+        };
         // the real clock: the answer's `elapsed` measures the pull
         self.poll_sent = Some(Instant::now());
         self.send(Cmd::Poll { id, skip });
@@ -1278,7 +1860,13 @@ impl App {
             return;
         }
         let ids: Vec<String> = match &self.comments {
-            Some(p) => self.current.iter().chain(&p.block).filter(|i| !i.starts_with("local-")).cloned().collect(),
+            Some(p) => self
+                .current
+                .iter()
+                .chain(&p.block)
+                .filter(|i| !i.starts_with("local-"))
+                .cloned()
+                .collect(),
             None => return,
         };
         let p = self.comments.as_mut().expect("checked");
@@ -1302,13 +1890,20 @@ impl App {
             return true;
         }
         let focus = self.focus.as_ref().filter(|f| f.text != f.original);
-        let key = self.current.clone().zip(focus).map(|(p, f)| (p, f.block_id.clone(), f.cell.clone()));
+        let key = self
+            .current
+            .clone()
+            .zip(focus)
+            .map(|(p, f)| (p, f.block_id.clone(), f.cell.clone()));
         let Some(key) = key.filter(|_| !self.stepping) else {
             return self.flush();
         };
         let page = key.0.clone();
         // the same page, block and cell, and nothing else since
-        let kept = self.poll_cp.take().filter(|(k, _, step)| *k == key && self.undo.last() == Some(step));
+        let kept = self
+            .poll_cp
+            .take()
+            .filter(|(k, _, step)| *k == key && self.undo.last() == Some(step));
         let old = kept.as_ref().and_then(|_| self.undo.pop());
         let cp = match kept {
             Some((_, cp, _)) => cp,
@@ -1356,12 +1951,27 @@ impl App {
             let due = |(id, every): (String, Duration)| {
                 (self.polled.get(&id).map_or(now, |t| *t + every)).saturating_duration_since(now)
             };
-            let comments = self.comments.as_ref().filter(|_| self.was_focused).map(|p| {
-                p.polled.map_or(POLL_COMMENTS, |t| (t + POLL_COMMENTS).saturating_duration_since(now))
-            });
-            self.poll_pages().into_iter().map(due).chain(comments).min().unwrap_or(POLL_BG).max(Duration::from_secs(1))
+            let comments = self
+                .comments
+                .as_ref()
+                .filter(|_| self.was_focused)
+                .map(|p| {
+                    p.polled.map_or(POLL_COMMENTS, |t| {
+                        (t + POLL_COMMENTS).saturating_duration_since(now)
+                    })
+                });
+            self.poll_pages()
+                .into_iter()
+                .map(due)
+                .chain(comments)
+                .min()
+                .unwrap_or(POLL_BG)
+                .max(Duration::from_secs(1))
         };
-        let ends = self.flash.values().map(|t| t.saturating_duration_since(now));
+        let ends = self
+            .flash
+            .values()
+            .map(|t| t.saturating_duration_since(now));
         ends.chain([polls]).min().unwrap_or(polls)
     }
 
@@ -1372,6 +1982,9 @@ impl App {
             ctx.input(|i| keys::log(&i.raw.events));
         }
         self.drain_events();
+        self.poll_oauth(&ctx);
+        self.poll_browser_login(&ctx);
+        self.poll_space_refresh(&ctx);
         self.media_pump();
         if let Some(r) = ctx.input(|i| i.viewport().inner_rect) {
             self.window = (r.width(), r.height());
@@ -1405,13 +2018,138 @@ impl App {
         let c = theme::colors(ui);
         let mut acts: Vec<Action> = Vec::new();
         let labels = self.tab_labels();
+        let workspace = self.workspace_name().to_string();
+        let browser_ok = self
+            .profiles
+            .browser
+            .as_ref()
+            .is_some_and(|b| !b.token_v2.trim().is_empty());
+        let names: Vec<String> = self
+            .profiles
+            .profiles
+            .iter()
+            .filter(|p| match p.kind {
+                crate::profiles::AuthKind::Browser => browser_ok,
+                crate::profiles::AuthKind::Official => p.has_token(),
+            })
+            .map(|p| p.name.clone())
+            .collect();
+        let no_token = !self.profiles.active_has_token();
+        let (can_back, can_forward) = self
+            .hists
+            .get(self.active)
+            .map_or((false, false), |h| (h.can_back(), h.can_forward()));
+        let header = crate::view::sidebar::Header {
+            workspace: &workspace,
+            names: &names,
+            no_token,
+            can_back,
+            can_forward,
+        };
+        // The sidebar runs the full height of the window, like Notion's, and
+        // the tab strip only covers the content area next to it.
+        if self.sidebar {
+            let side = Frame::new().fill(c.sidebar);
+            acts.extend(
+                egui::Panel::left("tree")
+                    .frame(side)
+                    .size_range(200.0..=420.0)
+                    .default_size(260.0)
+                    .show(ui, |ui| {
+                        let head = Frame::new()
+                            .inner_margin(Margin::symmetric(6, 6))
+                            .show(ui, |ui| crate::view::sidebar::header(ui, c, &header))
+                            .inner;
+                        let body = Frame::new()
+                            .inner_margin(Margin::symmetric(6, 0))
+                            .show(ui, |ui| {
+                                let row = crate::view::sidebar::workspace_row(ui, c, &header);
+                                row.or_else(|| {
+                                    crate::view::sidebar::show(
+                                        ui,
+                                        c,
+                                        &self.tree,
+                                        &self.tree_open,
+                                        self.current.as_deref(),
+                                        self.unread,
+                                        self.no_person,
+                                    )
+                                })
+                            })
+                            .inner;
+                        head.or(body)
+                    })
+                    .inner,
+            );
+        }
         let bar = Frame::new()
             .fill(c.sidebar)
-            .inner_margin(Margin::symmetric(6, 4));
+            .inner_margin(Margin::symmetric(6, 6));
         acts.extend(
             egui::Panel::top("tabs")
                 .frame(bar)
-                .show(ui, |ui| view::tabbar::show(ui, c, &labels, self.active))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let mut act = None;
+                        if !self.sidebar {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            if crate::icons::button(
+                                ui,
+                                28.0,
+                                crate::icons::Icon::Sidebar,
+                                c.secondary,
+                                c.hover,
+                                Some("Show sidebar"),
+                            )
+                            .clicked()
+                            {
+                                act = Some(Action::ToggleSidebar);
+                            }
+                            let back_c = if can_back {
+                                c.secondary
+                            } else {
+                                c.secondary.gamma_multiply(0.35)
+                            };
+                            if crate::icons::button(
+                                ui,
+                                24.0,
+                                crate::icons::Icon::Back,
+                                back_c,
+                                c.hover,
+                                Some("Back"),
+                            )
+                            .clicked()
+                                && can_back
+                            {
+                                act = Some(Action::Back);
+                            }
+                            let fwd_c = if can_forward {
+                                c.secondary
+                            } else {
+                                c.secondary.gamma_multiply(0.35)
+                            };
+                            if crate::icons::button(
+                                ui,
+                                24.0,
+                                crate::icons::Icon::Forward,
+                                fwd_c,
+                                c.hover,
+                                Some("Forward"),
+                            )
+                            .clicked()
+                                && can_forward
+                            {
+                                act = Some(Action::Forward);
+                            }
+                            ui.add_space(6.0);
+                        }
+                        if act.is_none() {
+                            act = view::tabbar::show(ui, c, &labels, self.active);
+                        }
+                        act
+                    })
+                    .inner
+                })
                 .inner,
         );
         let status = view::status::Status {
@@ -1422,25 +2160,21 @@ impl App {
             problems_open: self.problems_open,
             has_problems: !self.problems.is_empty(),
         };
-        let bar = Frame::new()
-            .fill(c.bg)
-            .inner_margin(Margin::symmetric(12, 4));
-        acts.extend(
-            egui::Panel::bottom("status")
-                .frame(bar)
-                .show(ui, |ui| view::status::show(ui, c, &status))
-                .inner,
-        );
-        if self.sidebar {
-            let side = Frame::new().fill(c.sidebar).inner_margin(Margin::same(6));
+        // Notion has no permanent status strip: only show one when there is
+        // something to say (queued work, a sync, an error, a hint).
+        let notable = status.counts != [0, 0, 0]
+            || status.busy.is_some()
+            || status.error.is_some()
+            || status.info.is_some()
+            || status.has_problems;
+        if notable {
+            let bar = Frame::new()
+                .fill(c.bg)
+                .inner_margin(Margin::symmetric(12, 4));
             acts.extend(
-                egui::Panel::left("tree")
-                    .frame(side)
-                    .size_range(180.0..=420.0)
-                    .default_size(260.0)
-                    .show(ui, |ui| {
-                        view::sidebar::show(ui, c, &self.tree, &self.tree_open, self.current.as_deref(), self.unread, self.no_person)
-                    })
+                egui::Panel::bottom("status")
+                    .frame(bar)
+                    .show(ui, |ui| view::status::show(ui, c, &status))
                     .inner,
             );
         }
@@ -1457,10 +2191,14 @@ impl App {
             );
         }
         if self.current.is_some() && self.find.is_some() {
-            let bar = Frame::new().fill(c.bg).inner_margin(Margin::symmetric(12, 4));
+            let bar = Frame::new()
+                .fill(c.bg)
+                .inner_margin(Margin::symmetric(12, 4));
             let out = egui::Panel::top("find")
                 .frame(bar)
-                .show(ui, |ui| self.find.as_mut().and_then(|f| view::find_bar(ui, c, f)))
+                .show(ui, |ui| {
+                    self.find.as_mut().and_then(|f| view::find_bar(ui, c, f))
+                })
                 .inner;
             if let Some(o) = out {
                 self.find_out(o);
@@ -1484,8 +2222,7 @@ impl App {
                 } else if self.current.is_some() {
                     self.page_ui(ui)
                 } else {
-                    view::empty_tab(ui, c);
-                    Vec::new()
+                    view::empty_tab(ui, c).into_iter().collect()
                 }
             })
             .inner;
@@ -1502,7 +2239,9 @@ impl App {
         if let Some(mut sw) = self.switcher.take() {
             let items = sw.items(&self.tree, &self.recent);
             // read when the selection changes, never per frame
-            let want = items.get(sw.sel.min(items.len().saturating_sub(1))).map(|i| i.id.as_str());
+            let want = items
+                .get(sw.sel.min(items.len().saturating_sub(1)))
+                .map(|i| i.id.as_str());
             if want != sw.preview.as_ref().map(|p| p.0.as_str()) {
                 sw.preview = want.map(|id| (id.to_string(), self.preview_lines(id)));
             }
@@ -1523,6 +2262,34 @@ impl App {
             self.dlg_done(d);
         }
         self.inbox_ui(&ctx, c);
+        if let Some(mut form) = self.ws_form.take() {
+            if let Some(a) = view::workspace::form(&ctx, c, &mut form) {
+                acts.push(a);
+            }
+            if self.ws_form.is_none() {
+                self.ws_form = Some(form);
+            }
+        }
+        if let Some(mut app) = self.oauth_setup.take() {
+            let mut err = self.oauth_error.take();
+            if let Some(a) = view::oauth::setup(&ctx, c, &mut app, &mut err) {
+                acts.push(a);
+            }
+            self.oauth_setup = Some(app);
+            self.oauth_error = err;
+        }
+        if let Some(mut flow) = self.oauth.take() {
+            if let Some(a) = view::oauth::waiting(&ctx, c, &mut flow) {
+                acts.push(a);
+            }
+            self.oauth = Some(flow);
+        }
+        if let Some(mut flow) = self.browser_login.take() {
+            if let Some(a) = view::browser_login::dialog(&ctx, c, &mut flow) {
+                acts.push(a);
+            }
+            self.browser_login = Some(flow);
+        }
         blur_first(&mut acts);
         for a in acts {
             self.apply(a);
@@ -1533,6 +2300,7 @@ impl App {
             }
             ctx.request_repaint(); // the panels above were drawn before it
         }
+        self.apply_pending_switch(&ctx);
     }
 }
 
@@ -1540,7 +2308,8 @@ impl App {
 /// is not a change).
 fn changed_ids(old: &[Row], new: &[Row]) -> Vec<String> {
     let old: HashMap<&str, &Row> = old.iter().map(|r| (r.block_id.as_str(), r)).collect();
-    let same = |a: &Marker, b: &Marker| a == b || matches!((a, b), (Marker::Number(_), Marker::Number(_)));
+    let same =
+        |a: &Marker, b: &Marker| a == b || matches!((a, b), (Marker::Number(_), Marker::Number(_)));
     new.iter()
         .filter(|n| {
             old.get(n.block_id.as_str())
@@ -1576,41 +2345,53 @@ impl eframe::App for App {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::switcher::Switcher;
+    use crate::tabs::Tab;
     use crate::testkit::{add_page, key, page_in, Win};
     use eframe::egui::Event as Ev;
     use notion_core::model::{plain_text, Block, BlockKind, TargetKind};
     use notion_core::store::Store;
     use notion_core::sync::PullReport;
-    use crate::tabs::Tab;
-    use crate::switcher::Switcher;
 
     fn skipped(id: &str) -> Event {
         Event::Pulled {
             id: id.into(),
-            report: PullReport { skipped: true, ..Default::default() },
+            report: PullReport {
+                skipped: true,
+                ..Default::default()
+            },
         }
     }
 
     fn changed(id: &str) -> Event {
         Event::Pulled {
             id: id.into(),
-            report: PullReport { fetched: 1, updated: 1, skipped: false },
+            report: PullReport {
+                fetched: 1,
+                updated: 1,
+                skipped: false,
+            },
         }
     }
 
     fn poll(id: &str, skip: Skip) -> Cmd {
-        Cmd::Poll { id: id.into(), skip }
+        Cmd::Poll {
+            id: id.into(),
+            skip,
+        }
     }
 
     /// A window with page "p" open and a background tab on each of `bg`.
     fn with_tabs(bg: &[&str]) -> Win {
         let mut w = Win::with_texts(&["a", "b"]);
         for id in bg {
-            w.app.tabs.push(Tab { page: Some(id.to_string()), ..Default::default() });
+            w.app.tabs.push(Tab {
+                page: Some(id.to_string()),
+                ..Default::default()
+            });
         }
         w
     }
@@ -1630,13 +2411,21 @@ mod tests {
             for _ in 0..5 {
                 w.app.poll_at(t0 + Duration::from_secs(t), false);
                 for c in w.cmds() {
-                    let Cmd::Poll { id, .. } = c else { panic!("{c:?}") };
+                    let Cmd::Poll { id, .. } = c else {
+                        panic!("{c:?}")
+                    };
                     polls.push((t, id.clone()));
                     w.app.on_event(skipped(&id));
                 }
             }
         }
-        let of = |id: &str| polls.iter().filter(|p| p.1 == id).map(|p| p.0).collect::<Vec<_>>();
+        let of = |id: &str| {
+            polls
+                .iter()
+                .filter(|p| p.1 == id)
+                .map(|p| p.0)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(of("p"), (1..=20).map(|n| n * 15).collect::<Vec<_>>());
         for q in ["q1", "q2", "q3", "q4"] {
             assert_eq!(of(q), [60, 120, 180, 240, 300], "{q}");
@@ -1661,7 +2450,11 @@ mod tests {
             assert_eq!(at(&mut w, s), [poll("p", Skip::IfUnchanged)], "{s}");
             w.app.on_event(skipped("p"));
         }
-        assert_eq!(at(&mut w, 75), [poll("p", sync::poll_settle())], "a minute on");
+        assert_eq!(
+            at(&mut w, 75),
+            [poll("p", sync::poll_settle())],
+            "a minute on"
+        );
     }
 
     /// With focus the open page is polled every 3 s, without it every 15 s.
@@ -1691,8 +2484,13 @@ mod tests {
             w.app.poll_at(t0 + POLL_LIVE, false);
             assert_eq!(w.cmds(), [poll("p", sync::poll_settle())]);
             w.app.on_event(changed("p"));
-            assert!(w.app.pull_took.contains_key("p"), "a poll's full pull is timed");
-            w.app.pull_took.insert("p".into(), Duration::from_secs(took));
+            assert!(
+                w.app.pull_took.contains_key("p"),
+                "a poll's full pull is timed"
+            );
+            w.app
+                .pull_took
+                .insert("p".into(), Duration::from_secs(took));
             let full = w.app.full_at["p"];
             w.app.polled.insert("p".into(), full);
             let mut fulls = Vec::new();
@@ -1726,7 +2524,13 @@ mod tests {
         assert!(w.cmds().is_empty(), "opening fetched them");
         w.app.poll_comments_at(t0 + POLL_COMMENTS);
         let c = w.cmds();
-        assert_eq!(c, [Cmd::PullComments { id: "p".into() }, Cmd::PullComments { id: "p-0".into() }]);
+        assert_eq!(
+            c,
+            [
+                Cmd::PullComments { id: "p".into() },
+                Cmd::PullComments { id: "p-0".into() }
+            ]
+        );
         w.app.poll_comments_at(t0 + POLL_COMMENTS * 2);
         assert!(w.cmds().is_empty(), "waits for the answers");
         w.app.on_event(Event::CommentsPulled);
@@ -1774,7 +2578,12 @@ mod tests {
         w.type_text("!");
         w.select(1, 1);
         let id = crate::app::edit_id("p-1");
-        let cursor = |w: &Win| egui::text_edit::TextEditState::load(&w.ctx, id).unwrap().cursor.char_range();
+        let cursor = |w: &Win| {
+            egui::text_edit::TextEditState::load(&w.ctx, id)
+                .unwrap()
+                .cursor
+                .char_range()
+        };
         let before = cursor(&w);
         w.app.poll_at(t0 + POLL_OPEN, false);
         assert_eq!(w.cmds(), [poll("p", sync::poll_settle())]);
@@ -1782,7 +2591,12 @@ mod tests {
         assert_eq!(w.queued(), 1);
         // the remote changed the other block and the edited one
         let kid = |id: &str, t: &str| {
-            crate::outline::tests::blk(id, "p", "paragraph", serde_json::json!({ "rich_text": crate::outline::tests::rt(t) }))
+            crate::outline::tests::blk(
+                id,
+                "p",
+                "paragraph",
+                serde_json::json!({ "rich_text": crate::outline::tests::rt(t) }),
+            )
         };
         w.app.store.put_block(&kid("p-0", "remote")).unwrap();
         w.answer(changed("p"));
@@ -1805,7 +2619,12 @@ mod tests {
         let mut w = Win::with_texts(&["a", "b", "c"]);
         let t0 = w.app.polled["p"];
         let put = |w: &Win, id: &str, t: &str| {
-            let b = crate::outline::tests::blk(id, "p", "paragraph", serde_json::json!({ "rich_text": crate::outline::tests::rt(t) }));
+            let b = crate::outline::tests::blk(
+                id,
+                "p",
+                "paragraph",
+                serde_json::json!({ "rich_text": crate::outline::tests::rt(t) }),
+            );
             w.app.store.put_block(&b).unwrap();
         };
         // a pull the user started highlights nothing
@@ -1822,7 +2641,10 @@ mod tests {
         put(&w, "p-1", "B2");
         w.answer(changed("p"));
         assert_eq!(w.app.flash.keys().collect::<Vec<_>>(), ["p-1"]);
-        assert!(w.app.next_wake(Instant::now()) <= FLASH, "wakes for the end");
+        assert!(
+            w.app.next_wake(Instant::now()) <= FLASH,
+            "wakes for the end"
+        );
         let end = Instant::now() + FLASH;
         w.app.expire_flash(end - Duration::from_millis(100));
         assert_eq!(w.app.flash.len(), 1);
@@ -1833,7 +2655,12 @@ mod tests {
 
     /// Puts block `id` of page "p" in the store with text `t`.
     fn put(w: &Win, id: &str, t: &str) {
-        let b = crate::outline::tests::blk(id, "p", "paragraph", serde_json::json!({ "rich_text": crate::outline::tests::rt(t) }));
+        let b = crate::outline::tests::blk(
+            id,
+            "p",
+            "paragraph",
+            serde_json::json!({ "rich_text": crate::outline::tests::rt(t) }),
+        );
         w.app.store.put_block(&b).unwrap();
     }
 
@@ -1853,8 +2680,20 @@ mod tests {
         w.app.commit();
         assert_eq!(w.app.undo.len(), 1);
         // a full poll that finds nothing new keeps the steps
-        let same = PullReport { fetched: 2, updated: 0, skipped: false };
-        poll_answered(&mut w, t0, 15, Event::Pulled { id: "p".into(), report: same });
+        let same = PullReport {
+            fetched: 2,
+            updated: 0,
+            skipped: false,
+        };
+        poll_answered(
+            &mut w,
+            t0,
+            15,
+            Event::Pulled {
+                id: "p".into(),
+                report: same,
+            },
+        );
         assert_eq!(w.app.undo.len(), 1);
         // another tab changed: not this page's steps
         w.app.sent.push_back(poll("q", Skip::Never));
@@ -1876,7 +2715,11 @@ mod tests {
         assert_eq!(w.app.undo.len(), 1);
         w.type_text("2");
         poll_answered(&mut w, t0, 30, skipped("p"));
-        assert_eq!(w.app.undo.len(), 1, "same step (each flush still queues its own op)");
+        assert_eq!(
+            w.app.undo.len(),
+            1,
+            "same step (each flush still queues its own op)"
+        );
         // nothing typed: the step stands
         poll_answered(&mut w, t0, 45, skipped("p"));
         assert_eq!(w.app.undo.len(), 1);
@@ -1892,7 +2735,11 @@ mod tests {
         w.app.undo_redo(true);
         w.app.undo_redo(true);
         w.app.undo_redo(true);
-        assert_eq!(w.row_text("p-0"), "a", "the typing session of 1 and 2 is one step");
+        assert_eq!(
+            w.row_text("p-0"),
+            "a",
+            "the typing session of 1 and 2 is one step"
+        );
     }
 
     #[test]
@@ -1902,7 +2749,10 @@ mod tests {
         w.edit(1);
         put(&w, "p-1", "remote");
         poll_answered(&mut w, t0, 15, changed("p"));
-        assert_eq!((w.text(), w.app.focus.as_ref().unwrap().original.as_str()), ("remote", "remote"));
+        assert_eq!(
+            (w.text(), w.app.focus.as_ref().unwrap().original.as_str()),
+            ("remote", "remote")
+        );
         assert_eq!(w.queued(), 0, "nothing written");
         // typing continues from the new text, and its base is the new version
         w.type_text("!");
@@ -1955,7 +2805,10 @@ mod tests {
             w.type_text(c);
             poll_answered(&mut w, t0, 3 * (i as u64 + 1), skipped("p"));
         }
-        w.frame_with(vec![crate::testkit::key_mod(Key::S, Modifiers::CTRL)], Modifiers::CTRL);
+        w.frame_with(
+            vec![crate::testkit::key_mod(Key::S, Modifiers::CTRL)],
+            Modifiers::CTRL,
+        );
         w.frames(vec![]);
         assert_eq!(w.queued(), 1);
         assert_eq!(w.app.undo.len(), 1);
@@ -1977,7 +2830,10 @@ mod tests {
         for s in [0, 10, 20, 100] {
             w.app.poll_comments_at(t0 + Duration::from_secs(s));
         }
-        assert!(w.cmds().iter().all(|c| !matches!(c, Cmd::PullComments { .. })));
+        assert!(w
+            .cmds()
+            .iter()
+            .all(|c| !matches!(c, Cmd::PullComments { .. })));
     }
 
     #[test]
@@ -2014,7 +2870,12 @@ mod tests {
         let t0 = w.app.polled["p"];
         poll_answered(&mut w, t0, 15, Event::Error("502 bad gateway".into()));
         assert_eq!(w.app.last_error, None);
-        poll_answered(&mut w, t0, 30, Event::Error("offline: NOTION_TOKEN not set".into()));
+        poll_answered(
+            &mut w,
+            t0,
+            30,
+            Event::Error("offline: NOTION_TOKEN not set".into()),
+        );
         assert!(w.app.offline());
         w.app.poll_at(t0 + POLL_OPEN * 10, false);
         assert!(w.cmds().is_empty(), "backed off");
@@ -2029,7 +2890,13 @@ mod tests {
         w.app.on_event(skipped("p"));
         w.app.pending_open = Some("remote".into());
         w.app.poll_at(t0 + POLL_BG, false);
-        assert_eq!(w.cmds(), [poll("p", sync::poll_settle()), poll("q", sync::poll_settle())]);
+        assert_eq!(
+            w.cmds(),
+            [
+                poll("p", sync::poll_settle()),
+                poll("q", sync::poll_settle())
+            ]
+        );
         w.app.on_event(changed("q"));
         assert_eq!(w.app.current.as_deref(), Some("p"));
         assert_eq!(w.app.pending_open.as_deref(), Some("remote"));
@@ -2046,7 +2913,9 @@ mod tests {
         assert_eq!(w.cmds().len(), 1);
         // in a frame
         w.app.sent.clear();
-        w.app.polled.insert("p".into(), Instant::now() - Duration::from_secs(6));
+        w.app
+            .polled
+            .insert("p".into(), Instant::now() - Duration::from_secs(6));
         w.app.was_focused = false; // the window was in the background
         w.frames(vec![]);
         assert_eq!(w.cmds().len(), 1, "focused again: one poll");
@@ -2219,7 +3088,12 @@ mod tests {
         assert!(w.app.problem_ids.contains("p-1"));
         let p = &w.app.problems[0];
         assert_eq!(
-            (p.kind, p.label.as_str(), p.page.as_deref(), p.error.as_str()),
+            (
+                p.kind,
+                p.label.as_str(),
+                p.page.as_deref(),
+                p.error.as_str()
+            ),
             ("edit", "y", Some("p"), "remote edited")
         );
 
@@ -2233,7 +3107,10 @@ mod tests {
         // a click goes to the block
         w.app.apply(Action::OpenProblem(bad));
         assert!(!w.app.problems_open);
-        assert_eq!(w.app.focus.as_ref().map(|f| f.block_id.as_str()), Some("p-1"));
+        assert_eq!(
+            w.app.focus.as_ref().map(|f| f.block_id.as_str()),
+            Some("p-1")
+        );
         w.app.commit();
 
         w.app.apply(Action::Discard(bad));
@@ -2258,7 +3135,10 @@ mod tests {
 
         // not while a push runs
         let bad = sync::local_edit_text(&w.app.store, "p-1", "q").unwrap();
-        w.app.store.mark_op(bad, OpStatus::Failed, Some("400")).unwrap();
+        w.app
+            .store
+            .mark_op(bad, OpStatus::Failed, Some("400"))
+            .unwrap();
         w.app.refresh();
         w.app.sent.push_back(Cmd::Push);
         w.app.apply(Action::Discard(bad));
@@ -2306,7 +3186,11 @@ mod tests {
         assert_eq!(w.app.active, 0);
         assert_eq!(w.app.current.as_deref(), Some("p1"));
         w.frames(vec![]);
-        assert!((w.app.scroll - 120.0).abs() < 1.0, "scroll restored: {}", w.app.scroll);
+        assert!(
+            (w.app.scroll - 120.0).abs() < 1.0,
+            "scroll restored: {}",
+            w.app.scroll
+        );
         assert!(w.app.open.contains("tog"));
         w.press(Key::Tab, Modifiers::CTRL);
         assert_eq!(w.app.active, 1);
@@ -2342,8 +3226,8 @@ mod tests {
         w.app.apply(Action::NewTab);
         w.press(Key::Escape, Modifiers::NONE);
         w.frames(vec![]);
-        // the first tab sits at the top-left of the window
-        let pos = egui::pos2(40.0, 18.0);
+        // the first tab sits right after the full-height sidebar
+        let pos = egui::pos2(350.0, 18.0);
         let click = |b| {
             vec![
                 Ev::PointerMoved(pos),
@@ -2441,7 +3325,9 @@ mod tests {
             let mut v = serde_json::to_value(&p).unwrap();
             v["properties"] = serde_json::json!({ "Name": { "id": "title", "type": "title", "title": [
                 { "type": "text", "text": { "content": t }, "plain_text": t, "annotations": {} }] } });
-            store.upsert_page(&serde_json::from_value(v).unwrap()).unwrap();
+            store
+                .upsert_page(&serde_json::from_value(v).unwrap())
+                .unwrap();
         }
         Win::new(store)
     }
@@ -2454,7 +3340,11 @@ mod tests {
         assert!(w.app.switcher.is_some());
         // empty query: the recent list
         let sw = w.app.switcher.as_ref().unwrap();
-        let ids: Vec<_> = sw.items(&w.app.tree, &w.app.recent).iter().map(|i| i.id.clone()).collect();
+        let ids: Vec<_> = sw
+            .items(&w.app.tree, &w.app.recent)
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
         assert_eq!(ids, ["a"]);
         // type: the field has the focus without a click
         w.type_text("ki");
@@ -2467,7 +3357,11 @@ mod tests {
         assert_eq!(w.app.current.as_deref(), Some("b"));
         assert_eq!(w.app.tabs.len(), 1);
         assert_eq!(w.app.recent[0], "b");
-        assert_eq!(w.cmds(), [Cmd::PullUsers], "cached: no page pull; the empty user cache is asked once");
+        assert_eq!(
+            w.cmds(),
+            [Cmd::PullUsers],
+            "cached: no page pull; the empty user cache is asked once"
+        );
         // the search went out after the debounce
         // (a fresh switcher: type, wait, see the command)
         w.press(Key::K, Modifiers::CTRL);
@@ -2522,7 +3416,11 @@ mod tests {
         w.frames(vec![]);
         assert_eq!((w.app.tabs.len(), w.app.active), (2, 1));
         assert_eq!(w.app.current.as_deref(), Some("c"));
-        assert_eq!(w.app.tabs[0].page.as_deref(), Some("a"), "the old tab keeps its page");
+        assert_eq!(
+            w.app.tabs[0].page.as_deref(),
+            Some("a"),
+            "the old tab keeps its page"
+        );
         assert!(w.app.switcher.is_none());
     }
 
@@ -2546,7 +3444,10 @@ mod tests {
         w.app.session_dir = Some(conf.clone());
         w.app.shutdown();
         assert!(conf.join(SESSION_FILE).exists());
-        assert!(!conf.join("session.json").exists(), "the iced app's file is left alone");
+        assert!(
+            !conf.join("session.json").exists(),
+            "the iced app's file is left alone"
+        );
 
         let (s, problem) = session::load_from(&conf, SESSION_FILE);
         assert_eq!(problem, None);
@@ -2584,9 +3485,11 @@ mod tests {
         // a worker that exits once its command sender is dropped
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
         w.app.cmds = Some(tx);
-        w.app.set_worker(std::thread::spawn(move || {
-            while rx.blocking_recv().is_some() {}
-        }));
+        w.app.set_worker(std::thread::spawn(
+            move || {
+                while rx.blocking_recv().is_some() {}
+            },
+        ));
         w.app.shutdown();
         assert!(w.app.worker.is_none() && w.app.cmds.is_none());
         assert_eq!(w.queued(), 1, "the typed text was committed");
@@ -2595,7 +3498,14 @@ mod tests {
     // ------------------------------------- conversions are written, not shown
 
     fn kind_of(w: &Win, id: &str) -> String {
-        w.app.store.get_block(id).unwrap().unwrap().kind.type_name().to_string()
+        w.app
+            .store
+            .get_block(id)
+            .unwrap()
+            .unwrap()
+            .kind
+            .type_name()
+            .to_string()
     }
 
     fn focused_id(w: &Win) -> String {
@@ -2656,7 +3566,10 @@ mod tests {
         assert!(!w.app.focus.as_ref().unwrap().code);
         w.type_text("c");
         w.press(Key::Escape, Modifiers::NONE);
-        assert_eq!((w.app.last_error.clone(), w.app.focus.is_none()), (None, true));
+        assert_eq!(
+            (w.app.last_error.clone(), w.app.focus.is_none()),
+            (None, true)
+        );
         let b = w.app.store.get_block(&id).unwrap().unwrap();
         assert_eq!(plain_text(&b.kind.text().unwrap().rich_text), "abc");
     }
@@ -2741,7 +3654,11 @@ mod tests {
         assert_eq!(w.app.rows[0].marker, crate::outline::Marker::Todo(true));
         w.app.apply(Action::Check(0));
         assert_eq!(w.app.rows[0].marker, crate::outline::Marker::Todo(false));
-        assert_eq!(w.queued(), 1, "the same block again: one op, the last state");
+        assert_eq!(
+            w.queued(),
+            1,
+            "the same block again: one op, the last state"
+        );
     }
 
     // ------------------------------------------------------- same-frame keys
@@ -2751,7 +3668,10 @@ mod tests {
         let mut w = Win::with_texts(&["a"]);
         w.edit(0);
         w.frame_with(
-            vec![Ev::Text("x".into()), crate::testkit::key_mod(Key::S, Modifiers::CTRL)],
+            vec![
+                Ev::Text("x".into()),
+                crate::testkit::key_mod(Key::S, Modifiers::CTRL),
+            ],
             Modifiers::CTRL,
         );
         w.frames(vec![]);
@@ -2780,10 +3700,15 @@ mod tests {
         let mut w = Win::with_texts(&["a"]);
         w.app.users_at = None;
         w.app.users_tick(Instant::now());
-        assert_eq!(w.cmds(), [Cmd::PullUsers], "the startup pull comes from the tick");
+        assert_eq!(
+            w.cmds(),
+            [Cmd::PullUsers],
+            "the startup pull comes from the tick"
+        );
         let asked = w.app.users_at.unwrap();
         w.answer(Event::UsersPulled);
-        w.app.users_tick(asked + USERS_EVERY - Duration::from_secs(1));
+        w.app
+            .users_tick(asked + USERS_EVERY - Duration::from_secs(1));
         assert!(w.cmds().is_empty(), "not within the hour");
         w.app.sent.push_back(Cmd::Push);
         w.app.users_tick(asked + USERS_EVERY);
@@ -2791,7 +3716,8 @@ mod tests {
         w.app.sent.clear();
         w.app.users_tick(asked + USERS_EVERY);
         assert_eq!(w.cmds(), [Cmd::PullUsers]);
-        w.app.users_tick(asked + USERS_EVERY + Duration::from_secs(5));
+        w.app
+            .users_tick(asked + USERS_EVERY + Duration::from_secs(5));
         assert!(w.cmds().is_empty(), "the hour restarts at each pull");
         // frames never ask on their own
         for _ in 0..5 {
@@ -2805,14 +3731,26 @@ mod tests {
         let mut w = Win::with_texts(&["a"]);
         w.app.users_at = None;
         // the restore page pull is out: the users wait for it
-        w.app.send(Cmd::Pull { id: "p".into(), force: false });
+        w.app.send(Cmd::Pull {
+            id: "p".into(),
+            force: false,
+        });
         for _ in 0..3 {
             w.frames(vec![]);
         }
-        assert_eq!(w.cmds(), [Cmd::Pull { id: "p".into(), force: false }]);
+        assert_eq!(
+            w.cmds(),
+            [Cmd::Pull {
+                id: "p".into(),
+                force: false
+            }]
+        );
         assert_eq!(w.app.users_at, None);
         // answered: the next frame asks, once
-        w.answer(Event::Pulled { id: "p".into(), report: PullReport::default() });
+        w.answer(Event::Pulled {
+            id: "p".into(),
+            report: PullReport::default(),
+        });
         w.frames(vec![]);
         assert_eq!(w.cmds(), [Cmd::PullUsers]);
         assert!(w.app.users_at.is_some());
@@ -2830,7 +3768,10 @@ mod tests {
         w.app.apply(Action::SyncAll);
         assert!(w.cmds().is_empty(), "one at a time");
         // progress is not an answer
-        w.answer(Event::Progress { done: 12, total: 164 });
+        w.answer(Event::Progress {
+            done: 12,
+            total: 164,
+        });
         assert_eq!(w.app.sent.len(), 1);
         assert_eq!(w.app.busy_label().as_deref(), Some("syncing 12/164…"));
         // polls wait behind it, but pages stay readable
@@ -2846,7 +3787,10 @@ mod tests {
         }))
         .unwrap();
         w.app.store.upsert_data_source(&ds).unwrap();
-        let row = crate::testkit::page("r", serde_json::json!({ "type": "data_source_id", "data_source_id": "ds", "database_id": "db" }));
+        let row = crate::testkit::page(
+            "r",
+            serde_json::json!({ "type": "data_source_id", "data_source_id": "ds", "database_id": "db" }),
+        );
         w.app.store.upsert_page(&row).unwrap();
         assert!(w.app.tree.iter().all(|e| e.id != "q"));
         w.answer(Event::SyncedAll(Default::default()));
@@ -2867,7 +3811,10 @@ mod tests {
         w.app.apply(Action::Open("ds".into()));
         assert_eq!(w.app.current.as_deref(), Some("ds"));
         assert!(w.app.db.is_some());
-        assert!(w.cmds().contains(&Cmd::Pull { id: "ds".into(), force: false }));
+        assert!(w.cmds().contains(&Cmd::Pull {
+            id: "ds".into(),
+            force: false
+        }));
     }
 
     #[test]
@@ -2878,8 +3825,15 @@ mod tests {
         w.cmds();
         w.answer(Event::UsersDenied);
         let msg = w.app.users_note.clone().expect("a message");
-        assert!(msg.contains("403") && msg.contains("Read user information"), "{msg}");
-        assert_eq!(w.app.pending_open.as_deref(), Some("remote"), "unrelated to the page being opened");
+        assert!(
+            msg.contains("403") && msg.contains("Read user information"),
+            "{msg}"
+        );
+        assert_eq!(
+            w.app.pending_open.as_deref(),
+            Some("remote"),
+            "unrelated to the page being opened"
+        );
         // neither the hourly tick, nor the @ menu, nor the switcher, nor a frame asks again
         w.app.users_tick(Instant::now() + USERS_EVERY * 5);
         w.app.ensure_users();
@@ -2890,8 +3844,14 @@ mod tests {
         assert!(w.cmds().is_empty(), "no repeat");
         assert_eq!(w.app.last_error, None, "and no second message");
         // a later pull's event doesn't wipe it, and the status bar still shows it
-        w.app.sent.push_back(Cmd::Pull { id: "p".into(), force: false });
-        w.answer(Event::Pulled { id: "p".into(), report: PullReport::default() });
+        w.app.sent.push_back(Cmd::Pull {
+            id: "p".into(),
+            force: false,
+        });
+        w.answer(Event::Pulled {
+            id: "p".into(),
+            report: PullReport::default(),
+        });
         assert!(w.app.users_note.is_some());
         w.frames(vec![]);
         assert!(w.shown.contains("Read user information"), "{}", w.shown);
@@ -2903,7 +3863,10 @@ mod tests {
         w.app.pending_open = Some("remote".into());
         w.app.request_users();
         w.answer(Event::Error("http: timeout".into()));
-        assert_eq!(w.app.last_error.as_deref(), Some("users not loaded: http: timeout"));
+        assert_eq!(
+            w.app.last_error.as_deref(),
+            Some("users not loaded: http: timeout")
+        );
         assert!(!w.app.users_stop);
         assert_eq!(w.app.pending_open.as_deref(), Some("remote"));
         w.cmds();
@@ -2922,7 +3885,10 @@ mod tests {
         let mut w = Win::with_texts(&["a"]);
         assert!(w.app.users.is_empty());
         let u = |id: &str, name: &str| {
-            notion_core::model::User::from_value(&serde_json::json!({ "object": "user", "id": id, "type": "person", "name": name })).unwrap()
+            notion_core::model::User::from_value(
+                &serde_json::json!({ "object": "user", "id": id, "type": "person", "name": name }),
+            )
+            .unwrap()
         };
         w.app.store.put_users(&[u("u1", "Ada")]).unwrap();
         w.app.sent.push_back(Cmd::PullUsers);
@@ -2946,7 +3912,10 @@ mod tests {
         }
         assert_eq!(w.app.last_error.as_deref(), Some("403"), "still shown");
         // the page's own pull failing cancels the open
-        w.app.sent.push_back(Cmd::Pull { id: "remote".into(), force: false });
+        w.app.sent.push_back(Cmd::Pull {
+            id: "remote".into(),
+            force: false,
+        });
         w.answer(Event::Error("404".into()));
         assert_eq!(w.app.pending_open, None);
     }
@@ -3041,7 +4010,10 @@ mod tests {
         w.cmds();
         w.press(Key::OpenBracket, Modifiers::CTRL);
         assert_eq!(w.app.pending_open.as_deref(), Some("remote"));
-        assert!(w.cmds().contains(&Cmd::Pull { id: "remote".into(), force: false }));
+        assert!(w.cmds().contains(&Cmd::Pull {
+            id: "remote".into(),
+            force: false
+        }));
         w.answer(Event::Error("404".into()));
         assert_eq!((w.app.pending_open.clone(), cur(&w)), (None, "c"));
         open(&mut w, "d");
@@ -3107,7 +4079,11 @@ mod tests {
         assert!(w.app.find.is_some());
         let cur = |w: &Win| w.app.find.as_ref().unwrap().cur;
         w.type_text("gruesse");
-        assert_eq!(w.app.find.as_ref().unwrap().hits, [2, 40, 75], "case and umlauts folded");
+        assert_eq!(
+            w.app.find.as_ref().unwrap().hits,
+            [2, 40, 75],
+            "case and umlauts folded"
+        );
         assert!(w.shown.contains("1/3"), "{}", w.shown);
         w.send(key(Key::Enter));
         assert_eq!(cur(&w), 1);
@@ -3141,7 +4117,8 @@ mod tests {
     fn esc_closes_the_find_bar_without_the_box_having_focus() {
         let mut w = find_win();
         w.type_text("line");
-        w.ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique("find-box")));
+        w.ctx
+            .memory_mut(|m| m.surrender_focus(egui::Id::unique("find-box")));
         w.frames(vec![]);
         w.send(key(Key::Escape));
         assert!(w.app.find.is_none());
@@ -3169,8 +4146,18 @@ mod tests {
     fn a_match_in_a_collapsed_toggle_opens_it() {
         let store = Store::open_in_memory().unwrap();
         add_page(&store, "p", None, &["x"]);
-        let t = crate::outline::tests::blk("tg", "p", "toggle", serde_json::json!({ "rich_text": crate::outline::tests::rt("T") }));
-        let k = crate::outline::tests::blk("kid", "tg", "paragraph", serde_json::json!({ "rich_text": crate::outline::tests::rt("needle") }));
+        let t = crate::outline::tests::blk(
+            "tg",
+            "p",
+            "toggle",
+            serde_json::json!({ "rich_text": crate::outline::tests::rt("T") }),
+        );
+        let k = crate::outline::tests::blk(
+            "kid",
+            "tg",
+            "paragraph",
+            serde_json::json!({ "rich_text": crate::outline::tests::rt("needle") }),
+        );
         store.replace_children("p", "p", &[t]).unwrap();
         store.replace_children("tg", "tg", &[k]).unwrap();
         let mut w = Win::new(store);
@@ -3186,10 +4173,29 @@ mod tests {
     fn headed_win() -> Win {
         use crate::outline::tests::{blk, rt};
         let store = Store::open_in_memory().unwrap();
-        store.upsert_page(&crate::testkit::page_in("p", None)).unwrap();
-        let mut kids = vec![blk("h1", "p", "heading_1", serde_json::json!({ "rich_text": rt("One") }))];
-        kids.extend((0..60).map(|i| blk(&format!("t{i}"), "p", "paragraph", serde_json::json!({ "rich_text": rt("t") }))));
-        kids.push(blk("h2", "p", "heading_2", serde_json::json!({ "rich_text": rt("Two") })));
+        store
+            .upsert_page(&crate::testkit::page_in("p", None))
+            .unwrap();
+        let mut kids = vec![blk(
+            "h1",
+            "p",
+            "heading_1",
+            serde_json::json!({ "rich_text": rt("One") }),
+        )];
+        kids.extend((0..60).map(|i| {
+            blk(
+                &format!("t{i}"),
+                "p",
+                "paragraph",
+                serde_json::json!({ "rich_text": rt("t") }),
+            )
+        }));
+        kids.push(blk(
+            "h2",
+            "p",
+            "heading_2",
+            serde_json::json!({ "rich_text": rt("Two") }),
+        ));
         store.replace_children("p", "p", &kids).unwrap();
         let mut w = Win::new(store);
         open(&mut w, "p");
@@ -3199,7 +4205,10 @@ mod tests {
     #[test]
     fn the_outline_lists_headings_once_and_a_click_scrolls() {
         let mut w = headed_win();
-        assert_eq!(w.app.heads, [(0, 1, "One".to_string()), (61, 2, "Two".to_string())]);
+        assert_eq!(
+            w.app.heads,
+            [(0, 1, "One".to_string()), (61, 2, "Two".to_string())]
+        );
         w.app.apply(Action::Goto(61));
         w.frames(vec![]);
         w.frames(vec![]);
@@ -3218,12 +4227,21 @@ mod tests {
             let kids: Vec<_> = t
                 .iter()
                 .enumerate()
-                .map(|(i, s)| crate::outline::tests::blk(&format!("{id}-{i}"), id, "paragraph", serde_json::json!({ "rich_text": crate::outline::tests::rt(s) })))
+                .map(|(i, s)| {
+                    crate::outline::tests::blk(
+                        &format!("{id}-{i}"),
+                        id,
+                        "paragraph",
+                        serde_json::json!({ "rich_text": crate::outline::tests::rt(s) }),
+                    )
+                })
                 .collect();
             w.app.store.replace_children(id, id, &kids).unwrap();
         }
         w.app.recent = vec!["a".into(), "b".into()];
-        w.app.visited.insert("a".into(), crate::comments::now_secs());
+        w.app
+            .visited
+            .insert("a".into(), crate::comments::now_secs());
         w.press(Key::K, Modifiers::CTRL);
         w.frames(vec![]);
         w.frames(vec![]);
@@ -3232,19 +4250,109 @@ mod tests {
         }
         assert!(!w.shown.contains("Gestern"));
         let pv = |w: &Win| w.app.switcher.as_ref().unwrap().preview.clone().unwrap();
-        assert_eq!(pv(&w), ("a".to_string(), vec!["one".to_string(), "two".to_string()]));
+        assert_eq!(
+            pv(&w),
+            ("a".to_string(), vec!["one".to_string(), "two".to_string()])
+        );
         // frames do not re-read the page
         w.app.store.replace_children("a", "a", &[]).unwrap();
         w.frames(vec![]);
         assert_eq!(pv(&w).1, ["one", "two"]);
         // ↓ lands on the next page, not on a header
         w.send(key(Key::ArrowDown));
-        assert_eq!(pv(&w), ("b".to_string(), vec!["three".to_string(), "four".to_string()]));
+        assert_eq!(
+            pv(&w),
+            (
+                "b".to_string(),
+                vec!["three".to_string(), "four".to_string()]
+            )
+        );
         w.send(key(Key::Enter));
         assert_eq!(cur(&w), "b");
         // a search is a flat list
         w.press(Key::K, Modifiers::CTRL);
         w.type_text("al");
         assert!(!w.shown.contains("Heute"));
+    }
+
+    #[test]
+    fn switching_workspaces_reopens_the_store_and_uses_its_session() {
+        use crate::profiles::{Profile, Profiles};
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("config");
+        let data = dir.path().join("data");
+        let mut w = Win::with_texts(&["a"]);
+        w.app.session_dir = Some(conf.clone());
+        w.app.session_file = "session-egui-one.json".into();
+        let mut profiles = Profiles::default();
+        profiles.upsert(Profile::new("One", ""));
+        profiles.upsert(Profile::new("Two", ""));
+        profiles.set_active("One");
+        w.app.profiles = profiles;
+        w.app.profiles_dir = Some(conf.clone());
+        w.app.data_dir = Some(data.clone());
+        w.app.pending_switch = Some(("Two".into(), true));
+        w.app.apply_pending_switch(&w.ctx);
+        assert_eq!(w.app.workspace_name(), "Two");
+        assert_eq!(w.app.session_file, "session-egui-two.json");
+        assert!(
+            data.join("cache-two.db").exists(),
+            "the profile's own cache"
+        );
+        assert!(w.app.tree.is_empty(), "the new workspace starts empty");
+        assert!(
+            conf.join("session-egui-one.json").exists(),
+            "the old session was saved"
+        );
+        let saved = std::fs::read_to_string(conf.join(crate::profiles::FILE)).unwrap();
+        assert!(saved.contains("\"active\": \"Two\""), "{saved}");
+        w.app.shutdown();
+    }
+
+    #[test]
+    fn sign_in_without_an_oauth_app_opens_the_setup_dialog() {
+        let mut w = Win::with_texts(&["a"]);
+        w.app.profiles.oauth = None;
+        w.app.apply(Action::OAuthStart);
+        assert!(w.app.oauth.is_none(), "no listener without credentials");
+        assert!(w.app.oauth_setup.is_some());
+
+        // saving an incomplete app keeps the dialog open with a message
+        w.app.apply(Action::OAuthSetupSave);
+        assert!(w.app.oauth_setup.is_some());
+        assert!(w.app.oauth_error.as_deref().unwrap().contains("client id"));
+        w.app.apply(Action::OAuthSetupCancel);
+        assert!(w.app.oauth_setup.is_none() && w.app.oauth_error.is_none());
+    }
+
+    #[test]
+    fn the_workspace_form_adds_a_profile_and_makes_it_active() {
+        use crate::profiles::{Form, Profiles};
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("config");
+        let data = dir.path().join("data");
+        let mut w = Win::with_texts(&["a"]);
+        w.app.session_dir = Some(conf.clone());
+        w.app.profiles_dir = Some(conf.clone());
+        w.app.data_dir = Some(data);
+        w.app.profiles = Profiles::default();
+        w.app.ws_form = Some(Form {
+            original: None,
+            name: "Acme".into(),
+            token: "ntn_x".into(),
+            user_id: String::new(),
+            error: None,
+        });
+        w.app.save_workspace_form();
+        assert_eq!(w.app.workspace_name(), "Acme");
+        assert_eq!(
+            w.app.pending_switch.as_ref().map(|p| p.0.as_str()),
+            Some("Acme")
+        );
+        let saved = std::fs::read_to_string(conf.join(crate::profiles::FILE)).unwrap();
+        assert!(saved.contains("Acme") && saved.contains("ntn_x"), "{saved}");
+        // never switch in the test: the fake token would start a live worker
+        w.app.pending_switch = None;
+        w.app.shutdown();
     }
 }

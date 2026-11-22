@@ -214,7 +214,11 @@ pub fn local_date_iso(offset_days: i64) -> String {
 pub fn local_day(secs: i64) -> i64 {
     use chrono::Datelike;
     chrono::DateTime::from_timestamp(secs, 0).map_or(0, |t| {
-        i64::from(t.with_timezone(&chrono::Local).date_naive().num_days_from_ce())
+        i64::from(
+            t.with_timezone(&chrono::Local)
+                .date_naive()
+                .num_days_from_ce(),
+        )
     })
 }
 
@@ -517,7 +521,11 @@ pub fn split_markdown(s: &str, at: usize) -> (Vec<RichText>, Vec<RichText>) {
     marked.insert(byte, CUT);
     let runs = from_markdown(&marked);
     // inside plain text, taking the sentinel out gives back the unmarked parse
-    let text = |v: &[RichText]| v.iter().map(|r| r.plain_text.replace(CUT, "")).collect::<String>();
+    let text = |v: &[RichText]| {
+        v.iter()
+            .map(|r| r.plain_text.replace(CUT, ""))
+            .collect::<String>()
+    };
     let hit = runs.iter().position(|r| r.plain_text.contains(CUT));
     let Some(i) = hit.filter(|&i| {
         text(&runs) == text(&whole) && matches!(runs[i].kind, RichTextKind::Text { .. })
@@ -640,7 +648,11 @@ mod tests {
             ("a \\*b", 3),
         ] {
             let (l, r) = split_markdown(s, at);
-            assert_eq!((to_markdown(&l), r.len()), (s.to_string(), 0), "{s} at {at}");
+            assert_eq!(
+                (to_markdown(&l), r.len()),
+                (s.to_string(), 0),
+                "{s} at {at}"
+            );
         }
         // next to a token is fine
         let (l, r) = split_markdown("ab@[Label](page:abc)", 2);

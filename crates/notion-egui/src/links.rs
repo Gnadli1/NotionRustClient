@@ -1,6 +1,6 @@
 //! Where a click on a link goes (ported from notion-gui's app.rs): a Notion
-//! page opens in the app, other http/https links go to `xdg-open`, anything
-//! else is refused. Pure functions, so tests never start a process.
+//! page opens in the app, other http/https links go to the system browser,
+//! anything else is refused. Pure functions, so tests never start a process.
 
 use eframe::egui::text::LayoutJob;
 use notion_core::model::{RichText, RichTextKind};
@@ -66,9 +66,9 @@ pub(crate) fn route(url: &str) -> Link {
 /// What clicking a run does: a page mention opens the page, a link is routed.
 pub(crate) fn run_link(r: &RichText) -> Option<Link> {
     match &r.kind {
-        RichTextKind::Mention(m) if m["type"] == "page" => {
-            m["page"]["id"].as_str().map(|id| Link::Page(id.to_string()))
-        }
+        RichTextKind::Mention(m) if m["type"] == "page" => m["page"]["id"]
+            .as_str()
+            .map(|id| Link::Page(id.to_string())),
         _ => r.href.as_deref().map(route),
     }
 }
@@ -88,27 +88,20 @@ pub(crate) fn link_at(rich: &[RichText], job: &LayoutJob, cursor: usize) -> Opti
         .and_then(|(_, r)| run_link(r))
 }
 
-/// Only web links go to xdg-open (a file:// one could start a local script or
-/// .desktop file).
+/// Only web links go to the browser (a file:// one could start a local script
+/// or .desktop file).
 pub(crate) fn allowed_url(url: &str) -> bool {
     let l = url.to_ascii_lowercase();
     ["http://", "https://"].iter().any(|p| l.starts_with(p))
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// Starts `xdg-open url` without waiting for it.
-pub(crate) fn xdg_open(url: &str) -> Result<(), String> {
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("xdg-open")
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("xdg-open: {e}"))?;
-    // reap it so it doesn't linger as a zombie
-    std::thread::spawn(move || child.wait());
-    Ok(())
+/// Opens `url` in the system browser (ShellExecute on Windows, `open` on
+/// macOS, `xdg-open` on Linux) without waiting for it.
+pub(crate) fn open_url(url: &str) -> Result<(), String> {
+    webbrowser::open(url)
+        .map(|_| ())
+        .map_err(|e| format!("cannot open the browser: {e}"))
 }
 
 #[cfg(test)]
@@ -152,7 +145,10 @@ mod tests {
 
     #[test]
     fn routing_and_the_scheme_whitelist() {
-        assert_eq!(route(&format!("https://notion.so/{PID}")), Link::Page(PID.into()));
+        assert_eq!(
+            route(&format!("https://notion.so/{PID}")),
+            Link::Page(PID.into())
+        );
         assert_eq!(
             route("https://example.com/a"),
             Link::Web("https://example.com/a".into())
@@ -180,18 +176,27 @@ mod tests {
     #[test]
     fn a_click_finds_its_run_even_with_an_equation_in_front() {
         let rich = vec![
-            run(json!({ "type": "equation", "equation": { "expression": "\\alpha" },
-                "plain_text": "\\alpha", "annotations": {} })),
-            run(json!({ "type": "text", "text": { "content": "go", "link": { "url": "https://e.x/" } },
-                "plain_text": "go", "href": "https://e.x/", "annotations": {} })),
-            run(json!({ "type": "mention", "mention": { "type": "page", "page": { "id": PID } },
-                "plain_text": "pg", "annotations": {} })),
+            run(
+                json!({ "type": "equation", "equation": { "expression": "\\alpha" },
+                "plain_text": "\\alpha", "annotations": {} }),
+            ),
+            run(
+                json!({ "type": "text", "text": { "content": "go", "link": { "url": "https://e.x/" } },
+                "plain_text": "go", "href": "https://e.x/", "annotations": {} }),
+            ),
+            run(
+                json!({ "type": "mention", "mention": { "type": "page", "page": { "id": PID } },
+                "plain_text": "pg", "annotations": {} }),
+            ),
         ];
         let job = rich_job(&rich, 16.0, false, &[]);
         // the equation shows as "α" (1 char), not as its 6-char source
         assert_eq!(job.text.chars().count(), 1 + 2 + 2, "{}", job.text);
         assert_eq!(link_at(&rich, &job, 0), None);
-        assert_eq!(link_at(&rich, &job, 1), Some(Link::Web("https://e.x/".into())));
+        assert_eq!(
+            link_at(&rich, &job, 1),
+            Some(Link::Web("https://e.x/".into()))
+        );
         assert_eq!(link_at(&rich, &job, 3), Some(Link::Page(PID.into())));
         assert_eq!(link_at(&rich, &job, 99), None);
     }

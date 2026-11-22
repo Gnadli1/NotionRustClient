@@ -23,7 +23,11 @@ pub fn show(ctx: &Context, c: &Colors, sw: &mut Switcher, items: &[Item]) -> Out
                 ui.set_width(540.0_f32.min(ui.available_width()));
                 let field = ui.add(
                     TextEdit::singleline(&mut sw.query)
-                        .hint_text(if sw.moving.is_some() { "Move to… (pick the new parent page)" } else { "Search pages…" })
+                        .hint_text(if sw.moving.is_some() {
+                            "Move to… (pick the new parent page)"
+                        } else {
+                            "Search pages…"
+                        })
                         .desired_width(f32::INFINITY)
                         .font(egui::TextStyle::Heading),
                 );
@@ -49,19 +53,35 @@ pub fn show(ctx: &Context, c: &Colors, sw: &mut Switcher, items: &[Item]) -> Out
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         for (i, it) in items.iter().enumerate() {
-                            if it.group.is_some() && it.group != i.checked_sub(1).and_then(|p| items[p].group) {
+                            if it.group.is_some()
+                                && it.group != i.checked_sub(1).and_then(|p| items[p].group)
+                            {
                                 ui.add_space(4.0);
-                                ui.label(RichText::new(it.group.unwrap_or_default()).small().color(c.secondary));
+                                ui.label(
+                                    RichText::new(it.group.unwrap_or_default())
+                                        .small()
+                                        .color(c.secondary),
+                                );
                             }
                             let r = super::item(ui, c, i == sel, 28.0, |ui| {
                                 ui.add(Label::new(&it.icon));
                                 let font = egui::TextStyle::Body.resolve(ui.style());
                                 let mut job = LayoutJob::default();
-                                let fmt = |color, font: &egui::FontId| TextFormat::simple(font.clone(), color);
-                                job.append(super::untitled(&it.title), 0.0, fmt(ui.visuals().text_color(), &font));
+                                let fmt = |color, font: &egui::FontId| {
+                                    TextFormat::simple(font.clone(), color)
+                                };
+                                job.append(
+                                    super::untitled(&it.title),
+                                    0.0,
+                                    fmt(ui.visuals().text_color(), &font),
+                                );
                                 if !it.path.is_empty() {
                                     let small = egui::FontId::proportional(font.size - 2.0);
-                                    job.append(&format!("  {}", it.path), 0.0, fmt(c.secondary, &small));
+                                    job.append(
+                                        &format!("  {}", it.path),
+                                        0.0,
+                                        fmt(c.secondary, &small),
+                                    );
                                 }
                                 ui.add(Label::new(job).truncate());
                             });

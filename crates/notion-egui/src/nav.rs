@@ -48,6 +48,15 @@ impl History {
         self.pages.iter_mut().for_each(|p| *p = f(p));
     }
 
+    /// Whether a step is available, for the greyed-out arrows.
+    pub fn can_back(&self) -> bool {
+        self.pos > 0 || self.want.is_some_and(|w| w < self.pos)
+    }
+
+    pub fn can_forward(&self) -> bool {
+        self.want.is_some_and(|w| w > self.pos) || self.pos + 1 < self.pages.len()
+    }
+
     /// The page one step back, if any. `pos` moves when `go` sees it shown.
     pub fn back(&mut self) -> Option<String> {
         self.want = Some(self.pos.checked_sub(1)?);
@@ -216,7 +225,9 @@ mod tests {
             .enumerate()
             .map(|(i, (ty, t))| blk(&format!("b{i}"), "p", ty, json!({ "rich_text": rt(t) })))
             .collect();
-        store.upsert_page(&crate::testkit::page_in("p", None)).unwrap();
+        store
+            .upsert_page(&crate::testkit::page_in("p", None))
+            .unwrap();
         store.replace_children("p", "p", &kids).unwrap();
         crate::outline::flatten(&store, "p").unwrap()
     }
@@ -229,7 +240,10 @@ mod tests {
             ("paragraph", "GRUESSE again"),
             ("paragraph", "ÜBER"),
         ]);
-        let mut f = Find { query: "gruesse".into(), ..Default::default() };
+        let mut f = Find {
+            query: "gruesse".into(),
+            ..Default::default()
+        };
         f.search(&r);
         assert_eq!(f.hits, [0, 2], "umlaut and case folded");
         assert_eq!(f.cur, 0);
@@ -250,8 +264,15 @@ mod tests {
 
     #[test]
     fn the_current_match_follows_its_row_when_rows_move() {
-        let r = rows(&[("paragraph", "hit"), ("paragraph", "hit"), ("paragraph", "hit")]);
-        let mut f = Find { query: "hit".into(), ..Default::default() };
+        let r = rows(&[
+            ("paragraph", "hit"),
+            ("paragraph", "hit"),
+            ("paragraph", "hit"),
+        ]);
+        let mut f = Find {
+            query: "hit".into(),
+            ..Default::default()
+        };
         f.search(&r);
         f.step(1, &r);
         assert_eq!(f.cur, 1);
@@ -270,7 +291,11 @@ mod tests {
         ]);
         assert_eq!(
             headings(&r),
-            [(0, 1, "One".to_string()), (2, 3, "Deep".to_string()), (3, 2, "Two".to_string())]
+            [
+                (0, 1, "One".to_string()),
+                (2, 3, "Deep".to_string()),
+                (3, 2, "Two".to_string())
+            ]
         );
     }
 }

@@ -703,12 +703,18 @@ impl Comment {
     fn from_value(v: Value) -> Result<Self> {
         let parent = Parent::from_value(v.get("parent").cloned().unwrap_or(Value::Null))?;
         if !matches!(parent, Parent::Page(_) | Parent::Block(_)) {
-            return Err(Error::Invalid("comment parent is not a page or block".into()));
+            return Err(Error::Invalid(
+                "comment parent is not a page or block".into(),
+            ));
         }
         // lenient: a rich text item of an unknown type is skipped, not fatal
         let rich_text = v["rich_text"]
             .as_array()
-            .map(|a| a.iter().filter_map(|r| RichText::from_value(r.clone()).ok()).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| RichText::from_value(r.clone()).ok())
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(Comment {
             id: str_field(&v, "id")?,
@@ -716,7 +722,10 @@ impl Comment {
             parent,
             created_time: time_field(&v, "created_time")?,
             last_edited_time: time_field(&v, "last_edited_time")?,
-            created_by: v["created_by"]["id"].as_str().unwrap_or_default().to_string(),
+            created_by: v["created_by"]["id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
             rich_text,
             raw: v,
         })
@@ -734,8 +743,9 @@ impl Comment {
             out = json!({});
         }
         out["rich_text"] = json!(self.rich_text);
-        out["last_edited_time"] =
-            json!(self.last_edited_time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        out["last_edited_time"] = json!(self
+            .last_edited_time
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
         out
     }
 }
@@ -1066,6 +1076,25 @@ impl SearchResult {
     }
 }
 
+// ------------------------------------------------- private-backend bridges
+
+/// Parse the official-shaped JSON the private backend builds.
+pub(crate) fn page_from_json(v: Value) -> Result<Page> {
+    Page::from_value(v)
+}
+
+pub(crate) fn block_from_json(v: Value) -> Result<Block> {
+    Block::from_value(v)
+}
+
+pub(crate) fn comment_from_json(v: Value) -> Result<Comment> {
+    Comment::from_value(v)
+}
+
+pub(crate) fn data_source_from_json(v: Value) -> Result<DataSource> {
+    DataSource::from_value(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1109,13 +1138,24 @@ mod tests {
 
     #[test]
     fn heading_4_toggle_headings_and_colours() {
-        let h4 = BlockKind::parse("heading_4", &json!({ "rich_text": [rt("x")], "color": "red" })).unwrap();
+        let h4 = BlockKind::parse(
+            "heading_4",
+            &json!({ "rich_text": [rt("x")], "color": "red" }),
+        )
+        .unwrap();
         assert!(matches!(h4, BlockKind::Heading4(_)) && h4.type_name() == "heading_4");
         assert_eq!(h4.to_request_json().unwrap()["heading_4"]["color"], "red");
         assert_eq!(TargetKind::of(&h4), None, "not offered in the menu");
-        let tg = BlockKind::parse("heading_2", &json!({ "rich_text": [rt("x")], "is_toggleable": true })).unwrap();
+        let tg = BlockKind::parse(
+            "heading_2",
+            &json!({ "rich_text": [rt("x")], "is_toggleable": true }),
+        )
+        .unwrap();
         assert_eq!(TargetKind::of(&tg), Some(TargetKind::ToggleHeading2));
-        let made = TargetKind::ToggleHeading3.block_kind(TextBlock { rich_text: vec![], color: "default".into() });
+        let made = TargetKind::ToggleHeading3.block_kind(TextBlock {
+            rich_text: vec![],
+            color: "default".into(),
+        });
         assert!(matches!(&made, BlockKind::Heading3(h) if h.is_toggleable));
         let mut k = BlockKind::parse("paragraph", &json!({ "rich_text": [rt("x")] })).unwrap();
         k.set_color("pink_background").unwrap();

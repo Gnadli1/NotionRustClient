@@ -9,8 +9,8 @@
 //! re-queues the op against what it finds. Keep theirs is Discard.
 
 use eframe::egui::{
-    self, text::LayoutJob, Align2, Button, Color32, Context, Id, Label, RichText, ScrollArea, Stroke,
-    TextEdit, TextFormat, Window,
+    self, text::LayoutJob, Align2, Button, Color32, Context, Id, Label, RichText, ScrollArea,
+    Stroke, TextEdit, TextFormat, Window,
 };
 use notion_core::sync::Fetched;
 
@@ -85,7 +85,12 @@ const MAX_CELLS: usize = 1_000_000;
 pub fn word_diff(mine: &str, theirs: &str) -> Vec<(Seg, String)> {
     let (a, b) = (tokens(mine), tokens(theirs));
     let pre = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-    let suf = a[pre..].iter().rev().zip(b[pre..].iter().rev()).take_while(|(x, y)| x == y).count();
+    let suf = a[pre..]
+        .iter()
+        .rev()
+        .zip(b[pre..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
     let (am, bm) = (&a[pre..a.len() - suf], &b[pre..b.len() - suf]);
     let mut out: Vec<(Seg, String)> = Vec::new();
     let mut put = |seg, t: &str| match out.last_mut() {
@@ -139,7 +144,11 @@ fn side(segs: &[(Seg, String)], own: Seg, mark: Color32, c: &Colors) -> LayoutJo
             TextFormat {
                 color: c.text,
                 background: if marked { mark } else { Color32::TRANSPARENT },
-                underline: if marked { Stroke::new(1.0, c.text) } else { Stroke::NONE },
+                underline: if marked {
+                    Stroke::new(1.0, c.text)
+                } else {
+                    Stroke::NONE
+                },
                 ..Default::default()
             },
         );
@@ -184,7 +193,10 @@ impl App {
     /// Keep mine (`merged` None) or Use merged. Not while a push runs, nor
     /// when Notion no longer has the object.
     pub(crate) fn resolve(&mut self, op: i64, merged: Option<String>) {
-        let gone = matches!(self.conflict.as_ref().and_then(|p| p.fetched.as_ref()), Some(Fetched::Gone));
+        let gone = matches!(
+            self.conflict.as_ref().and_then(|p| p.fetched.as_ref()),
+            Some(Fetched::Gone)
+        );
         if gone || self.sent.iter().any(|c| matches!(c, Cmd::Resolve { .. })) {
             return;
         }
@@ -301,11 +313,22 @@ mod tests {
     fn word_diff_marks_insertions_and_deletions() {
         use Seg::*;
         assert_eq!(d("a b c", "a b c"), [s(Same, "a b c")]);
-        assert_eq!(d("a b c", "a c"), [s(Same, "a "), s(Mine, "b "), s(Same, "c")]);
-        assert_eq!(d("a c", "a b c"), [s(Same, "a "), s(Theirs, "b "), s(Same, "c")]);
+        assert_eq!(
+            d("a b c", "a c"),
+            [s(Same, "a "), s(Mine, "b "), s(Same, "c")]
+        );
+        assert_eq!(
+            d("a c", "a b c"),
+            [s(Same, "a "), s(Theirs, "b "), s(Same, "c")]
+        );
         assert_eq!(
             d("the quick fox", "the slow fox"),
-            [s(Same, "the "), s(Theirs, "slow"), s(Mine, "quick"), s(Same, " fox")]
+            [
+                s(Same, "the "),
+                s(Theirs, "slow"),
+                s(Mine, "quick"),
+                s(Same, " fox")
+            ]
         );
         assert_eq!(d("", "x y"), [s(Theirs, "x y")]);
         assert_eq!(d("x y", ""), [s(Mine, "x y")]);
@@ -316,7 +339,12 @@ mod tests {
     fn word_diff_pieces_rebuild_both_texts() {
         let (m, t) = ("one  two\nthree four", "one two three\n five four six");
         let segs = d(m, t);
-        let join = |skip: Seg| segs.iter().filter(|(s, _)| *s != skip).map(|(_, x)| x.as_str()).collect::<String>();
+        let join = |skip: Seg| {
+            segs.iter()
+                .filter(|(s, _)| *s != skip)
+                .map(|(_, x)| x.as_str())
+                .collect::<String>()
+        };
         assert_eq!(join(Seg::Theirs), m);
         assert_eq!(join(Seg::Mine), t);
     }
@@ -324,13 +352,19 @@ mod tests {
     fn conflict_win() -> (Win, i64) {
         let mut w = Win::with_texts(&["a", "b"]);
         let op = sync::local_edit_text(&w.app.store, "p-1", "my text").unwrap();
-        w.app.store.mark_op(op, OpStatus::Conflict, Some("remote edited")).unwrap();
+        w.app
+            .store
+            .mark_op(op, OpStatus::Conflict, Some("remote edited"))
+            .unwrap();
         w.app.refresh();
         (w, op)
     }
 
     fn text(mine: &str, theirs: &str) -> Fetched {
-        Fetched::Text { mine: mine.into(), theirs: theirs.into() }
+        Fetched::Text {
+            mine: mine.into(),
+            theirs: theirs.into(),
+        }
     }
 
     /// The list opens the panel (Enter on the selected entry), which asks for
@@ -341,18 +375,36 @@ mod tests {
         w.app.apply(Action::ToggleProblems);
         w.frames(vec![]);
         w.frames(vec![]); // an area is drawn from its second frame
-        assert!(w.shown.contains("Resolve…") && w.shown.contains("Keep theirs"), "{}", w.shown);
+        assert!(
+            w.shown.contains("Resolve…") && w.shown.contains("Keep theirs"),
+            "{}",
+            w.shown
+        );
         w.press(Key::Enter, Modifiers::NONE);
         assert!(w.app.conflict.is_some() && !w.app.problems_open);
         assert_eq!(w.cmds(), [Cmd::Fetch { op }]);
         w.frames(vec![]);
         assert!(w.shown.contains("Asking Notion") && w.shown.contains("Keep theirs"));
-        w.answer(WEvent::Fetched { op, what: text("my text", "their text") });
+        w.answer(WEvent::Fetched {
+            op,
+            what: text("my text", "their text"),
+        });
         w.frames(vec![]);
-        for t in ["Yours", "Notion's", "Keep theirs", "Keep mine", "Use merged", "Merged"] {
+        for t in [
+            "Yours",
+            "Notion's",
+            "Keep theirs",
+            "Keep mine",
+            "Use merged",
+            "Merged",
+        ] {
             assert!(w.shown.contains(t), "{t}: {}", w.shown);
         }
-        assert_eq!(w.app.conflict.as_ref().unwrap().merged, "my text", "starts as yours");
+        assert_eq!(
+            w.app.conflict.as_ref().unwrap().merged,
+            "my text",
+            "starts as yours"
+        );
 
         // the Resolve… button opens it too, and only for a conflict
         w.app.conflict = None;
@@ -368,11 +420,21 @@ mod tests {
         let (mut w, op) = conflict_win();
         w.app.apply(Action::Resolve(op));
         w.cmds();
-        w.answer(WEvent::Fetched { op, what: text("my text", "their text") });
+        w.answer(WEvent::Fetched {
+            op,
+            what: text("my text", "their text"),
+        });
 
         // Keep mine
         w.app.apply(Action::KeepMine(op));
-        assert_eq!(w.cmds(), [Cmd::Resolve { op, merged: None, seen: Some("their text".into()) }]);
+        assert_eq!(
+            w.cmds(),
+            [Cmd::Resolve {
+                op,
+                merged: None,
+                seen: Some("their text".into())
+            }]
+        );
         w.app.apply(Action::KeepMine(op));
         assert!(w.cmds().is_empty(), "one at a time");
         w.answer(WEvent::Error("boom".into()));
@@ -383,10 +445,24 @@ mod tests {
         w.app.conflict.as_mut().unwrap().merged = "my and their text".into();
         w.app.apply(Action::Merge(op));
         let merged = Some("my and their text".to_string());
-        assert_eq!(w.cmds(), [Cmd::Resolve { op, merged: merged.clone(), seen: Some("their text".into()) }]);
+        assert_eq!(
+            w.cmds(),
+            [Cmd::Resolve {
+                op,
+                merged: merged.clone(),
+                seen: Some("their text".into())
+            }]
+        );
         w.answer(WEvent::Error("boom".into()));
         w.press(Key::Enter, Modifiers::CTRL);
-        assert_eq!(w.cmds(), [Cmd::Resolve { op, merged, seen: Some("their text".into()) }]);
+        assert_eq!(
+            w.cmds(),
+            [Cmd::Resolve {
+                op,
+                merged,
+                seen: Some("their text".into())
+            }]
+        );
         w.answer(WEvent::Resolved(op));
         assert!(w.app.conflict.is_none() && w.app.sent.is_empty());
         assert!(w.app.info.as_deref().unwrap().contains("re-queued"));
@@ -396,7 +472,13 @@ mod tests {
         w.cmds();
         w.app.apply(Action::Discard(op));
         assert!(w.app.conflict.is_none());
-        assert_eq!(w.cmds(), [Cmd::Pull { id: "p".into(), force: true }]);
+        assert_eq!(
+            w.cmds(),
+            [Cmd::Pull {
+                id: "p".into(),
+                force: true
+            }]
+        );
     }
 
     #[test]
@@ -404,15 +486,24 @@ mod tests {
         let (mut w, op) = conflict_win();
         w.app.apply(Action::Resolve(op));
         w.cmds();
-        w.answer(WEvent::Fetched { op, what: text("my text", "their text") });
+        w.answer(WEvent::Fetched {
+            op,
+            what: text("my text", "their text"),
+        });
         w.frames(vec![]);
         w.press(Key::Escape, Modifiers::NONE);
         assert!(w.app.conflict.is_none());
         assert!(w.cmds().is_empty());
-        assert_eq!(w.app.store.ops_by_status(OpStatus::Conflict).unwrap().len(), 1);
+        assert_eq!(
+            w.app.store.ops_by_status(OpStatus::Conflict).unwrap().len(),
+            1
+        );
         assert_eq!(w.app.store.queued_ops().unwrap().len(), 0);
         // the late answer of the fetch is ignored
-        w.answer(WEvent::Fetched { op, what: text("x", "y") });
+        w.answer(WEvent::Fetched {
+            op,
+            what: text("x", "y"),
+        });
         assert!(w.app.conflict.is_none());
     }
 
@@ -421,10 +512,21 @@ mod tests {
         let (mut w, op) = conflict_win();
         w.app.apply(Action::Resolve(op));
         w.cmds();
-        w.answer(WEvent::Fetched { op, what: Fetched::Gone });
+        w.answer(WEvent::Fetched {
+            op,
+            what: Fetched::Gone,
+        });
         w.frames(vec![]);
-        assert!(w.shown.contains("Keep theirs") && w.shown.contains("no longer has"), "{}", w.shown);
-        assert!(!w.shown.contains("Keep mine") && !w.shown.contains("Use merged"), "{}", w.shown);
+        assert!(
+            w.shown.contains("Keep theirs") && w.shown.contains("no longer has"),
+            "{}",
+            w.shown
+        );
+        assert!(
+            !w.shown.contains("Keep mine") && !w.shown.contains("Use merged"),
+            "{}",
+            w.shown
+        );
         w.app.apply(Action::KeepMine(op));
         w.press(Key::Enter, Modifiers::CTRL);
         assert!(w.cmds().is_empty());
@@ -437,14 +539,21 @@ mod tests {
         w.answer(WEvent::Error("offline: NOTION_TOKEN not set".into()));
         assert!(w.app.sent.is_empty());
         w.frames(vec![]);
-        assert!(w.shown.contains("Could not get Notion's version"), "{}", w.shown);
+        assert!(
+            w.shown.contains("Could not get Notion's version"),
+            "{}",
+            w.shown
+        );
     }
 
     #[test]
     fn up_down_select_in_the_list() {
         let (mut w, op) = conflict_win();
         let op2 = sync::local_edit_text(&w.app.store, "p-0", "x").unwrap();
-        w.app.store.mark_op(op2, OpStatus::Failed, Some("400")).unwrap();
+        w.app
+            .store
+            .mark_op(op2, OpStatus::Failed, Some("400"))
+            .unwrap();
         w.app.refresh();
         w.app.apply(Action::ToggleProblems);
         w.frames(vec![]);
@@ -462,13 +571,34 @@ mod tests {
         use Seg::*;
         assert_eq!(
             d("start a b end", "start x end"),
-            [s(Same, "start "), s(Theirs, "x"), s(Mine, "a b"), s(Same, " end")]
+            [
+                s(Same, "start "),
+                s(Theirs, "x"),
+                s(Mine, "a b"),
+                s(Same, " end")
+            ]
         );
         // far over the table cap: each side is marked whole, the ends stay common
-        let words = |p: &str| (0..1500).map(|i| format!("{p}{i}")).collect::<Vec<_>>().join(" ");
-        let (m, t) = (format!("head {} tail", words("m")), format!("head {} tail", words("t")));
+        let words = |p: &str| {
+            (0..1500)
+                .map(|i| format!("{p}{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let (m, t) = (
+            format!("head {} tail", words("m")),
+            format!("head {} tail", words("t")),
+        );
         let segs = d(&m, &t);
-        assert_eq!(segs, [s(Same, "head "), s(Theirs, &words("t")), s(Mine, &words("m")), s(Same, " tail")]);
+        assert_eq!(
+            segs,
+            [
+                s(Same, "head "),
+                s(Theirs, &words("t")),
+                s(Mine, &words("m")),
+                s(Same, " tail")
+            ]
+        );
     }
 
     #[test]
@@ -476,18 +606,27 @@ mod tests {
         let (mut w, op) = conflict_win();
         w.app.apply(Action::Resolve(op));
         w.cmds();
-        w.answer(WEvent::Fetched { op, what: text("my text", "their text") });
+        w.answer(WEvent::Fetched {
+            op,
+            what: text("my text", "their text"),
+        });
         w.app.apply(Action::KeepMine(op));
         w.cmds();
         w.answer(WEvent::Error("Notion changed again: review it".into()));
         assert_eq!(w.cmds(), [Cmd::Fetch { op }], "shows the new text");
         assert!(w.app.conflict.as_ref().unwrap().fetched.is_none());
-        w.answer(WEvent::Fetched { op, what: text("my text", "their newer text") });
+        w.answer(WEvent::Fetched {
+            op,
+            what: text("my text", "their newer text"),
+        });
         assert!(w.app.sent.is_empty());
 
         // A's fetch fails late, after B's panel opened
         let b = sync::local_edit_text(&w.app.store, "p-0", "other").unwrap();
-        w.app.store.mark_op(b, OpStatus::Conflict, Some("x")).unwrap();
+        w.app
+            .store
+            .mark_op(b, OpStatus::Conflict, Some("x"))
+            .unwrap();
         w.app.refresh();
         w.app.conflict = None;
         w.app.apply(Action::Resolve(op));
@@ -495,7 +634,13 @@ mod tests {
         w.app.apply(Action::Resolve(b));
         w.cmds();
         w.answer(WEvent::Error("500".into())); // A's
-        assert_eq!(w.app.conflict.as_ref().map(|p| (p.op, p.error_fetching.clone())), Some((b, None)));
+        assert_eq!(
+            w.app
+                .conflict
+                .as_ref()
+                .map(|p| (p.op, p.error_fetching.clone())),
+            Some((b, None))
+        );
         w.answer(WEvent::Error("500".into())); // B's own
         assert!(w.app.conflict.as_ref().unwrap().error_fetching.is_some());
     }
@@ -505,7 +650,10 @@ mod tests {
         let (mut w, op) = conflict_win();
         w.app.apply(Action::Resolve(op));
         w.cmds();
-        w.answer(WEvent::Fetched { op, what: text("my text", "their text") });
+        w.answer(WEvent::Fetched {
+            op,
+            what: text("my text", "their text"),
+        });
         w.app.conflict.as_mut().unwrap().merged = "  ".into();
         w.app.apply(Action::Merge(op));
         assert!(w.cmds().is_empty());
@@ -518,20 +666,32 @@ mod tests {
         let (mut w, op) = conflict_win();
         w.app.apply(Action::Resolve(op));
         w.cmds();
-        w.answer(WEvent::Fetched { op, what: text("my text", "their text") });
+        w.answer(WEvent::Fetched {
+            op,
+            what: text("my text", "their text"),
+        });
         w.frames(vec![]);
         w.app.open_comments(None);
         w.frames(vec![]);
-        w.ctx.memory_mut(|m| m.request_focus(egui::Id::unique(("comment-box", "new", ""))));
+        w.ctx
+            .memory_mut(|m| m.request_focus(egui::Id::unique(("comment-box", "new", ""))));
         w.frames(vec![]);
         w.type_text("hello");
         w.cmds();
         w.send(key_mod(Key::Enter, Modifiers::CTRL));
         assert!(
-            w.app.store.queued_ops().unwrap().iter().any(|o| matches!(o.kind, notion_core::ops::OpKind::CreateComment { .. })),
+            w.app
+                .store
+                .queued_ops()
+                .unwrap()
+                .iter()
+                .any(|o| matches!(o.kind, notion_core::ops::OpKind::CreateComment { .. })),
             "the comment was queued"
         );
-        assert!(w.cmds().iter().all(|c| !matches!(c, Cmd::Resolve { .. })), "no merge");
+        assert!(
+            w.cmds().iter().all(|c| !matches!(c, Cmd::Resolve { .. })),
+            "no merge"
+        );
         assert!(w.app.conflict.is_some());
     }
 }
