@@ -63,53 +63,6 @@ impl std::fmt::Debug for BrowserSession {
     }
 }
 
-/// The OAuth app the user creates once in Notion's Developer portal. Its
-/// client secret is not a workspace key; it authorizes the login flow itself.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct OAuthApp {
-    pub client_id: String,
-    pub client_secret: String,
-    #[serde(default = "default_redirect")]
-    pub redirect_uri: String,
-}
-
-fn default_redirect() -> String {
-    notion_core::oauth::DEFAULT_REDIRECT.to_string()
-}
-
-impl Default for OAuthApp {
-    fn default() -> Self {
-        OAuthApp {
-            client_id: String::new(),
-            client_secret: String::new(),
-            redirect_uri: default_redirect(),
-        }
-    }
-}
-
-impl std::fmt::Debug for OAuthApp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OAuthApp")
-            .field("client_id", &self.client_id)
-            .field(
-                "client_secret",
-                &if self.client_secret.is_empty() {
-                    ""
-                } else {
-                    "<redacted>"
-                },
-            )
-            .field("redirect_uri", &self.redirect_uri)
-            .finish()
-    }
-}
-
-impl OAuthApp {
-    pub fn is_configured(&self) -> bool {
-        !self.client_id.trim().is_empty() && !self.client_secret.trim().is_empty()
-    }
-}
-
 /// One workspace. A personal access token or an internal-connection token
 /// works; the token is stored in `profiles.json`, so keep that file private.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -133,12 +86,9 @@ pub struct Profile {
     /// Overrides the per-profile session file name, relative to the config dir.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_file: Option<String>,
-    /// Set for an OAuth login: the workspace it was authorized in.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_id: Option<String>,
-    /// Set for an OAuth login; lets the app refresh the access token later.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_token: Option<String>,
+    /// Built from `NOTION_TOKEN`; never written to disk.
+    #[serde(skip)]
+    pub from_env: bool,
 }
 
 impl std::fmt::Debug for Profile {
@@ -158,8 +108,6 @@ impl std::fmt::Debug for Profile {
             .field("user_id", &self.user_id)
             .field("cache_file", &self.cache_file)
             .field("session_file", &self.session_file)
-            .field("workspace_id", &self.workspace_id)
-            .field("oauth", &self.refresh_token.is_some())
             .finish()
     }
 }
@@ -175,8 +123,7 @@ impl Profile {
             user_id: None,
             cache_file: None,
             session_file: None,
-            workspace_id: None,
-            refresh_token: None,
+            from_env: false,
         }
     }
 
@@ -184,12 +131,15 @@ impl Profile {
         !self.token.trim().is_empty()
     }
 
+    fn cache_name(&self) -> String {
+        self.cache_file
+            .clone()
+            .unwrap_or_else(|| format!("cache-{}.db", paths::slug(&self.name)))
+    }
+
     /// The SQLite file of this workspace.
     pub fn cache_path(&self, data_dir: Option<&Path>) -> Option<PathBuf> {
-        let file = self
-            .cache_file
-            .clone()
-            .unwrap_or_else(|| format!("cache-{}.db", paths::slug(&self.name)));
+        let file = self.cache_name();
         let path = PathBuf::from(file);
         if path.is_absolute() {
             Some(path)
@@ -207,7 +157,7 @@ impl Profile {
 }
 
 /// The add/edit workspace dialog's fields.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Form {
     /// The name before an edit; None when adding.
     pub original: Option<String>,
@@ -215,6 +165,27 @@ pub struct Form {
     pub token: String,
     pub user_id: String,
     pub error: Option<String>,
+    /// Set once the dialog has taken the focus, so it does so only on opening.
+    pub focused: bool,
+}
+
+impl std::fmt::Debug for Form {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Form")
+            .field("original", &self.original)
+            .field("name", &self.name)
+            .field(
+                "token",
+                &if self.token.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("user_id", &self.user_id)
+            .field("error", &self.error)
+            .finish()
+    }
 }
 
 impl Form {
@@ -229,6 +200,7 @@ impl Form {
             token: p.token.clone(),
             user_id: p.user_id.clone().unwrap_or_default(),
             error: None,
+            focused: false,
         }
     }
 
@@ -262,8 +234,7 @@ impl Form {
             user_id: Some(self.user_id.trim().to_string()).filter(|u| !u.is_empty()),
             cache_file,
             session_file,
-            workspace_id: before.and_then(|p| p.workspace_id.clone()),
-            refresh_token: before.and_then(|p| p.refresh_token.clone()),
+            from_env: false,
         })
     }
 }
@@ -273,22 +244,58 @@ impl Form {
 pub struct Profiles {
     pub active: Option<String>,
     pub profiles: Vec<Profile>,
-    /// The public OAuth integration used by "Sign in with Notion".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oauth: Option<OAuthApp>,
     /// The browser-session cookie used by browser-mode profiles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser: Option<BrowserSession>,
+    /// `profiles.json` exists but could not be read; `save` refuses so the
+    /// original is not overwritten.
+    #[serde(skip)]
+    locked: bool,
+}
+
+/// Copies an unreadable `profiles.json` to `profiles.json.bad` (mode 600).
+fn backup_bad(path: &Path) {
+    let bad = path.with_extension("json.bad");
+    if let Ok(bytes) = std::fs::read(path) {
+        let _ = write_private(&bad, &bytes);
+    }
+}
+
+/// Writes `bytes` to `path`, mode 600 on Unix even if the file already existed.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 impl Profiles {
     /// Reads `profiles.json`; a missing file falls back to `NOTION_TOKEN`
     /// without writing anything.
     pub fn load(dir: &Path) -> (Self, Option<String>) {
+        Self::load_with(dir, Self::from_env())
+    }
+
+    /// `load` with the env profile passed in, so tests needn't touch the env.
+    fn load_with(dir: &Path, env: Profiles) -> (Self, Option<String>) {
         let path = dir.join(FILE);
+        let mut saved_active = None;
         let (mut profiles, problem) = match std::fs::read_to_string(&path) {
             Ok(src) => match serde_json::from_str::<Profiles>(&src) {
                 Ok(mut p) => {
+                    saved_active = p.active.clone();
                     p.normalize();
                     (p, None)
                 }
@@ -297,14 +304,31 @@ impl Profiles {
                     Some(format!("{FILE}: {e}; no workspaces loaded")),
                 ),
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Self::from_env(), None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (env.clone(), None),
             Err(e) => (
-                Self::from_env(),
+                env.clone(),
                 Some(format!("cannot read {}: {e}", path.display())),
             ),
         };
         if profiles.profiles.is_empty() {
-            profiles = Self::from_env();
+            profiles = env.clone();
+        }
+        // the launcher's NOTION_TOKEN keeps its in-memory Default workspace
+        // next to the saved ones (never persisted)
+        if let Some(env) = env.profiles.into_iter().next() {
+            if !profiles.profiles.iter().any(|p| p.token == env.token)
+                && profiles.get(&env.name).is_none()
+            {
+                // save() drops the env profile but keeps `active` pointing at it
+                if saved_active.as_deref() == Some(env.name.as_str()) {
+                    profiles.active = saved_active;
+                }
+                profiles.profiles.push(env);
+            }
+        }
+        if problem.is_some() && path.exists() {
+            profiles.locked = true;
+            backup_bad(&path);
         }
         (profiles, problem)
     }
@@ -321,6 +345,10 @@ impl Profiles {
         let user_id = std::env::var("NOTION_USER_ID")
             .ok()
             .filter(|u| !u.trim().is_empty());
+        Self::from_token(token, user_id)
+    }
+
+    fn from_token(token: String, user_id: Option<String>) -> Self {
         Profiles {
             active: Some(DEFAULT_NAME.to_string()),
             profiles: vec![Profile {
@@ -331,11 +359,10 @@ impl Profiles {
                 user_id,
                 cache_file: Some(LEGACY_CACHE.to_string()),
                 session_file: Some(LEGACY_SESSION.to_string()),
-                workspace_id: None,
-                refresh_token: None,
+                from_env: true,
             }],
-            oauth: None,
             browser: None,
+            locked: false,
         }
     }
 
@@ -395,16 +422,10 @@ impl Profiles {
                 user_id: user_id.clone(),
                 cache_file: existing.as_ref().and_then(|p| p.cache_file.clone()),
                 session_file: existing.as_ref().and_then(|p| p.session_file.clone()),
-                workspace_id: None,
-                refresh_token: None,
+                from_env: false,
             };
             self.upsert(profile);
             names.push(name);
-        }
-        if self.active_profile().map(|p| p.kind) != Some(AuthKind::Browser) {
-            if let Some(first) = names.first() {
-                self.set_active(first);
-            }
         }
         names
     }
@@ -430,10 +451,39 @@ impl Profiles {
     }
 
     /// Replaces the profile with the same name, or adds it.
-    pub fn upsert(&mut self, profile: Profile) {
-        match self.profiles.iter_mut().find(|p| p.name == profile.name) {
-            Some(p) => *p = profile,
-            None => self.profiles.push(profile),
+    /// A new profile whose cache/session file would collide with another's
+    /// (same slug, truncated name, a renamed profile's pinned file) gets a
+    /// unique pinned file stem: `slug-2`, `slug-3`, ...
+    pub fn upsert(&mut self, mut profile: Profile) {
+        match self.profiles.iter().position(|p| p.name == profile.name) {
+            Some(i) => self.profiles[i] = profile,
+            None => {
+                let used = |f: fn(&Profile) -> String, name: &str| {
+                    self.profiles
+                        .iter()
+                        .any(|p| f(p).eq_ignore_ascii_case(name))
+                };
+                let base = paths::slug(&profile.name);
+                let mut stem = base.clone();
+                let mut n = 2;
+                loop {
+                    let cache = format!("cache-{stem}.db");
+                    let session = format!("session-egui-{stem}.json");
+                    let taken = (profile.cache_file.is_none() && used(Profile::cache_name, &cache))
+                        || (profile.session_file.is_none()
+                            && used(Profile::session_file, &session));
+                    if !taken {
+                        if stem != base {
+                            profile.cache_file.get_or_insert(cache);
+                            profile.session_file.get_or_insert(session);
+                        }
+                        break;
+                    }
+                    stem = format!("{base}-{n}");
+                    n += 1;
+                }
+                self.profiles.push(profile);
+            }
         }
         self.normalize();
     }
@@ -443,53 +493,6 @@ impl Profiles {
         if self.active.as_deref() == Some(name) {
             self.active = self.profiles.first().map(|p| p.name.clone());
         }
-    }
-
-    /// Adds or updates the profile from an OAuth token response. An existing
-    /// profile for the same workspace id keeps its cache and session; a new
-    /// workspace gets a unique name.
-    pub fn upsert_oauth(
-        &mut self,
-        token: &notion_core::oauth::TokenResponse,
-        fallback: &str,
-    ) -> Profile {
-        let base = token.workspace().unwrap_or(fallback).to_string();
-        let existing = token
-            .workspace_id
-            .as_deref()
-            .and_then(|id| {
-                self.profiles
-                    .iter()
-                    .find(|p| p.workspace_id.as_deref() == Some(id))
-            })
-            .cloned()
-            .or_else(|| self.profiles.iter().find(|p| p.name == base).cloned());
-        let name = existing.as_ref().map_or_else(
-            || {
-                let mut name = base.clone();
-                let mut n = 2;
-                while self.profiles.iter().any(|p| p.name == name) {
-                    name = format!("{base} ({n})");
-                    n += 1;
-                }
-                name
-            },
-            |p| p.name.clone(),
-        );
-        let profile = Profile {
-            name: name.clone(),
-            token: token.access_token.clone(),
-            kind: AuthKind::Official,
-            space_id: None,
-            user_id: token.user_id(),
-            cache_file: existing.as_ref().and_then(|p| p.cache_file.clone()),
-            session_file: existing.as_ref().and_then(|p| p.session_file.clone()),
-            workspace_id: token.workspace_id.clone(),
-            refresh_token: token.refresh_token.clone(),
-        };
-        self.upsert(profile.clone());
-        self.set_active(&name);
-        profile
     }
 
     /// Trims names and tokens, drops unnamed profiles, keeps the first of
@@ -514,16 +517,6 @@ impl Profiles {
                 .take()
                 .map(|f| f.trim().to_string())
                 .filter(|f| !f.is_empty());
-            p.workspace_id = p
-                .workspace_id
-                .take()
-                .map(|w| w.trim().to_string())
-                .filter(|w| !w.is_empty());
-            p.refresh_token = p
-                .refresh_token
-                .take()
-                .map(|r| r.trim().to_string())
-                .filter(|r| !r.is_empty());
             if p.name.is_empty() || seen.iter().any(|n| n == &p.name) {
                 return false;
             }
@@ -534,19 +527,6 @@ impl Profiles {
         self.active = active
             .filter(|a| self.get(a).is_some())
             .or_else(|| self.profiles.first().map(|p| p.name.clone()));
-        let mut drop_oauth = false;
-        if let Some(o) = self.oauth.as_mut() {
-            o.client_id = o.client_id.trim().to_string();
-            o.client_secret = o.client_secret.trim().to_string();
-            o.redirect_uri = o.redirect_uri.trim().to_string();
-            if o.redirect_uri.is_empty() {
-                o.redirect_uri = default_redirect();
-            }
-            drop_oauth = o.client_id.is_empty() && o.client_secret.is_empty();
-        }
-        if drop_oauth {
-            self.oauth = None;
-        }
         let mut drop_browser = false;
         if let Some(b) = self.browser.as_mut() {
             b.token_v2 = b.token_v2.trim().to_string();
@@ -562,17 +542,26 @@ impl Profiles {
         }
     }
 
-    /// Writes `profiles.json` atomically. On Unix the file is mode 600: it
-    /// holds the tokens.
+    /// Writes `profiles.json` atomically. On Unix the file is mode 600 (dir
+    /// 700): it holds the tokens. Env-token profiles are not written.
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dir)?;
-        let tmp = dir.join(format!("{FILE}.tmp"));
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        if self.locked {
+            return Err(std::io::Error::other(
+                "profiles.json could not be read; fix or remove it",
+            ));
+        }
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
         }
+        b.create(dir)?;
+        let mut out = self.clone();
+        out.profiles.retain(|p| !p.from_env);
+        let tmp = dir.join(format!("{FILE}.tmp"));
+        write_private(&tmp, &serde_json::to_vec_pretty(&out)?)?;
         std::fs::rename(tmp, dir.join(FILE))
     }
 }
@@ -588,25 +577,15 @@ mod tests {
         p.upsert(Profile::new(" Personal ", " ntn_a "));
         p.upsert(Profile::new("Shared", "ntn_b"));
         p.set_active("Shared");
-        p.oauth = Some(OAuthApp {
-            client_id: " id ".into(),
-            client_secret: " secret ".into(),
-            redirect_uri: " http://127.0.0.1:8765/callback ".into(),
-        });
         p.save(dir.path()).unwrap();
 
-        let (got, problem) = Profiles::load(dir.path());
+        let (got, problem) = Profiles::load_with(dir.path(), Profiles::default());
         assert_eq!(problem, None);
         assert_eq!(got.active.as_deref(), Some("Shared"));
         assert_eq!(got.profiles[0].token, "ntn_a");
         assert_eq!(
             got.active_profile().map(|p| p.name.as_str()),
             Some("Shared")
-        );
-        let oauth = got.oauth.as_ref().unwrap();
-        assert_eq!(
-            (oauth.client_id.as_str(), oauth.client_secret.as_str()),
-            ("id", "secret")
         );
 
         p.remove("Shared");
@@ -617,11 +596,25 @@ mod tests {
     fn bad_file_does_not_leak_the_token_in_the_message() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(FILE), "{ nope").unwrap();
-        let (got, problem) = Profiles::load(dir.path());
+        let (got, problem) = Profiles::load_with(dir.path(), Profiles::default());
         assert!(got.profiles.is_empty());
         let problem = problem.unwrap();
         assert!(problem.contains(FILE));
         assert!(!problem.contains("ntn_"));
+    }
+
+    #[test]
+    fn an_old_oauth_key_is_ignored_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE),
+            r#"{"active":"A","profiles":[{"name":"A","token":"ntn_a","workspace_id":"w","refresh_token":"r"}],
+               "oauth":{"client_id":"id","client_secret":"s","redirect_uri":"http://127.0.0.1:8765/callback"}}"#,
+        )
+        .unwrap();
+        let (got, problem) = Profiles::load_with(dir.path(), Profiles::default());
+        assert_eq!(problem, None);
+        assert_eq!(got.profiles[0].token, "ntn_a");
     }
 
     #[test]
@@ -633,66 +626,22 @@ mod tests {
     }
 
     #[test]
-    fn an_oauth_login_creates_then_updates_one_profile() {
-        let mut p = Profiles::default();
-        let first: notion_core::oauth::TokenResponse = serde_json::from_value(serde_json::json!({
-            "access_token": "a1",
-            "refresh_token": "r1",
-            "workspace_id": "w1",
-            "workspace_name": "Acme",
-            "owner": { "type": "user", "user": { "id": "u1" } }
-        }))
-        .unwrap();
-        let made = p.upsert_oauth(&first, "fallback");
-        assert_eq!(made.name, "Acme");
-        assert_eq!(made.token, "a1");
-        assert_eq!(made.user_id.as_deref(), Some("u1"));
-        assert_eq!(made.workspace_id.as_deref(), Some("w1"));
-        assert_eq!(p.active.as_deref(), Some("Acme"));
-
-        let again: notion_core::oauth::TokenResponse = serde_json::from_value(serde_json::json!({
-            "access_token": "a2",
-            "refresh_token": "r2",
-            "workspace_id": "w1",
-            "workspace_name": "Acme"
-        }))
-        .unwrap();
-        p.upsert_oauth(&again, "fallback");
-        assert_eq!(p.profiles.len(), 1, "same workspace id reuses the profile");
-        assert_eq!(p.profiles[0].token, "a2");
-        assert_eq!(p.profiles[0].refresh_token.as_deref(), Some("r2"));
-    }
-
-    #[test]
-    fn oauth_client_secret_is_redacted_in_debug() {
-        let app = OAuthApp {
-            client_id: "id".into(),
-            client_secret: "super-secret".into(),
-            redirect_uri: default_redirect(),
-        };
-        let text = format!("{app:?}");
-        assert!(!text.contains("super-secret"));
-        assert!(text.contains("redacted"));
-        assert!(app.is_configured());
-    }
-
-    #[test]
     fn browser_spaces_create_one_profile_each_and_stay_stable() {
         let mut p = Profiles::default();
         p.upsert(Profile::new("My Notion", ""));
         let spaces = vec![
             notion_core::private::Space {
                 id: "s1".into(),
-                name: "Nicolas's Notion".into(),
+                name: "Work".into(),
             },
             notion_core::private::Space {
                 id: "s2".into(),
-                name: "Paul's Notion".into(),
+                name: "Home".into(),
             },
         ];
         let names = p.sync_browser_spaces("token", Some("u1".into()), None, &spaces);
-        assert_eq!(names, ["Nicolas's Notion", "Paul's Notion"]);
-        assert_eq!(p.active.as_deref(), Some("Nicolas's Notion"));
+        assert_eq!(names, ["Work", "Home"]);
+        assert_eq!(p.active.as_deref(), Some("My Notion")); // the caller switches, not the sync
         assert!(p
             .profiles
             .iter()
@@ -718,5 +667,131 @@ mod tests {
         );
         assert_eq!(p.session_file(), "session-egui-my-workspace.json");
         assert_eq!(p.cache_path(None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_is_private_even_over_a_stale_tmp_and_creates_the_dir_700() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("cfg");
+        let mut p = Profiles::default();
+        p.upsert(Profile::new("A", "ntn_a"));
+        p.save(&dir).unwrap();
+        let mode = |f: &Path| std::fs::metadata(f).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        let tmp = dir.join(format!("{FILE}.tmp"));
+        std::fs::write(&tmp, "old").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        p.save(&dir).unwrap();
+        assert_eq!(mode(&dir.join(FILE)), 0o600);
+    }
+
+    #[test]
+    fn unreadable_file_is_backed_up_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join(FILE);
+        std::fs::write(&f, "{ nope ntn_x").unwrap();
+        let (got, problem) = Profiles::load_with(dir.path(), Profiles::default());
+        assert!(problem.is_some());
+        assert_eq!(
+            std::fs::read(dir.path().join("profiles.json.bad")).unwrap(),
+            b"{ nope ntn_x"
+        );
+        let err = got.save(dir.path()).unwrap_err();
+        assert!(!err.to_string().contains("ntn_"));
+        assert_eq!(std::fs::read(&f).unwrap(), b"{ nope ntn_x");
+    }
+
+    #[test]
+    fn load_keeps_the_env_profile_next_to_saved_ones() {
+        let env = || Profiles::from_token("ntn_env".into(), None);
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Profiles::default();
+        p.upsert(Profile::new("Work", "ntn_b"));
+        p.set_active("Work");
+        p.save(dir.path()).unwrap();
+        let (got, _) = Profiles::load_with(dir.path(), env());
+        let d = got.get(DEFAULT_NAME).expect("env profile kept");
+        assert!(d.from_env && d.token == "ntn_env");
+        assert_eq!(d.cache_file.as_deref(), Some(LEGACY_CACHE));
+        assert_eq!(got.active.as_deref(), Some("Work"));
+
+        // active env Default survives a save + restart
+        let mut got = got;
+        got.set_active(DEFAULT_NAME);
+        got.save(dir.path()).unwrap();
+        assert!(!std::fs::read_to_string(dir.path().join(FILE))
+            .unwrap()
+            .contains("ntn_env"));
+        let (again, _) = Profiles::load_with(dir.path(), env());
+        assert_eq!(again.active.as_deref(), Some(DEFAULT_NAME));
+    }
+
+    #[test]
+    fn env_profile_token_is_not_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Profiles::default();
+        p.upsert(Profile {
+            from_env: true,
+            ..Profile::new("Default", "ntn_envsecret")
+        });
+        p.upsert(Profile::new("Work", "ntn_b"));
+        p.save(dir.path()).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
+        assert!(!text.contains("ntn_envsecret"));
+        assert!(text.contains("ntn_b"));
+    }
+
+    #[test]
+    fn form_debug_redacts_the_token() {
+        let form = Form::edit(&Profile::new("x", "ntn_secret"));
+        assert!(!format!("{form:?}").contains("ntn_secret"));
+    }
+
+    #[test]
+    fn browser_session_debug_redacts_token_and_cookies() {
+        let b = BrowserSession {
+            token_v2: "tok_secret".into(),
+            user_id: None,
+            cookies: Some("c_secret=1".into()),
+        };
+        let t = format!("{b:?}");
+        assert!(!t.contains("tok_secret") && !t.contains("c_secret"), "{t}");
+    }
+
+    #[test]
+    fn colliding_names_get_distinct_files() {
+        let mut p = Profiles::default();
+        for n in [
+            "Acme Team",
+            "acme-team",
+            "Acme/Team",
+            &"a".repeat(60),
+            &"a".repeat(70),
+        ] {
+            p.upsert(Profile::new(n, ""));
+        }
+        // a new profile reusing a renamed profile's pinned file
+        let old = p.get("Acme Team").cloned().unwrap();
+        let renamed = Form {
+            name: "Renamed".into(),
+            ..Form::edit(&old)
+        }
+        .to_profile(Some(&old))
+        .unwrap();
+        p.remove("Acme Team");
+        p.upsert(renamed);
+        p.upsert(Profile::new("Acme Team", ""));
+        let d = Some(Path::new("d"));
+        let caches: std::collections::HashSet<_> = p
+            .profiles
+            .iter()
+            .map(|x| x.cache_path(d).unwrap())
+            .collect();
+        let sessions: std::collections::HashSet<_> =
+            p.profiles.iter().map(|x| x.session_file()).collect();
+        assert_eq!(caches.len(), p.profiles.len());
+        assert_eq!(sessions.len(), p.profiles.len());
     }
 }

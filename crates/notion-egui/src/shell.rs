@@ -614,6 +614,14 @@ impl App {
                 self.saved_views.insert(ds, views);
                 self.refresh();
             }
+            // the cookie is dead: say so and offer the login once, not on every retry
+            Event::Error(e) if e.contains("browser session expired") => {
+                self.progress = None;
+                if self.last_error.as_deref() != Some(e.as_str()) && self.browser_login.is_none() {
+                    self.start_browser_login();
+                }
+                self.last_error = Some(e);
+            }
             // saved views are optional: any error leaves the local views
             Event::Error(_) if matches!(answered, Some(Cmd::Views { .. })) => {}
             Event::Me(id) => self.me = Some(id),
@@ -1202,28 +1210,39 @@ impl App {
         if adding || editing_active {
             next.set_active(&profile.name);
         }
-        if let Some(dir) = self.profiles_dir.as_deref() {
-            if let Err(e) = next.save(dir) {
+        if adding || editing_active {
+            // the switch applies and saves `next`; a refused one changes nothing
+            if self.pushing() {
                 if let Some(f) = &mut self.ws_form {
-                    f.error = Some(format!("cannot save profiles.json: {e}"));
+                    f.error = Some("wait for the push to finish before switching".into());
                 }
                 return;
             }
-        }
-        self.profiles = next;
-        self.ws_form = None;
-        if adding || editing_active {
+            self.pending_profiles = Some(next);
             self.pending_switch = Some((profile.name, true));
+        } else {
+            if let Some(dir) = self.profiles_dir.as_deref() {
+                if let Err(e) = next.save(dir) {
+                    if let Some(f) = &mut self.ws_form {
+                        f.error = Some(format!("cannot save profiles.json: {e}"));
+                    }
+                    return;
+                }
+            }
+            self.profiles = next;
         }
+        self.ws_form = None;
     }
 
     /// Replaces the store, worker and session with another workspace. The
     /// current edit must be committed; a running push is waited for.
     pub(crate) fn switch_workspace(&mut self, name: &str, force: bool, ctx: &egui::Context) {
+        // the profiles to adopt on success; dropped when the switch is refused
+        let next = self.pending_profiles.take();
         if !force && self.workspace_name() == name {
             return;
         }
-        let Some(profile) = self.profiles.get(name).cloned() else {
+        let Some(profile) = next.as_ref().unwrap_or(&self.profiles).get(name).cloned() else {
             self.last_error = Some(format!("unknown workspace {name:?}"));
             return;
         };
@@ -1261,7 +1280,8 @@ impl App {
         let token = profile.has_token().then(|| profile.token.clone());
         let browser = (profile.kind == crate::profiles::AuthKind::Browser)
             .then(|| {
-                self.profiles
+                next.as_ref()
+                    .unwrap_or(&self.profiles)
                     .browser
                     .clone()
                     .and_then(|b| profile.space_id.clone().map(|space| (b, space)))
@@ -1305,7 +1325,7 @@ impl App {
         fresh.profiles_dir = self.profiles_dir.clone();
         fresh.data_dir = self.data_dir.clone();
         fresh.clock = self.clock;
-        let mut profiles = std::mem::take(&mut self.profiles);
+        let mut profiles = next.unwrap_or_else(|| std::mem::take(&mut self.profiles));
         profiles.set_active(&profile.name);
         fresh.profiles = profiles;
         fresh.set_worker(worker);
@@ -1319,6 +1339,7 @@ impl App {
                 self.last_error = Some(format!("cannot save profiles.json: {e}"));
             }
         }
+        self.hint_no_token();
         // A browser workspace that has never been opened has an empty cache.
         // Discover its pages on first entry instead of showing a blank sidebar.
         if self.tree.is_empty()
@@ -1339,6 +1360,27 @@ impl App {
         }
     }
 
+    /// Tells the user the active workspace has no credential.
+    pub(crate) fn hint_no_token(&mut self) {
+        if !self.profiles.active_has_token() {
+            self.info = Some(if self.profiles.profiles.is_empty() {
+                "Add a workspace with ＋ in the top bar".into()
+            } else {
+                "No token for this workspace: use the top-bar picker → Edit current workspace…"
+                    .into()
+            });
+        }
+    }
+
+    /// Startup: with no workspace at all (and no `NOTION_TOKEN`, which makes
+    /// one) the browser-session login opens; otherwise a missing token is hinted.
+    pub(crate) fn first_run(&mut self) {
+        if self.profiles.profiles.is_empty() {
+            self.start_browser_login();
+        }
+        self.hint_no_token();
+    }
+
     fn save_profiles(&mut self) {
         if let Some(dir) = self.profiles_dir.as_deref() {
             if let Err(e) = self.profiles.save(dir) {
@@ -1349,67 +1391,8 @@ impl App {
 
     // ------------------------------------------------------------ sign in
 
-    /// "Sign in with Notion…": starts the stored OAuth app, or asks for its
-    /// client id/secret the first time.
-    pub(crate) fn start_oauth(&mut self) {
-        self.ws_form = None;
-        let app = self.profiles.oauth.clone().unwrap_or_default();
-        if !app.is_configured() {
-            self.oauth_setup = Some(app);
-            self.oauth_error = None;
-            return;
-        }
-        self.begin_oauth(app);
-    }
-
-    fn begin_oauth(&mut self, app: crate::profiles::OAuthApp) {
-        match crate::oauth::Flow::start(app.clone()) {
-            Ok(mut flow) => {
-                if let Err(e) = flow.open_again() {
-                    flow.error = Some(e);
-                }
-                self.profiles.oauth = Some(app);
-                self.save_profiles();
-                self.oauth = Some(flow);
-                self.oauth_setup = None;
-                self.oauth_error = None;
-            }
-            Err(e) => {
-                self.oauth_setup = Some(app);
-                self.oauth_error = Some(e);
-            }
-        }
-    }
-
-    pub(crate) fn save_oauth_setup(&mut self) {
-        let Some(mut app) = self.oauth_setup.clone() else {
-            return;
-        };
-        app.client_id = app.client_id.trim().to_string();
-        app.client_secret = app.client_secret.trim().to_string();
-        app.redirect_uri = app.redirect_uri.trim().to_string();
-        let problem = if !app.is_configured() {
-            Some("Both the OAuth client id and client secret are required.".to_string())
-        } else if !(app.redirect_uri.starts_with("http://")
-            || app.redirect_uri.starts_with("https://"))
-        {
-            Some("The redirect URI must be an http:// or https:// URL.".to_string())
-        } else {
-            None
-        };
-        if let Some(p) = problem {
-            self.oauth_setup = Some(app);
-            self.oauth_error = Some(p);
-            return;
-        }
-        self.oauth_setup = None;
-        self.oauth_error = None;
-        self.begin_oauth(app);
-    }
-
     pub(crate) fn start_browser_login(&mut self) {
         self.ws_form = None;
-        self.oauth_setup = None;
         let (prefill, cookies) = self
             .profiles
             .browser
@@ -1463,6 +1446,7 @@ impl App {
         }
         let before = self.profiles.profiles.len();
         let cookies = (!cookies.is_empty()).then_some(cookies);
+        // refreshes browser profiles in place; `active` is never changed
         self.profiles
             .sync_browser_spaces(&token, user_id, cookies, &spaces);
         let added = self.profiles.profiles.len().saturating_sub(before);
@@ -1510,24 +1494,24 @@ impl App {
                     })
                     .unwrap_or_default();
                 let cookies = (!cookies.is_empty()).then_some(cookies);
-                let names = self
-                    .profiles
-                    .sync_browser_spaces(&token, user_id, cookies, &spaces);
-                self.save_profiles();
+                let mut next = self.profiles.clone();
+                let names = next.sync_browser_spaces(&token, user_id, cookies, &spaces);
                 self.browser_login = None;
                 // Restart the current browser workspace so it gets the new
                 // cookies; a first browser login falls back to the first one.
-                let target = self
-                    .profiles
+                let target = next
                     .active
                     .clone()
                     .filter(|name| {
-                        self.profiles.profiles.iter().any(|p| {
+                        next.profiles.iter().any(|p| {
                             &p.name == name && p.kind == crate::profiles::AuthKind::Browser
                         })
                     })
                     .or_else(|| names.first().cloned());
                 if let Some(target) = target {
+                    next.set_active(&target);
+                    // the switch adopts and saves `next`; a refused one changes nothing
+                    self.pending_profiles = Some(next);
                     self.pending_switch = Some((target, true));
                 }
                 self.info = Some(format!(
@@ -1539,35 +1523,6 @@ impl App {
             Err(e) => {
                 if let Some(flow) = &mut self.browser_login {
                     flow.error = Some(e);
-                }
-            }
-        }
-    }
-
-    fn finish_oauth(&mut self, token: notion_core::oauth::TokenResponse) {
-        let profile = self.profiles.upsert_oauth(&token, "Notion workspace");
-        self.save_profiles();
-        self.info = Some(format!("signed in to {}", profile.name));
-        self.pending_switch = Some((profile.name, true));
-    }
-
-    /// Polls the callback/listener once a frame while a sign-in is open.
-    pub(crate) fn poll_oauth(&mut self, ctx: &egui::Context) {
-        let Some(result) = self.oauth.as_mut().and_then(crate::oauth::Flow::poll) else {
-            if self.oauth.is_some() {
-                ctx.request_repaint_after(Duration::from_millis(250));
-            }
-            return;
-        };
-        match result {
-            Ok(token) => {
-                self.oauth = None;
-                self.finish_oauth(token);
-            }
-            Err(e) => {
-                if let Some(f) = &mut self.oauth {
-                    f.error = Some(e);
-                    f.busy = false;
                 }
             }
         }
@@ -1627,22 +1582,28 @@ impl App {
         let mut out =
             ctx.input_mut(|i| keys::take_commands(&mut i.events, ctrl, map, Command::is_global));
         out.extend(ctx.input(|i| keys::mouse_nav(&i.events)));
-        if self.ws_form.is_some()
-            || self.oauth_setup.is_some()
-            || self.oauth.is_some()
-            || self.browser_login.is_some()
-        {
-            // a workspace/OAuth dialog has the keys
+        if self.ws_form.is_some() || self.browser_login.is_some() {
+            // a workspace dialog has the keys
             out.clear();
+            if self.ws_form.is_some() {
+                // Enter saves, Esc cancels; taken here, before the editor sees them
+                let (enter, esc) = ctx.input_mut(|i| {
+                    (
+                        i.consume_key(Modifiers::NONE, Key::Enter),
+                        i.consume_key(Modifiers::NONE, Key::Escape),
+                    )
+                });
+                if enter {
+                    self.save_workspace_form();
+                } else if esc {
+                    self.ws_form = None;
+                }
+            }
         } else if out.contains(&Command::ToggleSidebar) {
             self.sidebar = !self.sidebar;
             out.retain(|c| *c != Command::ToggleSidebar);
         }
-        if self.ws_form.is_some()
-            || self.oauth_setup.is_some()
-            || self.oauth.is_some()
-            || self.browser_login.is_some()
-        {
+        if self.ws_form.is_some() || self.browser_login.is_some() {
             // modal: nothing else runs
         } else if self.inbox.is_some() {
             // the inbox is modal: it has the keys, bar its own two
@@ -1982,7 +1943,6 @@ impl App {
             ctx.input(|i| keys::log(&i.raw.events));
         }
         self.drain_events();
-        self.poll_oauth(&ctx);
         self.poll_browser_login(&ctx);
         self.poll_space_refresh(&ctx);
         self.media_pump();
@@ -2269,20 +2229,6 @@ impl App {
             if self.ws_form.is_none() {
                 self.ws_form = Some(form);
             }
-        }
-        if let Some(mut app) = self.oauth_setup.take() {
-            let mut err = self.oauth_error.take();
-            if let Some(a) = view::oauth::setup(&ctx, c, &mut app, &mut err) {
-                acts.push(a);
-            }
-            self.oauth_setup = Some(app);
-            self.oauth_error = err;
-        }
-        if let Some(mut flow) = self.oauth.take() {
-            if let Some(a) = view::oauth::waiting(&ctx, c, &mut flow) {
-                acts.push(a);
-            }
-            self.oauth = Some(flow);
         }
         if let Some(mut flow) = self.browser_login.take() {
             if let Some(a) = view::browser_login::dialog(&ctx, c, &mut flow) {
@@ -4310,22 +4256,6 @@ mod tests {
     }
 
     #[test]
-    fn sign_in_without_an_oauth_app_opens_the_setup_dialog() {
-        let mut w = Win::with_texts(&["a"]);
-        w.app.profiles.oauth = None;
-        w.app.apply(Action::OAuthStart);
-        assert!(w.app.oauth.is_none(), "no listener without credentials");
-        assert!(w.app.oauth_setup.is_some());
-
-        // saving an incomplete app keeps the dialog open with a message
-        w.app.apply(Action::OAuthSetupSave);
-        assert!(w.app.oauth_setup.is_some());
-        assert!(w.app.oauth_error.as_deref().unwrap().contains("client id"));
-        w.app.apply(Action::OAuthSetupCancel);
-        assert!(w.app.oauth_setup.is_none() && w.app.oauth_error.is_none());
-    }
-
-    #[test]
     fn the_workspace_form_adds_a_profile_and_makes_it_active() {
         use crate::profiles::{Form, Profiles};
         let dir = tempfile::tempdir().unwrap();
@@ -4342,17 +4272,103 @@ mod tests {
             token: "ntn_x".into(),
             user_id: String::new(),
             error: None,
+            focused: false,
         });
         w.app.save_workspace_form();
-        assert_eq!(w.app.workspace_name(), "Acme");
+        // nothing changes or is saved until the switch succeeds
+        assert_eq!(w.app.workspace_name(), "No workspace");
+        assert!(!conf.join(crate::profiles::FILE).exists());
+        let next = w.app.pending_profiles.take().unwrap();
+        assert_eq!(next.active.as_deref(), Some("Acme"));
         assert_eq!(
             w.app.pending_switch.as_ref().map(|p| p.0.as_str()),
             Some("Acme")
         );
-        let saved = std::fs::read_to_string(conf.join(crate::profiles::FILE)).unwrap();
-        assert!(saved.contains("Acme") && saved.contains("ntn_x"), "{saved}");
         // never switch in the test: the fake token would start a live worker
         w.app.pending_switch = None;
         w.app.shutdown();
+    }
+
+    #[test]
+    fn a_switch_during_a_push_changes_nothing_and_a_good_one_saves() {
+        use crate::profiles::{Profile, Profiles};
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("config");
+        let mut w = Win::with_texts(&["a"]);
+        w.app.session_dir = Some(conf.clone());
+        w.app.profiles_dir = Some(conf.clone());
+        w.app.data_dir = Some(dir.path().join("data"));
+        let mut profiles = Profiles::default();
+        profiles.upsert(Profile::new("One", ""));
+        profiles.upsert(Profile::new("Two", ""));
+        profiles.set_active("One");
+        w.app.profiles = profiles;
+        w.app.sent.push_back(Cmd::Push);
+        w.app.pending_switch = Some(("Two".into(), false));
+        w.app.apply_pending_switch(&w.ctx);
+        assert_eq!(w.app.workspace_name(), "One");
+        assert!(!conf.join(crate::profiles::FILE).exists());
+        assert!(w.app.last_error.is_some());
+        w.app.sent.clear();
+        w.app.pending_switch = Some(("Two".into(), false));
+        w.app.apply_pending_switch(&w.ctx);
+        assert_eq!(w.app.workspace_name(), "Two");
+        let saved = std::fs::read_to_string(conf.join(crate::profiles::FILE)).unwrap();
+        assert!(saved.contains("\"active\": \"Two\""), "{saved}");
+        w.app.shutdown();
+    }
+
+    #[test]
+    fn a_browser_login_whose_switch_fails_keeps_the_running_workspace_active() {
+        use crate::profiles::{Profile, Profiles};
+        use notion_core::private::Space;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("config");
+        let mut w = Win::with_texts(&["a"]);
+        w.app.session_dir = Some(conf.clone());
+        w.app.profiles_dir = Some(conf.clone());
+        w.app.data_dir = Some(dir.path().join("data"));
+        let mut profiles = Profiles::default();
+        profiles.upsert(Profile::new("One", "ntn_one"));
+        profiles.set_active("One");
+        w.app.profiles = profiles;
+        let spaces = vec![
+            Space {
+                id: "s1".into(),
+                name: "Work".into(),
+            },
+            Space {
+                id: "s2".into(),
+                name: "Home".into(),
+            },
+        ];
+        w.app.browser_login = Some(crate::browser_login::tests::done("tok", Ok((None, spaces))));
+        w.app.sent.push_back(Cmd::Push); // a push is in flight: the switch is refused
+        w.app.poll_browser_login(&w.ctx);
+        w.app.apply_pending_switch(&w.ctx);
+        assert!(
+            w.app.last_error.is_some(),
+            "the switch must have been refused"
+        );
+        // the running worker is still One's, so One must stay the active name
+        assert_eq!(w.app.workspace_name(), "One");
+        let saved = std::fs::read_to_string(conf.join(crate::profiles::FILE)).unwrap_or_default();
+        assert!(!saved.contains("\"active\": \"Work\""), "{saved}");
+        w.app.sent.clear();
+        w.app.shutdown();
+    }
+
+    #[test]
+    fn first_run_opens_the_browser_login_only_without_workspaces() {
+        let mut w = Win::with_texts(&["a"]);
+        w.app.first_run();
+        assert!(w.app.browser_login.is_some());
+        let mut w = Win::with_texts(&["a"]);
+        w.app
+            .profiles
+            .upsert(crate::profiles::Profile::new("One", "tok"));
+        w.app.profiles.set_active("One");
+        w.app.first_run();
+        assert!(w.app.browser_login.is_none());
     }
 }

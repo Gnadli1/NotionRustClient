@@ -173,10 +173,6 @@ pub fn workspace_row(ui: &mut Ui, c: &Colors, h: &Header<'_>) -> Option<Action> 
             act = Some(Action::BrowserLoginStart);
             ui.close();
         }
-        if menu_item(ui, c, "Sign in with Notion (OAuth)…") {
-            act = Some(Action::OAuthStart);
-            ui.close();
-        }
         if menu_item(ui, c, "Add workspace with a token…") {
             act = Some(Action::NewProfile);
             ui.close();

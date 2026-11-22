@@ -2478,7 +2478,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "uuid",
  "webbrowser",
 ]
 

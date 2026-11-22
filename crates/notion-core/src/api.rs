@@ -221,7 +221,10 @@ impl Client {
             let resp = req.send().await.map_err(|e| Error::Http(e.without_url()))?;
             let status = resp.status().as_u16();
             let wait = Self::retry_after(&resp);
-            let text = resp.text().await.map_err(|e| Error::Http(e.without_url()))?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| Error::Http(e.without_url()))?;
             if (200..300).contains(&status) {
                 return Ok(serde_json::from_str(&text)?);
             }
@@ -2611,9 +2614,15 @@ mod private_api_tests {
             .mount(&s)
             .await;
         let c = client(&s);
-        let e = c.private_post("loadUserContent", json!({})).await.unwrap_err();
+        let e = c
+            .private_post("loadUserContent", json!({}))
+            .await
+            .unwrap_err();
         assert!(matches!(e, Error::SessionExpired), "{e}");
-        let e = c.private_post("loadUserContent", json!({})).await.unwrap_err();
+        let e = c
+            .private_post("loadUserContent", json!({}))
+            .await
+            .unwrap_err();
         assert!(matches!(e, Error::SessionExpired));
     }
 
@@ -2970,7 +2979,10 @@ mod private_api_tests {
             .await;
         let c = client(&s);
         for _ in 0..2 {
-            let e = c.private_post("loadUserContent", json!({})).await.unwrap_err();
+            let e = c
+                .private_post("loadUserContent", json!({}))
+                .await
+                .unwrap_err();
             assert!(matches!(e, Error::Api { status: 403, .. }), "{e}");
         }
     }
@@ -2981,9 +2993,14 @@ mod private_api_tests {
         serve_records(&s, vec![record("r1", "page", "p1", "block")]).await;
         mount_fanout(&s).await;
         let props = json!({ "Nope": { "number": 1 } });
-        assert!(client(&s).update_page_properties("r1", &props).await.is_err());
+        assert!(client(&s)
+            .update_page_properties("r1", &props)
+            .await
+            .is_err());
         let reqs = s.received_requests().await.unwrap();
-        assert!(reqs.iter().all(|r| !r.url.path().ends_with("saveTransactionsFanout")));
+        assert!(reqs
+            .iter()
+            .all(|r| !r.url.path().ends_with("saveTransactionsFanout")));
     }
 
     #[tokio::test]
@@ -2998,9 +3015,14 @@ mod private_api_tests {
         )
         .await;
         mount_fanout(&s).await;
-        assert!(matches!(client(&s).move_page("r1", "p2").await, Err(Error::Invalid(_))));
+        assert!(matches!(
+            client(&s).move_page("r1", "p2").await,
+            Err(Error::Invalid(_))
+        ));
         let reqs = s.received_requests().await.unwrap();
-        assert!(reqs.iter().all(|r| !r.url.path().ends_with("saveTransactionsFanout")));
+        assert!(reqs
+            .iter()
+            .all(|r| !r.url.path().ends_with("saveTransactionsFanout")));
     }
 
     #[tokio::test]
@@ -3016,7 +3038,9 @@ mod private_api_tests {
             let body = json!({ key: { "rich_text": rt("New") } });
             client(&s).update_block("b1", &body).await.unwrap();
             let ops = fanout_ops(&s).await;
-            let t = ops.iter().find(|o| o["path"] == json!(["properties", "title"]));
+            let t = ops
+                .iter()
+                .find(|o| o["path"] == json!(["properties", "title"]));
             assert_eq!(t.unwrap()["args"], json!([["New"]]), "{key}");
             assert!(ops.iter().all(|o| o["path"] != json!(["type"])), "{key}");
         }
@@ -3030,7 +3054,10 @@ mod private_api_tests {
             .and(path("/api/v3/syncRecordValues"))
             .respond_with(move |req: &wiremock::Request| {
                 let b: Value = serde_json::from_slice(&req.body).unwrap();
-                let id = b["requests"][0]["pointer"]["id"].as_str().unwrap().to_string();
+                let id = b["requests"][0]["pointer"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
                 let rec = json!({ "id": id, "type": "page", "alive": true,
                     "parent_id": format!("{id}x"), "parent_table": "block" });
                 ResponseTemplate::new(200).set_body_json(json!({

@@ -14,8 +14,8 @@ It takes about 10 minutes, plus the first sync.
    ./install.sh
    ```
 
-   This puts `notion-egui`, `notion-cli` and the `notion-client` launcher into `~/.local/bin`, and adds **Notion Client** to your app menu. It then asks for a Notion integration token and stores it in `~/.config/notion-client/token`, readable only by you; the launcher passes it as `NOTION_TOKEN`, so it works as the `Default` profile. Your user id is optional and goes to `~/.config/notion-client/user_id`.
-3. Start **Notion Client** from the menu, then add your workspaces ([step 4](#4-add-your-workspaces)): browser session, OAuth, or the stored token. Press `Ctrl+Shift+Y` for the first sync.
+   This puts `notion-egui`, `notion-cli` and the `notion-client` launcher into `~/.local/bin`, and adds **Notion Client** to your app menu. It then optionally asks for a Notion integration token (press Enter to skip) and stores it in `~/.config/notion-client/token`, readable only by you; the launcher passes it as `NOTION_TOKEN`, so it works as the `Default` profile. Your user id is optional and goes to `~/.config/notion-client/user_id`.
+3. Start **Notion Client** from the menu, then sign in with your browser session ([step 2](#2-log-in)), or use the stored integration token. Press `Ctrl+Shift+Y` for the first sync.
 
 `./install.sh --uninstall` removes the app again and keeps your cache and token. The launcher prefers `NOTION_TOKEN` / `NOTION_USER_ID` from the environment if they're set.
 
@@ -57,15 +57,20 @@ X11/Wayland libraries.
 | Debian, Ubuntu | `sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev` |
 | Fedora | `sudo dnf install gcc pkgconf-pkg-config libxkbcommon-devel wayland-devel mesa-libGL-devel libX11-devel libXcursor-devel libXrandr-devel libXi-devel` |
 
-**macOS.** `xcode-select --install`.
+**macOS (untested).** `xcode-select --install`.
 
 ## 2. Log in
 
-There are two native backends. **Browser session** sees every workspace your
-account can see, including pages other people shared with you. **OAuth** and
-tokens use the public API and are the stable, documented path.
+There are two native backends. **Browser session** is the recommended way to
+sign in: it sees every workspace your account can see, including pages other
+people shared with you. **Integration tokens** use the public, documented API.
 
-### Browser session (recommended for shared workspaces)
+> **Risk.** The browser session uses Notion's private, undocumented web API
+> with your account cookie, so it can break whenever Notion changes it. The
+> `token_v2` cookie is full access to your account: treat it like a password.
+> `profiles.json` stores it in plain text (mode `600` on Linux/macOS).
+
+### Browser session (recommended)
 
 This is the workaround that other Notion clients use: the app authenticates
 with the same cookie as Notion's web app and calls Notion's own API in Rust.
@@ -76,7 +81,7 @@ No WebView, no browser window, no per-workspace key.
    (Firefox) → **Cookies** → `https://www.notion.so`.
 3. Copy the value of the cookie named **`token_v2`**.
 4. In the app: workspace picker → **Browser session (token_v2)…** → paste the
-   value → **Connect**.
+   value (a whole `Cookie` header also works) → **Connect**.
 5. The app asks Notion for every workspace the account can see and creates one
    native profile per workspace. Switch with the picker; each has its own
    cache and session.
@@ -84,71 +89,13 @@ No WebView, no browser window, no per-workspace key.
    exchanges it for a short-lived Notion file token when a picture is first
    downloaded. No second cookie is needed.
 
-Treat `token_v2` like your password: it is stored in `profiles.json` on this
-computer, and anyone who has it can act as your Notion account. It expires
-when you log out, change your password, or revoke the session. If a pull
-starts returning `401`, repeat these steps with a fresh cookie.
+The cookie expires when you log out, change your password, or revoke the
+session. If a pull starts returning `401`, repeat these steps with a fresh
+cookie.
 
-This backend is a best-effort reimplementation of Notion's undocumented web
-API, so it can break when Notion changes it. The official API (OAuth/tokens)
-remains the stable option for your own workspace.
+### Alternative: an integration token
 
-### OAuth via the public API
-
-This is the documented login: Notion's own page opens in your browser, you log
-in there, choose a workspace and pages, and the app receives a token for that
-workspace. One login per workspace; no token has to be created for each page.
-
-#### One-time: create a public OAuth connection
-
-You do this once. It is **not** a per-workspace key; every workspace you sign
-in to uses the same connection.
-
-1. Open <https://app.notion.com/developers/connections> and click **New
-   connection**. (You need a workspace where you can create connections.)
-2. Under **Authentication method** choose **OAuth**.
-3. Under **Installable in** choose **Any workspace** (or select the workspaces
-   you need).
-4. Add this redirect URI exactly:
-
-   ```text
-   http://localhost:8765/callback
-   ```
-
-   Use the hostname `localhost`, **not** `127.0.0.1`: Notion rejects
-   redirect URIs that are IP addresses.
-
-
-5. Create the connection, then on its **Configuration** tab enable:
-   **Read content**, **Update content**, **Insert content**, **Read comments**,
-   **Insert comments**, and **Read user information**.
-6. Copy the **OAuth client ID** and **OAuth client secret**.
-
-If Notion's Developer portal refuses an `http://127.0.0.1` redirect URI, use a
-`https://` URL you control instead. The app can still finish: after **Allow
-access**, copy the URL from the browser (it contains `code=…`) and paste it into
-the app's sign-in window.
-
-#### In the app
-
-1. Open the workspace picker in the top bar → **🔐 Sign in with Notion…**.
-2. Paste the client ID, client secret, and redirect URI → **Save and sign in**.
-3. Your browser opens Notion. Log in if needed. At the top right of the
-   authorization window, **switch to the workspace you want**.
-4. Select the pages/databases to make available (a parent page includes its
-   children), then **Allow access**.
-5. The app receives the code, stores the access and refresh token in
-   `profiles.json`, and switches to the new workspace profile.
-
-The page picker only lists pages you have **full access** to. If a shared page
-does not appear there, Notion is not granting your account access to it; see
-[step 3](#3-get-access-to-a-shared-workspace). Repeat the sign-in for each
-workspace. Signing in again to the same workspace updates that profile and
-keeps its cache.
-
-### Alternative: a token
-
-You can still add a profile with a token instead of OAuth.
+You can add a profile with an official token instead.
 
 **Personal access token.** Create one at
 <https://www.notion.so/developers/tokens>: choose the workspace, enable the
@@ -176,15 +123,11 @@ Try these in order:
    and page that the official app can see, including guest pages and pages
    shared by other people, appears as a native profile. No key from the owner
    is needed. This is the path that solves the shared-workspace problem.
-2. **Use OAuth and look in the page picker.** Sign in with Notion, switch the
-   authorization window to the shared workspace, and see whether the page
-   appears. The picker lists pages you have full access to; select the page and
-   allow access.
-3. **You are a full member of that workspace.** Create a personal access token
+2. **You are a full member of that workspace.** Create a personal access token
    for it. It needs no page-by-page sharing and no key from anyone else.
-4. **The workspace owner creates an internal-connection token** and shares the
+3. **The workspace owner creates an internal-connection token** and shares the
    page with it. This works for guests and is the least-privilege route.
-5. **Own/admin the workspace:** a personal access token or internal connection
+4. **Own/admin the workspace:** a personal access token or internal connection
    both work.
 
 A page link with no account access is still not readable by any API client;
@@ -194,8 +137,7 @@ the browser session only sees what your Notion account can see.
 
 **Browser session** creates one profile per workspace automatically after you
 paste `token_v2`; the cookie itself is stored once under `browser`, not copied
-into every profile. **OAuth** creates the profile after the browser sign-in.
-Both need nothing else.
+into every profile. It needs nothing else.
 
 To add a public-API profile with a token instead, use **＋ Add workspace with a
 token…** in the top bar and give it:
@@ -225,20 +167,9 @@ curl -s https://api.notion.com/v1/users \
 {
   "active": "Acme team",
   "browser": { "token_v2": "the browser cookie", "user_id": "…" },
-  "oauth": {
-    "client_id": "your-oauth-client-id",
-    "client_secret": "your-oauth-client-secret",
-    "redirect_uri": "http://localhost:8765/callback"
-  },
   "profiles": [
     { "name": "Acme team", "kind": "browser", "space_id": "…" },
-    { "name": "Personal", "token": "ntn_personal", "user_id": null },
-    {
-      "name": "Work (OAuth)",
-      "token": "ntn_oauth_access",
-      "workspace_id": "…",
-      "refresh_token": "nrt_…"
-    }
+    { "name": "Personal", "token": "ntn_personal", "user_id": null }
   ]
 }
 ```
@@ -246,9 +177,7 @@ curl -s https://api.notion.com/v1/users \
 `kind` defaults to `official`; a `browser` profile needs `space_id` and uses
 the account-wide `browser.token_v2`. Official profiles need `name` and `token`.
 `cache_file` and `session_file` are optional overrides; by default each profile
-uses `cache-<slug>.db` and `session-egui-<slug>.json`. OAuth logins also write
-`workspace_id` and `refresh_token`; signing in again to the same workspace
-updates that profile and keeps its cache.
+uses `cache-<slug>.db` and `session-egui-<slug>.json`.
 
 **Old single-token setup.** With no `profiles.json`, `NOTION_TOKEN` (and
 `NOTION_USER_ID`) still works as a `Default` profile on the shared `cache.db`
@@ -380,16 +309,11 @@ It needs `NOTION_TOKEN` set, and the page must be visible to that token.
 | Symptom | Fix |
 |---|---|
 | Status bar says `no token for this workspace` | The active profile has an empty token. Edit it in the top-bar picker. |
-| **Sign in with Notion…** asks for a client id | Create the one-time public OAuth connection in [step 2](#2-sign-in-with-notion-oauth) and paste its client id and secret. |
-| OAuth says `redirect_uri` is invalid | The redirect URI in the Notion connection must be exactly the one in the app. The default is `http://localhost:8765/callback`. |
-| OAuth cannot listen on `127.0.0.1:8765` | Another program has the port. Change the port in the app and in the Notion connection, or use an https redirect and paste the code. |
-| Browser shows an error after **Allow access** | The local listener may not be reachable. Copy the browser URL (it contains `code=…`) and paste it into the app's sign-in window. |
-| The shared page is not in the OAuth page picker | Use **Browser session (token_v2)** instead; it sees everything your Notion account sees. OAuth only lists pages you have full access to. |
 | Browser session finds no workspaces | The `token_v2` cookie is stale or copied from the wrong site. Log in at `https://www.notion.so` again and copy it from that exact domain. |
 | Browser session fails with `401` / `403` | The cookie expired or was signed out. Open the browser session dialog and paste a fresh `token_v2`. |
-| A page pulls but looks incomplete (databases, files) | The private backend is best-effort; Notion changes it without notice. Use an OAuth/token profile for anything that must stay stable. |
+| A page pulls but looks incomplete (databases, files) | The private backend is best-effort; Notion changes it without notice. Use an integration-token profile for anything that must stay stable. |
 | Creating tables or some database properties fails | The browser backend does not yet implement every private transaction type; the public API profile remains the full-featured path for those operations. |
-| `401 unauthorized` | The token is wrong, revoked or expired. For OAuth, sign in again; the profile and cache are kept. For a token, copy/create a new one and edit the profile. |
+| `401 unauthorized` | The token is wrong, revoked or expired. Copy/create a new token and edit the profile. |
 | A page or database is missing, or `404 object_not_found` | An internal connection only sees pages shared with it. A personal access token sees what you see. See [step 3](#3-get-access-to-a-shared-workspace). |
 | I only have a page link | That is not API access. The workspace owner must give you full membership (then use a personal token) or an internal-connection token for that page. |
 | One message about users, then no names | Personal access tokens cannot list all workspace users. Names may show as ids; this is expected. For an internal connection, enable "Read user information". |

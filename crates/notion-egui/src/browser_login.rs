@@ -56,7 +56,7 @@ impl Flow {
         std::thread::spawn(move || {
             let base = std::env::var("NOTION_PRIVATE_BASE")
                 .ok()
-                .filter(|b| b.starts_with("http"))
+                .filter(|b| notion_core::private::safe_base(b))
                 .unwrap_or_else(|| notion_core::private::DEFAULT_BASE.to_string());
             let result = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -121,8 +121,21 @@ pub fn token_from_input(input: &str) -> String {
     }
 }
 #[cfg(test)]
-mod tests {
-    use super::token_from_input;
+pub(crate) mod tests {
+    use super::{token_from_input, Flow, Spaces};
+
+    /// A finished login whose discovery answered `result`.
+    pub(crate) fn done(token: &str, result: Spaces) -> Flow {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(result).unwrap();
+        Flow {
+            token: token.into(),
+            cookies: String::new(),
+            error: None,
+            busy: true,
+            rx,
+        }
+    }
 
     #[test]
     fn accepts_a_bare_token_and_a_cookie_header() {

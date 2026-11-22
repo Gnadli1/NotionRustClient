@@ -2,7 +2,6 @@
 //! returns the `Action` the user triggered, if any; `App::apply` runs it.
 
 pub mod browser_login;
-pub mod oauth;
 pub mod sidebar;
 pub mod status;
 pub mod switcher;
@@ -85,8 +84,8 @@ pub fn breadcrumb(
     act
 }
 
-/// The centre of a tab with no page. Offers the OAuth sign-in when no page is
-/// open, which is also the first thing a new user sees.
+/// The centre of a tab with no page. Offers the browser-session login when no page
+/// is open, which is also the first thing a new user sees.
 pub fn empty_tab(ui: &mut Ui, c: &Colors) -> Option<Action> {
     let mut act = None;
     ui.centered_and_justified(|ui| {
@@ -97,14 +96,11 @@ pub fn empty_tab(ui: &mut Ui, c: &Colors) -> Option<Action> {
                 if ui.button("🌐 Browser session").clicked() {
                     act = Some(Action::BrowserLoginStart);
                 }
-                if ui.button("🔐 Sign in with Notion…").clicked() {
-                    act = Some(Action::OAuthStart);
-                }
             });
             ui.label(
                 RichText::new(
                     "Browser session sees every workspace shared with your account. \
-                     OAuth and tokens use the public API.",
+                     Tokens use the public API.",
                 )
                 .small()
                 .color(c.secondary),

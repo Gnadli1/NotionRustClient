@@ -321,7 +321,9 @@ impl Records {
                     if let Some(schema) = collection.get("schema").and_then(Value::as_object) {
                         for (key, entry) in schema {
                             if entry.get("type").and_then(Value::as_str) == Some("title") {
-                                if let Some(value) = rec.pointer(&format!("/properties/{}", ptr(key))) {
+                                if let Some(value) =
+                                    rec.pointer(&format!("/properties/{}", ptr(key)))
+                                {
                                     properties.insert(
                                         key.clone(),
                                         json!({ "id": key, "type": "title",
@@ -510,7 +512,9 @@ impl Records {
     fn schema_entry(&self, rec: &Value, key: &str) -> Option<Value> {
         let parent_id = rec.get("parent_id").and_then(Value::as_str)?;
         let collection = self.collections.get(parent_id)?;
-        collection.pointer(&format!("/schema/{}", ptr(key))).cloned()
+        collection
+            .pointer(&format!("/schema/{}", ptr(key)))
+            .cloned()
     }
 
     fn collection_name(&self, rec: &Value) -> Option<String> {
@@ -1380,7 +1384,10 @@ async fn space_post(
         .await
         .map_err(|e| Error::Http(e.without_url()))?;
     let status = resp.status().as_u16();
-    let text = resp.text().await.map_err(|e| Error::Http(e.without_url()))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| Error::Http(e.without_url()))?;
     if !(200..300).contains(&status) {
         return Err(Error::Api {
             status,
@@ -1799,21 +1806,38 @@ mod tests {
     fn pointer_keys_are_escaped() {
         assert_eq!(ptr("a/b~c"), "a~1b~0c");
         let rec = json!({ "properties": { "a/b": 1, "a": { "b": 2 } } });
-        assert_eq!(rec.pointer(&format!("/properties/{}", ptr("a/b"))), Some(&json!(1)));
+        assert_eq!(
+            rec.pointer(&format!("/properties/{}", ptr("a/b"))),
+            Some(&json!(1))
+        );
     }
 
     #[test]
     fn bases_and_cookie_hosts_are_checked() {
         assert!(safe_base("https://www.notion.so/") && safe_base("http://127.0.0.1:8080"));
         assert!(safe_base("http://localhost:9"));
-        for b in ["https://evil.example", "http://www.notion.so", "http://127.0.0.1", "https://www.notion.so.evil.com"] {
+        for b in [
+            "https://evil.example",
+            "http://www.notion.so",
+            "http://127.0.0.1",
+            "https://www.notion.so.evil.com",
+        ] {
             assert!(!safe_base(b), "{b}");
         }
         let b = "http://127.0.0.1:8080";
-        assert!(cookie_url_ok("https://file.notion.so/f/a.png?x=1", DEFAULT_BASE));
+        assert!(cookie_url_ok(
+            "https://file.notion.so/f/a.png?x=1",
+            DEFAULT_BASE
+        ));
         assert!(cookie_url_ok("https://notion.so/a", DEFAULT_BASE));
         assert!(cookie_url_ok("http://127.0.0.1:8080/a.png", b));
-        for u in ["https://s3.amazonaws.com/x", "https://evilnotion.so/x", "https://notion.so.evil.com/x", "http://file.notion.so/x", "http://127.0.0.1:9/x"] {
+        for u in [
+            "https://s3.amazonaws.com/x",
+            "https://evilnotion.so/x",
+            "https://notion.so.evil.com/x",
+            "http://file.notion.so/x",
+            "http://127.0.0.1:9/x",
+        ] {
             assert!(!cookie_url_ok(u, b), "{u}");
         }
     }
@@ -1985,11 +2009,17 @@ mod tests {
         let e = |t: &str| json!({ "id": "k", "type": t, "options": opts });
         let cases = [
             ("select", json!({ "select": { "name": "a" } })),
-            ("multi_select", json!({ "multi_select": [{ "name": "a" }, { "name": "b" }] })),
+            (
+                "multi_select",
+                json!({ "multi_select": [{ "name": "a" }, { "name": "b" }] }),
+            ),
             ("number", json!({ "number": 4.5 })),
             ("checkbox", json!({ "checkbox": true })),
             ("checkbox", json!({ "checkbox": false })),
-            ("date", json!({ "date": { "start": "2024-01-02", "end": null } })),
+            (
+                "date",
+                json!({ "date": { "start": "2024-01-02", "end": null } }),
+            ),
         ];
         for (t, v) in cases {
             let stored = property_to_private(&e(t), &v).unwrap();
@@ -2006,13 +2036,20 @@ mod tests {
         let stored = property_to_private(&text, &json!({ "rich_text": [] })).unwrap();
         assert_eq!(property_to_official(&text, &stored)["rich_text"], json!([]));
         for t in ["rollup", "formula", "files"] {
-            assert!(property_to_private(&json!({ "type": t }), &json!({})).is_err(), "{t}");
+            assert!(
+                property_to_private(&json!({ "type": t }), &json!({})).is_err(),
+                "{t}"
+            );
         }
     }
 
     #[test]
     fn lookalike_hosts_are_rejected() {
-        for u in ["https://notion.so.evil.com/", "https://evilnotion.so/", "http://www.notion.so/"] {
+        for u in [
+            "https://notion.so.evil.com/",
+            "https://evilnotion.so/",
+            "http://www.notion.so/",
+        ] {
             assert!(!safe_base(u), "{u}");
             assert!(!cookie_url_ok(u, DEFAULT_BASE), "{u}");
         }

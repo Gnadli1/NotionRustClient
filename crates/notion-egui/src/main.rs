@@ -20,7 +20,6 @@ mod md;
 mod media;
 mod menu;
 mod nav;
-mod oauth;
 #[allow(dead_code)]
 mod outline;
 mod pages;
@@ -168,8 +167,6 @@ fn main() -> eframe::Result {
         .as_ref()
         .map(|p| p.token.trim().to_string())
         .filter(|t| !t.is_empty());
-    let no_token = !profiles.active_has_token();
-    let has_profiles = !profiles.profiles.is_empty();
     let browser_auth = active
         .as_ref()
         .filter(|p| p.kind == profiles::AuthKind::Browser)
@@ -237,14 +234,7 @@ fn main() -> eframe::Result {
             app.set_worker(worker);
             app.set_profiles(profiles, dir.clone(), data.clone(), session_file.clone());
             app.start_space_refresh();
-            if no_token {
-                app.info = Some(if has_profiles {
-                    "No token for this workspace: use the top-bar picker → Edit current workspace…"
-                        .into()
-                } else {
-                    "Add a workspace with ＋ in the top bar".into()
-                });
-            }
+            app.first_run();
             if let Some(dir) = dir {
                 let (keys, notes) = keys::load(&dir);
                 app.keys = keys;

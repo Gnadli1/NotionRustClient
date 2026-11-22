@@ -155,14 +155,6 @@ pub(crate) enum Action {
     EditProfile,
     ProfileSave,
     ProfileCancel,
-    /// "Sign in with Notion…" and its dialogs.
-    OAuthStart,
-    OAuthSetupSave,
-    OAuthSetupCancel,
-    OAuthCancel,
-    OAuthManual,
-    OAuthOpenAgain,
-    OAuthDevPortal,
     /// The private browser-session login.
     BrowserLoginStart,
     BrowserLoginConnect,
@@ -316,11 +308,8 @@ pub struct App {
     pub(crate) ws_form: Option<crate::profiles::Form>,
     /// A workspace switch asked for this frame: (name, reload even if active).
     pub(crate) pending_switch: Option<(String, bool)>,
-    /// The OAuth client app setup dialog, while open.
-    pub(crate) oauth_setup: Option<crate::profiles::OAuthApp>,
-    pub(crate) oauth_error: Option<String>,
-    /// The sign-in waiting for Notion's redirect.
-    pub(crate) oauth: Option<crate::oauth::Flow>,
+    /// The profiles the pending switch adopts (and saves) once it succeeds.
+    pub(crate) pending_profiles: Option<Profiles>,
     /// The browser-session (`token_v2`) login dialog.
     pub(crate) browser_login: Option<crate::browser_login::Flow>,
     /// A quiet startup refresh that discovers the account's shared workspaces.
@@ -541,9 +530,7 @@ impl App {
             data_dir: None,
             ws_form: None,
             pending_switch: None,
-            oauth_setup: None,
-            oauth_error: None,
-            oauth: None,
+            pending_profiles: None,
             browser_login: None,
             space_refresh: None,
             sent: VecDeque::new(),
@@ -797,27 +784,6 @@ impl App {
             }
             Action::ProfileSave => self.save_workspace_form(),
             Action::ProfileCancel => self.ws_form = None,
-            Action::OAuthStart => self.start_oauth(),
-            Action::OAuthSetupSave => self.save_oauth_setup(),
-            Action::OAuthSetupCancel => {
-                self.oauth_setup = None;
-                self.oauth_error = None;
-            }
-            Action::OAuthCancel => self.oauth = None,
-            Action::OAuthManual => {
-                if let Some(f) = &mut self.oauth {
-                    f.submit_manual();
-                }
-            }
-            Action::OAuthOpenAgain => {
-                let r = self.oauth.as_ref().map(crate::oauth::Flow::open_again);
-                if let Some(Err(e)) = r {
-                    self.oauth_error = Some(e);
-                }
-            }
-            Action::OAuthDevPortal => {
-                let _ = webbrowser::open("https://app.notion.com/developers/connections");
-            }
             Action::BrowserLoginStart => self.start_browser_login(),
             Action::BrowserLoginConnect => {
                 if let Some(flow) = &mut self.browser_login {

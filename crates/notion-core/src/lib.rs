@@ -6,7 +6,6 @@ pub mod error;
 pub mod markdown;
 pub mod media;
 pub mod model;
-pub mod oauth;
 pub mod ops;
 pub mod paths;
 pub mod private;

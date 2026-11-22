@@ -16,6 +16,7 @@ cp target/docker/release/notion-egui target/docker/release/notion-cli "dist/$NAM
 strip "dist/$NAME/notion-egui" "dist/$NAME/notion-cli" 2>/dev/null || true
 cp packaging/install.sh packaging/notion-client packaging/notion-egui.desktop packaging/notion-egui.svg \
     README.md SETUP.md LICENSE "dist/$NAME/"
+cp crates/notion-egui/assets/fonts/OFL.txt "dist/$NAME/OFL-Inter.txt"
 chmod 755 "dist/$NAME/install.sh" "dist/$NAME/notion-client"
 tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
 (cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")

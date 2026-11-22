@@ -37,10 +37,10 @@ chmod 644 "$APPS/notion-egui.desktop"
 refresh_menu
 echo "Installed into $BIN and added \"Notion Client\" to the app menu."
 
-# The token: asked once if there is none yet, stored readable only by you.
+# Optional integration token (Enter skips), stored readable only by you.
 if [ ! -s "$CONF/token" ] && [ -z "${NOTION_TOKEN:-}" ] && [ -t 0 ]; then
     echo
-    echo "Paste your Notion integration secret (see SETUP.md), or press Enter to skip:"
+    echo "Optional: paste a Notion integration token (see SETUP.md), or press Enter to skip:"
     stty -echo 2>/dev/null || true
     read -r token || token=""
     stty echo 2>/dev/null || true
@@ -54,8 +54,9 @@ if [ ! -s "$CONF/token" ] && [ -z "${NOTION_TOKEN:-}" ] && [ -t 0 ]; then
         [ -n "$uid" ] && (umask 077 && printf '%s' "$uid" > "$CONF/user_id")
     fi
 fi
-[ -s "$CONF/token" ] || [ -n "${NOTION_TOKEN:-}" ] || \
-    echo "No token yet: put it in $CONF/token (chmod 600) or export NOTION_TOKEN."
+echo
+echo "Next: start Notion Client and sign in from the app (workspace picker -> Browser session),"
+echo "or set an integration token ($CONF/token with chmod 600, or export NOTION_TOKEN). See SETUP.md."
 
 case ":$PATH:" in
     *":$BIN:"*) ;;
