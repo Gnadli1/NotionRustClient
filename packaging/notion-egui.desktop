@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Notion Client
+GenericName=Notes
+Comment=Local-first Notion client (Rust)
+Exec=notion-client
+Icon=notion-egui
+Terminal=false
+Categories=Office;
+Keywords=notion;wiki;
+StartupWMClass=notion-egui

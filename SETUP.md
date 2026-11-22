@@ -2,6 +2,24 @@
 
 This guide takes you from nothing to a synced client. It takes about 10 minutes.
 
+## Quick install from a release (no Rust needed)
+
+1. Download `notion-client-<version>-x86_64-linux.tar.gz` from the [Releases page](https://github.com/Gnadli1/NotionRustClient/releases). It runs on x86_64 Linux with glibc 2.35 or newer: Ubuntu 22.04+, Debian 12+, Fedora 36+, Arch and similar.
+2. Unpack it and run the installer:
+
+   ```bash
+   tar xzf notion-client-*-x86_64-linux.tar.gz
+   cd notion-client-*-x86_64-linux
+   ./install.sh
+   ```
+
+   This puts `notion-egui`, `notion-cli` and the `notion-client` launcher into `~/.local/bin`, and adds **Notion Client** to your app menu. It then asks for your integration token, which you create in [step 2](#2-create-a-notion-integration), and stores it in `~/.config/notion-client/token`, readable only by you. Your user id is optional and goes to `~/.config/notion-client/user_id`.
+3. Share pages with the integration ([step 3](#3-share-pages-with-the-integration)), start **Notion Client** from the menu, and press `Ctrl+Shift+Y` for the first sync.
+
+`./install.sh --uninstall` removes the app again and keeps your cache and token. The launcher prefers `NOTION_TOKEN` / `NOTION_USER_ID` from the environment if they're set.
+
+The rest of this guide builds from source.
+
 1. [Install the build tools](#1-install-the-build-tools)
 2. [Create a Notion integration](#2-create-a-notion-integration)
 3. [Share pages with the integration](#3-share-pages-with-the-integration)

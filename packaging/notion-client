@@ -1,0 +1,14 @@
+#!/bin/sh
+# Starts notion-egui. The token comes from $NOTION_TOKEN, else from
+# ~/.config/notion-client/token; the user id from $NOTION_USER_ID, else from
+# ~/.config/notion-client/user_id. Neither is written anywhere by this script.
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/notion-client"
+if [ -z "$NOTION_TOKEN" ] && [ -r "$CONF/token" ]; then
+    NOTION_TOKEN="$(tr -d '[:space:]' < "$CONF/token")"
+    export NOTION_TOKEN
+fi
+if [ -z "$NOTION_USER_ID" ] && [ -r "$CONF/user_id" ]; then
+    NOTION_USER_ID="$(tr -d '[:space:]' < "$CONF/user_id")"
+    export NOTION_USER_ID
+fi
+exec "$(dirname "$(readlink -f "$0")")/notion-egui" "$@"

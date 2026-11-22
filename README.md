@@ -19,6 +19,10 @@ It talks to Notion only through the official [Notion API](https://developers.not
 
 ## Quick start
 
+**From a release:** download the tarball from [Releases](https://github.com/Gnadli1/NotionRustClient/releases), unpack it and run `./install.sh`. It adds **Notion Client** to your app menu and asks for your token.
+
+**From source:**
+
 ```bash
 git clone https://github.com/Gnadli1/NotionRustClient.git
 cd NotionRustClient
