@@ -62,12 +62,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 The tests never call the real API; they use a mock server. A single live smoke test exists and is `#[ignore]`d. See [SETUP.md](SETUP.md#running-the-tests).
 
-## Security
-
-Tokens are read from `profiles.json` in your config folder (or from `NOTION_TOKEN` when no profile file exists). They are never logged or written to the page cache. `profiles.json` holds them in plain text: on Linux/macOS it is written with mode `600`, and on Windows it is protected by your user account's folder permissions. The cache holds your page contents in plain text, so treat it like the pages themselves.
-
-Browser-session mode stores the account-wide `token_v2` cookie in `profiles.json` (under `browser`). It is a full session credential, equivalent to being logged in: never share the file. Sign out in Notion or change the password to invalidate it.
-
 ## Fonts
 
 The app embeds the Inter font (Bold, SemiBold, Regular), copyright 2016 The Inter Project Authors, under the SIL Open Font License 1.1. The licence text is in [`crates/notion-egui/assets/fonts/OFL.txt`](crates/notion-egui/assets/fonts/OFL.txt) and ships in the release tarball as `OFL-Inter.txt`.
