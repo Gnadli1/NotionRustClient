@@ -477,6 +477,10 @@ impl App {
             return;
         }
         self.flush();
+        // "sync" means both ways: queued edits go out first, then the pull
+        if !self.store.queued_ops().unwrap_or_default().is_empty() && self.commit() {
+            self.send(Cmd::Push);
+        }
         self.progress = Some((0, 0));
         self.send(Cmd::SyncAll);
     }
@@ -599,14 +603,24 @@ impl App {
                     self.undo.clear();
                     self.redo.clear();
                 }
-                self.last_error = r
-                    .errors
-                    .first()
-                    .map(|e| format!("{} failed, first: {e}", r.errors.len()));
-                self.info = Some(format!(
-                    "synced: {} pages, {} databases, {} up to date",
-                    r.pages, r.data_sources, r.skipped
-                ));
+                let waiting = self.store.queued_ops().map_or(0, |o| o.len());
+                if let Some(e) = r.errors.first() {
+                    self.last_error = Some(format!("{} failed, first: {e}", r.errors.len()));
+                } else if waiting == 0 {
+                    // a push error from this run stays while edits still wait
+                    self.last_error = None;
+                }
+                self.info = Some(if waiting > 0 {
+                    format!(
+                        "pulled: {} pages, {} databases · {waiting} edits not pushed",
+                        r.pages, r.data_sources
+                    )
+                } else {
+                    format!(
+                        "synced: {} pages, {} databases, {} up to date",
+                        r.pages, r.data_sources, r.skipped
+                    )
+                });
                 self.refresh();
             }
             Event::Progress { .. } => {}
@@ -3702,6 +3716,21 @@ mod tests {
         assert!(w.app.users_at.is_some());
         w.frames(vec![]);
         assert!(w.cmds().is_empty());
+    }
+
+    #[test]
+    fn sync_all_pushes_queued_edits_first_and_says_when_some_still_wait() {
+        let mut w = Win::with_texts(&["a"]);
+        w.edit(0);
+        w.type_text("x");
+        w.app.apply(Action::SyncAll);
+        assert_eq!(w.cmds(), [Cmd::Push, Cmd::SyncAll]);
+        // the push failed: the edit still waits, and the pull says so
+        w.answer(Event::Error("push refused".into()));
+        w.answer(Event::SyncedAll(Default::default()));
+        let info = w.app.info.clone().unwrap();
+        assert!(info.contains("1 edits not pushed"), "{info}");
+        assert!(w.app.last_error.is_some(), "the push error stays");
     }
 
     #[test]

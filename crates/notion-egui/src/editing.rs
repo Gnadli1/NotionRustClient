@@ -264,6 +264,39 @@ impl App {
         }
     }
 
+    /// A click below the last block, as in Notion: the page's trailing empty
+    /// paragraph is edited, else a new one is added at the end.
+    pub(crate) fn append_block_at_end(&mut self) {
+        if let Some(i) = self.rows.iter().rposition(|r| r.depth == 0) {
+            let r = &self.rows[i];
+            if r.editable && matches!(r.marker, Marker::None) && r.rich_text.is_empty() {
+                return self.start_edit(i, Grab::End);
+            }
+        }
+        let Some(page) = self.current.clone() else {
+            return;
+        };
+        if self.meta.locked || self.pushing() || !self.flush() {
+            return;
+        }
+        let para = BlockKind::Paragraph(TextBlock {
+            rich_text: Vec::new(),
+            color: "default".into(),
+        });
+        let made = self
+            .store
+            .resolve_id(&page)
+            .and_then(|p| sync::local_create_block(&self.store, &p, None, para));
+        match made {
+            Ok(new) => {
+                self.focus = None;
+                self.refresh();
+                self.focus_block(&new, Grab::Start);
+            }
+            Err(e) => self.last_error = Some(e.to_string()),
+        }
+    }
+
     /// Enter: commit, an empty paragraph after the row, edit it.
     fn new_block_after(&mut self) {
         if !self.flush() {
@@ -989,6 +1022,21 @@ mod tests {
         w.press(Key::Z, Modifiers::CTRL);
         assert_eq!(ids(&w), ["p-0", "p-1"]);
         assert_eq!((w.row_text("p-0"), w.queued()), ("a".into(), 0));
+    }
+
+    #[test]
+    fn a_click_below_the_last_block_adds_a_line_or_reuses_an_empty_one() {
+        let mut w = Win::with_texts(&["a"]);
+        w.app.apply(Action::AppendEnd);
+        assert_eq!(w.app.rows.len(), 2);
+        assert_eq!(focus_idx(&w), Some(1), "the new last line is edited");
+        assert_eq!(w.queued(), 1);
+        // its click again: the empty last line is reused, nothing new
+        w.app.apply(Action::AppendEnd);
+        assert_eq!((w.app.rows.len(), w.queued()), (2, 1));
+        assert_eq!(focus_idx(&w), Some(1));
+        w.type_text("b");
+        assert_eq!(w.text(), "b");
     }
 
     #[test]

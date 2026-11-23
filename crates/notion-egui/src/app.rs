@@ -220,6 +220,8 @@ pub(crate) enum Action {
     Forward,
     /// A row's hover "+": a new paragraph after it, edited.
     InsertBelow(usize),
+    /// A click below the last block: edit the trailing empty line, else add one.
+    AppendEnd,
 }
 
 /// Opens a web link outside the app (injectable for tests).
@@ -816,6 +818,7 @@ impl App {
             Action::Forward => self.go_history(false),
             Action::InsertBelow(i) if i < self.rows.len() => self.insert_block_after(i),
             Action::InsertBelow(_) => {}
+            Action::AppendEnd => self.append_block_at_end(),
         }
     }
 
@@ -982,7 +985,13 @@ impl App {
                         idx += 1;
                     }
                     self.goto = None;
-                    ui.add_space(200.0);
+                    let (_, end) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 200.0),
+                        Sense::click(),
+                    );
+                    if end.on_hover_cursor(egui::CursorIcon::Text).clicked() {
+                        acts.push(Action::AppendEnd);
+                    }
                 });
             });
         });
@@ -1629,9 +1638,24 @@ impl App {
                 ui.add(l)
             };
             return if editable {
-                r.on_hover_cursor(egui::CursorIcon::Text)
-                    .clicked()
-                    .then_some(Action::Edit(idx, Grab::End))
+                // the whole line is clickable, not just its text: an empty
+                // line has no text to hit
+                let (size, _) = look(&rows[idx].marker);
+                let line = egui::Rect::from_min_max(
+                    r.rect.min,
+                    egui::pos2(
+                        ui.max_rect().right(),
+                        r.rect.bottom().max(r.rect.top() + size * 1.4),
+                    ),
+                );
+                let hit = ui.interact(
+                    line,
+                    Id::unique(("row-hit", rows[idx].block_id.as_str())),
+                    Sense::click(),
+                );
+                (r.on_hover_cursor(egui::CursorIcon::Text).clicked()
+                    || hit.on_hover_cursor(egui::CursorIcon::Text).clicked())
+                .then_some(Action::Edit(idx, Grab::End))
             } else {
                 None
             };
