@@ -48,8 +48,9 @@ pub const PAGE_PAD: f32 = 48.0;
 /// spacing a text row gets. Icon, breadcrumb, title, blocks and tables share it.
 pub const TEXT_INSET: f32 = 20.0;
 pub const PAGE_MAX_WIDTH: f32 = 708.0;
-/// Vertical gap between blocks.
-pub const BLOCK_GAP: f32 = 5.0;
+/// Vertical gap between blocks: Notion pads each block 3 px above and below
+/// plus a 1–2 px margin.
+pub const BLOCK_GAP: f32 = 9.0;
 /// Gap between the columns of a `column_list` (Notion uses 46 points).
 pub const COLUMN_GAP: f32 = 46.0;
 pub const H_SIZE: [f32; 3] = [30.0, 24.0, 20.0];
