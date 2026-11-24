@@ -3,10 +3,14 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use eframe::egui::{self, Event, Key, Modifiers, RichText, Vec2};
+use eframe::egui::{
+    self, vec2, Align, Align2, Color32, CornerRadius, Event, FontId, Frame, Key, Layout, Modifiers,
+    Rect, RichText, ScrollArea, Sense, Ui, UiBuilder, Vec2,
+};
 
 use crate::ai::{self, Backend, Secrets};
 use crate::app::App;
+use crate::icons::{self, Icon};
 use crate::keys::{self, Chord, Command, Keymap};
 use crate::settings::{self, Settings};
 use crate::theme;
@@ -38,14 +42,15 @@ impl SettingsUi {
     }
 }
 
-const TABS: [&str; 3] = ["Appearance", "Keys", "AI Agent"];
-
 const PRESETS: &[(&str, &str)] = &[
     ("OpenAI", "https://api.openai.com/v1"),
     ("OpenRouter", "https://openrouter.ai/api/v1"),
     ("Mistral", "https://api.mistral.ai/v1"),
     ("Groq", "https://api.groq.com/openai/v1"),
-    ("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai"),
+    (
+        "Gemini",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+    ),
     ("Ollama (local)", "http://localhost:11434/v1"),
 ];
 
@@ -59,7 +64,9 @@ pub fn capture(events: &[Event]) -> Option<Chord> {
             pressed: true,
             repeat: false,
             modifiers,
-        } => keys::chords(*key, *physical_key, *modifiers).into_iter().next(),
+        } => keys::chords(*key, *physical_key, *modifiers)
+            .into_iter()
+            .next(),
         _ => None,
     })
 }
@@ -68,7 +75,9 @@ pub fn capture(events: &[Event]) -> Option<Chord> {
 /// Keys that type text or that the editor owns need ctrl, alt or super.
 pub fn bind(map: &mut Keymap, chord: Chord, cmd: Command) -> Result<Option<Command>, String> {
     if !chord.is_bindable() {
-        return Err(format!("{chord} types text or is the editor's own key: add Ctrl, Alt or Super"));
+        return Err(format!(
+            "{chord} types text or is the editor's own key: add Ctrl, Alt or Super"
+        ));
     }
     let prev = map.get(&chord).filter(|p| *p != cmd);
     map.set(chord, Some(cmd));
@@ -79,7 +88,8 @@ pub fn bind(map: &mut Keymap, chord: Chord, cmd: Command) -> Result<Option<Comma
 fn label(name: &str) -> String {
     let s = name.replace('_', " ");
     let mut c = s.chars();
-    c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
+    c.next()
+        .map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
 }
 
 fn save_keys(app: &mut App) {
@@ -98,6 +108,21 @@ fn save_secrets(app: &mut App) {
     }
 }
 
+/// The left column: (name, heading subtitle, icon) per tab.
+const TABS: [(&str, &str, Icon); 3] = [
+    ("Appearance", "Choose how the app looks and feels on this computer", Icon::Sidebar),
+    (
+        "Keyboard shortcuts",
+        "Bind any key to any action, including every / command",
+        Icon::Table,
+    ),
+    (
+        "AI Agent",
+        "Connect Claude with your subscription, or any AI with an API key",
+        Icon::Sparkle,
+    ),
+];
+
 /// Shows the window when `app.settings_ui` is Some; edits `app.settings`,
 /// `app.keys`, `app.ai_secrets` and saves them on change.
 pub fn show(app: &mut App, ctx: &egui::Context) {
@@ -112,28 +137,68 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         open = st.capture.take().is_some();
     }
     let (before, tab) = (app.settings.clone(), st.tab);
-    egui::Window::new("Settings")
-        .collapsible(false)
-        .resizable(true)
-        .default_size(Vec2::new(560.0, 480.0))
-        .open(&mut open)
+    // a big window in the middle of the screen, like Notion's settings
+    let screen = ctx.content_rect();
+    let size = Vec2::new(
+        (screen.width() - 80.0).clamp(420.0, 1100.0),
+        (screen.height() - 80.0).clamp(320.0, 760.0),
+    );
+    let vis = ctx.global_style().visuals.clone();
+    let frame = Frame::new()
+        .fill(vis.window_fill)
+        .stroke(vis.window_stroke)
+        .corner_radius(12)
+        .shadow(vis.window_shadow);
+    let mut close = false;
+    let m = egui::Modal::new(egui::Id::unique("settings"))
+        .frame(frame)
         .show(ctx, |ui| {
             if ui.is_sizing_pass() {
                 ui.ctx().request_repaint(); // a new window is invisible until the next frame
             }
-            ui.horizontal(|ui| {
-                for (i, t) in TABS.iter().enumerate() {
-                    ui.selectable_value(&mut st.tab, i, *t);
-                }
-            });
-            ui.separator();
-            match st.tab {
-                0 => appearance(app, &mut st, ui),
-                1 => keys_tab(app, &mut st, ui),
-                _ => ai_tab(app, &mut st, ui),
-            }
+            let c = theme::colors(ui);
+            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+            let (nav, body) = rect.split_left_right_at_x(rect.left() + 230.0);
+            let round = CornerRadius { nw: 12, sw: 12, ne: 0, se: 0 };
+            ui.painter().rect_filled(nav, round, c.sidebar);
+            let mut nui = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(nav.shrink(10.0))
+                    .layout(Layout::top_down(Align::Min)),
+            );
+            nav_list(&mut nui, c, &mut st.tab);
+            let x = Rect::from_center_size(body.right_top() + vec2(-24.0, 24.0), Vec2::splat(28.0));
+            let mut xui = ui.new_child(UiBuilder::new().max_rect(x));
+            close = icons::button(&mut xui, 28.0, Icon::Close, c.secondary, c.hover, Some("Close (Esc)"))
+                .clicked();
+            let inner = Rect::from_min_max(body.min + vec2(56.0, 40.0), body.max - vec2(40.0, 12.0));
+            let mut bui = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(inner)
+                    .layout(Layout::top_down(Align::Min)),
+            );
+            ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(&mut bui, |ui| {
+                    ui.set_max_width(760.0);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let (title, sub, _) = TABS[st.tab.min(2)];
+                    ui.label(RichText::new(title).size(28.0).strong().color(c.text));
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(sub).size(15.0).color(c.secondary));
+                    match st.tab {
+                        0 => appearance(app, &mut st, ui),
+                        1 => keys_tab(app, &mut st, ui),
+                        _ => ai_tab(app, &mut st, ui),
+                    }
+                    ui.add_space(24.0);
+                });
         });
+    if close || m.backdrop_response.clicked() {
+        open = false;
+    }
     if st.tab != tab {
+        ctx.request_repaint(); // the new tab is laid out in the next frame
         st.capture = None;
     }
     if app.settings != before {
@@ -155,6 +220,73 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     }
 }
 
+fn nav_list(ui: &mut Ui, c: &theme::Colors, tab: &mut usize) {
+    ui.add_space(8.0);
+    ui.label(RichText::new("  Settings").size(12.5).color(c.secondary));
+    ui.add_space(4.0);
+    for (i, (name, _, icon)) in TABS.iter().enumerate() {
+        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+        if i == *tab {
+            ui.painter().rect_filled(r, 6.0, c.hover.gamma_multiply(2.0));
+        } else if resp.hovered() {
+            ui.painter().rect_filled(r, 6.0, c.hover);
+        }
+        let ir = Rect::from_center_size(egui::pos2(r.left() + 18.0, r.center().y), Vec2::splat(18.0));
+        icons::paint(ui, ir, *icon, c.secondary);
+        ui.painter().text(
+            egui::pos2(r.left() + 38.0, r.center().y),
+            Align2::LEFT_CENTER,
+            *name,
+            FontId::proportional(14.5),
+            c.text,
+        );
+        if resp.clicked() {
+            *tab = i;
+        }
+    }
+    ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+        ui.label(RichText::new("  Ctrl+, opens · Esc closes").size(11.5).color(c.secondary));
+    });
+}
+
+/// A section heading with a rule under it.
+fn section(ui: &mut Ui, c: &theme::Colors, title: &str) {
+    ui.add_space(30.0);
+    ui.label(RichText::new(title).size(16.5).color(c.text));
+    ui.add_space(10.0);
+    let r = ui.available_rect_before_wrap();
+    ui.painter().hline(r.x_range(), r.top(), (1.0, c.border));
+    ui.add_space(4.0);
+}
+
+/// One setting: title and description on the left, its control on the right.
+fn row(ui: &mut Ui, c: &theme::Colors, title: &str, desc: &str, control: impl FnOnce(&mut Ui)) {
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        let w = ui.available_width();
+        ui.allocate_ui_with_layout(vec2(w * 0.58, 0.0), Layout::top_down(Align::Min), |ui| {
+            ui.label(RichText::new(title).size(14.5).color(c.text));
+            if !desc.is_empty() {
+                ui.label(RichText::new(desc).size(12.5).color(c.secondary));
+            }
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), control);
+    });
+}
+
+/// An on/off switch.
+fn toggle(ui: &mut Ui, c: &theme::Colors, on: &mut bool) {
+    let (r, resp) = ui.allocate_exact_size(vec2(38.0, 22.0), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+    }
+    let t = ui.ctx().animate_bool(resp.id, *on);
+    let fill = if *on { c.accent } else { c.hover.gamma_multiply(3.0) };
+    ui.painter().rect_filled(r, 11.0, fill);
+    let x = egui::lerp((r.left() + 11.0)..=(r.right() - 11.0), t);
+    ui.painter().circle_filled(egui::pos2(x, r.center().y), 8.5, Color32::WHITE);
+}
+
 fn swatch(ui: &mut egui::Ui, p: &theme::Palette) {
     let (r, _) = ui.allocate_exact_size(Vec2::splat(14.0), egui::Sense::hover());
     ui.painter().rect_filled(r, 2.0, p.colors.bg);
@@ -162,11 +294,13 @@ fn swatch(ui: &mut egui::Ui, p: &theme::Palette) {
 }
 
 fn appearance(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
+    let c = theme::colors(ui);
     let s = &mut app.settings;
-    ui.horizontal(|ui| {
-        ui.label("Theme");
+    section(ui, c, "Theme");
+    row(ui, c, "Design", "A light, dark or colourful palette, or follow the system", |ui| {
         egui::ComboBox::from_id_salt("theme")
             .selected_text(s.theme.clone())
+            .width(180.0)
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut s.theme, "System".to_string(), "System");
                 for p in theme::THEMES {
@@ -178,8 +312,8 @@ fn appearance(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
             });
     });
 
-    ui.horizontal(|ui| {
-        ui.label("Text size");
+    section(ui, c, "Text");
+    row(ui, c, "Text size", "Scales the whole window, like zoom in a browser", |ui| {
         let mut pct = st.zoom.unwrap_or(s.zoom * 100.0);
         let r = ui.add(egui::Slider::new(&mut pct, 75.0..=200.0).suffix(" %").step_by(5.0));
         if r.changed() {
@@ -191,11 +325,6 @@ fn appearance(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
             st.zoom = None;
         }
     });
-    ui.horizontal(|ui| {
-        ui.label("Scroll speed");
-        ui.add(egui::Slider::new(&mut s.scroll_speed, 0.25..=4.0).suffix("×"));
-    });
-
     let fonts = st.fonts.get_or_insert_with(|| {
         let mut v: Vec<_> = settings::system_fonts()
             .into_iter()
@@ -212,14 +341,15 @@ fn appearance(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
             .find(|(_, p)| p.to_string_lossy() == s.font)
             .map_or_else(|| s.font.clone(), |(n, _)| n.clone())
     };
-    ui.horizontal(|ui| {
-        ui.label("Font");
+    let font_filter = &mut st.font_filter;
+    row(ui, c, "Font", "Inter, or any font installed on this computer", |ui| {
         egui::ComboBox::from_id_salt("font")
             .selected_text(current)
+            .width(180.0)
             .show_ui(ui, |ui| {
-                ui.add(egui::TextEdit::singleline(&mut st.font_filter).hint_text("Filter"));
+                ui.add(egui::TextEdit::singleline(font_filter).hint_text("Filter"));
                 ui.selectable_value(&mut s.font, String::new(), "Inter (built-in)");
-                let f = st.font_filter.to_lowercase();
+                let f = font_filter.to_lowercase();
                 egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
                     for (n, p) in fonts.iter().filter(|(n, _)| n.to_lowercase().contains(&f)) {
                         ui.selectable_value(&mut s.font, p.to_string_lossy().into(), n);
@@ -227,10 +357,21 @@ fn appearance(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
                 });
             });
     });
+    row(ui, c, "Full-width pages", "Use the whole window for page content", |ui| {
+        toggle(ui, c, &mut s.full_width)
+    });
 
-    ui.checkbox(&mut s.full_width, "Full-width pages");
-    ui.add_space(8.0);
-    if ui.button("Reset to defaults").clicked() {
+    section(ui, c, "Scrolling");
+    row(ui, c, "Scroll speed", "Multiplier for the mouse wheel and touchpad", |ui| {
+        ui.add(egui::Slider::new(&mut s.scroll_speed, 0.25..=4.0).suffix("×"));
+    });
+
+    section(ui, c, "Reset");
+    let mut reset = false;
+    row(ui, c, "Reset appearance", "Back to the defaults; AI settings stay", |ui| {
+        reset = ui.button("Reset to defaults").clicked();
+    });
+    if reset {
         let ai = s.ai.clone();
         *s = Settings {
             ai,
@@ -241,6 +382,7 @@ fn appearance(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
 }
 
 fn keys_tab(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
+    let c = theme::colors(ui);
     if let Some(cmd) = st.capture {
         let chord = ui.ctx().input_mut(|i| {
             let c = capture(&i.events);
@@ -264,50 +406,63 @@ fn keys_tab(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
             }
         }
     }
-    ui.label("/ commands (Text, Heading 1, To-do, Callout, …) can be bound like any other action");
+    ui.add_space(22.0);
+    let mut reset = false;
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut st.key_filter).hint_text("Filter"));
-        if ui.button("Reset all to defaults").clicked() {
-            app.keys = Keymap::default();
-            st.capture = None;
-            st.note.clear();
-            save_keys(app);
-        }
+        ui.add(
+            egui::TextEdit::singleline(&mut st.key_filter)
+                .hint_text("Search shortcuts")
+                .desired_width(280.0),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            reset = ui.button("Reset all to defaults").clicked();
+        });
     });
-    if !st.note.is_empty() {
-        ui.label(&st.note);
+    if reset {
+        app.keys = Keymap::default();
+        st.capture = None;
+        st.note.clear();
+        save_keys(app);
     }
+    if !st.note.is_empty() {
+        ui.add_space(6.0);
+        ui.label(RichText::new(&st.note).color(c.accent));
+    }
+    section(ui, c, "Actions and / commands");
     let f = st.key_filter.to_lowercase();
     let bound = app.keys.bindings();
     let (mut unbind, mut start) = (None, None);
-    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-        egui::Grid::new("keys").num_columns(2).striped(true).show(ui, |ui| {
-            for (name, cmd) in keys::NAMES {
-                let text = label(name);
-                let chords: Vec<&Chord> =
-                    bound.iter().filter(|(_, c)| c == cmd).map(|(k, _)| k).collect();
-                let hit = text.to_lowercase().contains(&f)
-                    || chords.iter().any(|k| k.to_string().contains(&f));
-                if !hit {
-                    continue;
+    for (name, cmd) in keys::NAMES {
+        let text = label(name);
+        let chords: Vec<&Chord> = bound.iter().filter(|(_, c)| c == cmd).map(|(k, _)| k).collect();
+        let hit = text.to_lowercase().contains(&f) || chords.iter().any(|k| k.to_string().contains(&f));
+        if !hit {
+            continue;
+        }
+        ui.horizontal(|ui| {
+            ui.set_min_height(34.0);
+            ui.label(RichText::new(text).size(14.0).color(c.text));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if st.capture == Some(*cmd) {
+                    ui.label(RichText::new("Press keys… Esc cancels").color(c.accent));
+                } else if icons::button(ui, 24.0, Icon::Plus, c.secondary, c.hover, Some("Add a key"))
+                    .clicked()
+                {
+                    start = Some(*cmd);
                 }
-                ui.label(text);
-                ui.horizontal_wrapped(|ui| {
-                    for k in chords {
-                        if ui.small_button(format!("{k} ×")).on_hover_text("Unbind").clicked() {
-                            unbind = Some(k.clone());
-                        }
+                for k in chords.iter().rev() {
+                    let chip = egui::Button::new(RichText::new(format!("{k}  ×")).size(12.5).color(c.text))
+                        .fill(c.hover.gamma_multiply(1.6))
+                        .corner_radius(6);
+                    if ui.add(chip).on_hover_text("Unbind").clicked() {
+                        unbind = Some((*k).clone());
                     }
-                    if st.capture == Some(*cmd) {
-                        ui.label("Press keys… Esc cancels");
-                    } else if ui.small_button("+").clicked() {
-                        start = Some(*cmd);
-                    }
-                });
-                ui.end_row();
-            }
+                }
+            });
         });
-    });
+        let r = ui.available_rect_before_wrap();
+        ui.painter().hline(r.x_range(), r.top(), (1.0, c.border.gamma_multiply(0.6)));
+    }
     if let Some(k) = unbind {
         app.keys.set(k, None);
         st.note.clear();
@@ -320,15 +475,28 @@ fn keys_tab(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
 }
 
 fn ai_tab(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
+    let c = theme::colors(ui);
     let cfg = &mut app.settings.ai;
-    for (b, t) in [
-        (Backend::ClaudeCli, "Claude — your subscription (Claude Code)"),
-        (Backend::Anthropic, "Anthropic API key"),
-        (Backend::OpenAiCompatible, "Other AI — OpenAI-compatible API key"),
+    section(ui, c, "Provider");
+    for (b, t, d) in [
+        (
+            Backend::ClaudeCli,
+            "Claude — your subscription",
+            "Runs your installed Claude Code with your Pro/Max login; no API key",
+        ),
+        (Backend::Anthropic, "Anthropic API", "Pay-as-you-go with an Anthropic API key"),
+        (
+            Backend::OpenAiCompatible,
+            "Other AI",
+            "Any OpenAI-compatible API: OpenAI, OpenRouter, Mistral, Groq, Gemini, Ollama",
+        ),
     ] {
-        ui.radio_value(&mut cfg.backend, b, t);
+        row(ui, c, t, d, |ui| {
+            if ui.radio(cfg.backend == b, "").clicked() {
+                cfg.backend = b;
+            }
+        });
     }
-    ui.add_space(6.0);
     let mut key_changed = false;
     let slot = Secrets::slot(cfg);
     let mut key = slot
@@ -336,22 +504,32 @@ fn ai_tab(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
         .and_then(|s| app.ai_secrets.keys.get(s))
         .cloned()
         .unwrap_or_default();
+    let field = |ui: &mut Ui, v: &mut String, hint: &str, secret: bool| {
+        ui.add(
+            egui::TextEdit::singleline(v)
+                .hint_text(hint)
+                .password(secret)
+                .desired_width(300.0),
+        )
+        .changed()
+    };
+    section(ui, c, "Connection");
+    let key_desc = "Saved only on this computer (ai-keys.json, readable by you alone)";
     match cfg.backend {
         Backend::ClaudeCli => {
-            ui.horizontal(|ui| {
-                ui.label("Claude path");
-                ui.text_edit_singleline(&mut cfg.claude_path);
+            row(ui, c, "Claude path", "Run `claude` once in a terminal to sign in", |ui| {
+                field(ui, &mut cfg.claude_path, "claude", false);
             });
-            ui.label("Uses your Claude Code sign-in (Pro/Max). Run `claude` once in a terminal to sign in.");
+            row(ui, c, "Model", "Empty uses Claude Code's default", |ui| {
+                field(ui, &mut cfg.model, "default", false);
+            });
         }
         Backend::Anthropic => {
-            ui.horizontal(|ui| {
-                ui.label("API key");
-                key_changed = ui.add(egui::TextEdit::singleline(&mut key).password(true)).changed();
+            row(ui, c, "API key", key_desc, |ui| {
+                key_changed = field(ui, &mut key, "sk-ant-…", true);
             });
-            ui.horizontal(|ui| {
-                ui.label("Model");
-                ui.add(egui::TextEdit::singleline(&mut cfg.model).hint_text("claude-opus-5-5"));
+            row(ui, c, "Model", "Empty uses claude-opus-5-5", |ui| {
+                field(ui, &mut cfg.model, "claude-opus-5-5", false);
             });
         }
         Backend::OpenAiCompatible => {
@@ -359,28 +537,27 @@ fn ai_tab(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
                 .iter()
                 .find(|(_, u)| *u == cfg.base_url.trim_end_matches('/'))
                 .map_or("Custom", |(n, _)| n);
-            ui.horizontal(|ui| {
-                ui.label("Service");
-                egui::ComboBox::from_id_salt("preset").selected_text(cur).show_ui(ui, |ui| {
-                    for (n, u) in PRESETS {
-                        if ui.selectable_label(cur == *n, *n).clicked() {
-                            cfg.base_url = (*u).into();
+            row(ui, c, "Service", "Fills in the base URL", |ui| {
+                egui::ComboBox::from_id_salt("preset")
+                    .selected_text(cur)
+                    .width(180.0)
+                    .show_ui(ui, |ui| {
+                        for (n, u) in PRESETS {
+                            if ui.selectable_label(cur == *n, *n).clicked() {
+                                cfg.base_url = (*u).into();
+                            }
                         }
-                    }
-                    let _ = ui.selectable_label(cur == "Custom", "Custom"); // keeps the URL
-                });
+                        let _ = ui.selectable_label(cur == "Custom", "Custom"); // keeps the URL
+                    });
             });
-            ui.horizontal(|ui| {
-                ui.label("Base URL");
-                ui.text_edit_singleline(&mut cfg.base_url);
+            row(ui, c, "Base URL", "https, or http to this computer only", |ui| {
+                field(ui, &mut cfg.base_url, "https://…/v1", false);
             });
-            ui.horizontal(|ui| {
-                ui.label("API key");
-                key_changed = ui.add(egui::TextEdit::singleline(&mut key).password(true)).changed();
+            row(ui, c, "API key", key_desc, |ui| {
+                key_changed = field(ui, &mut key, "empty for a local server", true);
             });
-            ui.horizontal(|ui| {
-                ui.label("Model");
-                ui.add(egui::TextEdit::singleline(&mut cfg.model).hint_text("required, e.g. gpt-4o"));
+            row(ui, c, "Model", "Required, e.g. gpt-4o", |ui| {
+                field(ui, &mut cfg.model, "model name", false);
             });
         }
     }
@@ -395,9 +572,19 @@ fn ai_tab(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
         }
     }
     let cfg = app.settings.ai.clone();
-    ui.add_space(6.0);
+    let done = st.test.as_ref().and_then(|t| t.lock().unwrap().take());
+    if done.is_some() {
+        st.test = None;
+        st.test_result = done;
+    }
+    section(ui, c, "Check");
     let pending = st.test.is_some();
-    if ui.add_enabled(!pending, egui::Button::new("Test connection")).clicked() {
+    let mut go = false;
+    row(ui, c, "Test connection", "Sends one tiny request with these settings", |ui| {
+        let text = if pending { "Testing…" } else { "Test connection" };
+        go = ui.add_enabled(!pending, egui::Button::new(text)).clicked();
+    });
+    if go {
         let k = (!key.is_empty()).then_some(key);
         let out: Test = Arc::default();
         let (o, ctx) = (out.clone(), ui.ctx().clone());
@@ -409,25 +596,23 @@ fn ai_tab(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
         st.test = Some(out);
         st.test_result = None;
     }
-    let done = st.test.as_ref().and_then(|t| t.lock().unwrap().take());
-    if done.is_some() {
-        st.test = None;
-        st.test_result = done;
-    }
-    if st.test.is_some() {
-        ui.label("Testing…");
-    }
     match &st.test_result {
         Some(Ok(m)) => {
-            ui.label(m);
+            ui.add_space(6.0);
+            ui.label(RichText::new(m).color(c.accent));
         }
         Some(Err(e)) => {
-            ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+            ui.add_space(6.0);
+            ui.label(RichText::new(e).color(c.error));
         }
         None => {}
     }
-    ui.add_space(6.0);
-    ui.label(RichText::new("Open AI panel: Ctrl+Shift+H").weak());
+    ui.add_space(18.0);
+    ui.label(
+        RichText::new("Open the AI panel with Ctrl+Shift+H or the ✦ button at the bottom of the sidebar.")
+            .size(12.5)
+            .color(c.secondary),
+    );
 }
 
 #[cfg(test)]
@@ -438,7 +623,10 @@ mod tests {
 
     fn run(w: &mut Win, events: Vec<Event>) {
         let raw = RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0))),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 800.0),
+            )),
             events,
             ..Default::default()
         };
@@ -476,7 +664,11 @@ mod tests {
     fn capture_takes_the_chord_and_rebinds() {
         assert_eq!(capture(&[Event::Text("x".into())]), None);
         assert_eq!(capture(&[key_mod(Key::Copy, Modifiers::CTRL)]), None);
-        let cs = Modifiers { ctrl: true, shift: true, ..Modifiers::NONE };
+        let cs = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::NONE
+        };
         let c = capture(&[key_mod(Key::Num9, cs)]).unwrap();
         assert_eq!(c, ch("ctrl+shift+9"));
         let callout = keys::NAMES.iter().find(|(n, _)| *n == "callout").unwrap().1;
@@ -501,7 +693,11 @@ mod tests {
             ..Default::default()
         });
         run(&mut w, vec![]);
-        let cs = Modifiers { ctrl: true, shift: true, ..Modifiers::NONE };
+        let cs = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::NONE
+        };
         run(&mut w, vec![key_mod(Key::Num9, cs)]);
         assert_eq!(w.app.keys.get(&ch("ctrl+shift+9")), Some(callout));
         assert!(!w.app.settings_ui.as_ref().unwrap().capturing());
@@ -541,11 +737,17 @@ mod tests {
     fn capturing_swallows_ctrl_b() {
         let mut w = Win::with_texts(&["a"]);
         let callout = keys::NAMES.iter().find(|(n, _)| *n == "callout").unwrap().1;
-        w.app.settings_ui = Some(SettingsUi { tab: 1, capture: Some(callout), ..Default::default() });
+        // editing first: the settings window is modal and blocks the page behind it
         w.edit(0);
         w.select(0, 1);
+        w.app.settings_ui = Some(SettingsUi {
+            tab: 1,
+            capture: Some(callout),
+            ..Default::default()
+        });
         w.press(Key::B, Modifiers::CTRL);
-        assert_eq!(w.text(), "a", "ctrl+b must not bold");
+        let text = w.app.focus.as_ref().map_or("a", |f| f.text.as_str());
+        assert_eq!(text, "a", "ctrl+b must not bold");
         assert_eq!(w.app.keys.get(&ch("ctrl+b")), Some(callout));
         assert!(!w.app.settings_ui.as_ref().unwrap().capturing());
     }
@@ -555,7 +757,17 @@ mod tests {
         let callout = keys::NAMES.iter().find(|(n, _)| *n == "callout").unwrap().1;
         let mut m = Keymap::default();
         let before = m.clone();
-        for k in ["enter", "up", "escape", "a", "shift+a", "1", "space", "+", "shift+space"] {
+        for k in [
+            "enter",
+            "up",
+            "escape",
+            "a",
+            "shift+a",
+            "1",
+            "space",
+            "+",
+            "shift+space",
+        ] {
             assert!(bind(&mut m, ch(k), callout).is_err(), "{k}");
         }
         assert_eq!(m, before);

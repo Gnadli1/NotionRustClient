@@ -5,7 +5,8 @@
 use std::collections::HashSet;
 
 use eframe::egui::{
-    self, vec2, Align, FontId, Layout, Popup, Rect, RichText, ScrollArea, Sense, Ui, UiBuilder,
+    self, vec2, Align, Color32, FontId, Layout, Popup, Rect, RichText, ScrollArea, Sense,
+    StrokeKind, Ui, UiBuilder,
 };
 use notion_core::store::PageEntry;
 
@@ -25,6 +26,9 @@ pub struct Header<'a> {
     pub no_token: bool,
     pub can_back: bool,
     pub can_forward: bool,
+    /// Unread updates: a dot on the bell.
+    pub unread: usize,
+    pub no_person: bool,
 }
 
 /// The logo, sidebar toggle and back/forward: the top-left cluster Notion keeps
@@ -86,6 +90,34 @@ pub fn header(ui: &mut Ui, c: &Colors, h: &Header<'_>) -> Option<Action> {
             {
                 act = Some(Action::Forward);
             }
+            // Notion keeps the inbox and "new page" at the header's right end
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icons::button(
+                    ui,
+                    28.0,
+                    Icon::Compose,
+                    c.secondary,
+                    c.hover,
+                    Some("New page"),
+                )
+                .clicked()
+                {
+                    act = Some(Action::NewPage(None));
+                }
+                let tip = if h.no_person {
+                    crate::inbox::NO_PERSON.to_string()
+                } else {
+                    format!("Updates ({} unread)", h.unread)
+                };
+                let bell = icons::button(ui, 28.0, Icon::Bell, c.secondary, c.hover, Some(&tip));
+                if h.unread > 0 {
+                    let dot = bell.rect.right_top() + vec2(-8.0, 8.0);
+                    ui.painter().circle_filled(dot, 3.5, c.error);
+                }
+                if bell.clicked() {
+                    act = Some(Action::Updates);
+                }
+            });
         },
     );
     act
@@ -106,15 +138,17 @@ pub fn workspace_row(ui: &mut Ui, c: &Colors, h: &Header<'_>) -> Option<Action> 
         h.workspace.to_string()
     };
     let name_color = if h.no_token { c.error } else { c.text };
+    let mut text = rect.shrink2(vec2(7.0, 0.0));
+    text.max.x -= 78.0; // the chevron and two buttons
     let mut row = ui.new_child(
         UiBuilder::new()
-            .max_rect(rect.shrink2(vec2(7.0, 0.0)))
+            .max_rect(text)
             .layout(Layout::left_to_right(Align::Center)),
     );
     row.style_mut().interaction.selectable_labels = false;
     row.spacing_mut().item_spacing.x = 6.0;
-    icons::workspace_avatar(&mut row, h.workspace, 20.0);
-    row.label(RichText::new(name).size(14.0).strong().color(name_color));
+    icons::workspace_avatar(&mut row, h.workspace, 22.0);
+    row.add(egui::Label::new(RichText::new(name).size(14.0).color(name_color)).truncate());
     let chev = Rect::from_center_size(
         egui::pos2(row.cursor().left() + 7.0, rect.center().y),
         vec2(14.0, 14.0),
@@ -122,19 +156,27 @@ pub fn workspace_row(ui: &mut Ui, c: &Colors, h: &Header<'_>) -> Option<Action> 
     row.advance_cursor_after_rect(chev);
     icons::paint(&row, chev, Icon::ChevronDown, c.secondary);
 
-    // the compose button sits at the far right, like Notion's "new page"
-    let compose = Rect::from_center_size(
-        egui::pos2(rect.right() - 16.0, rect.center().y),
-        vec2(22.0, 22.0),
-    );
-    let compose_resp = ui.interact(compose, resp.id.with("compose"), Sense::click());
-    if compose_resp.hovered() {
-        ui.painter()
-            .rect_filled(compose, 4.0, c.hover.gamma_multiply(1.6));
-    }
-    icons::paint(ui, compose.shrink(4.0), Icon::Compose, c.secondary);
-    if compose_resp.on_hover_text("New page").clicked() {
-        act = Some(Action::NewPage(None));
+    // the footer's right end: AI agent and settings
+    for (i, (icon, tip, a)) in [
+        (Icon::Gear, "Settings (Ctrl+,)", Action::Settings),
+        (Icon::Sparkle, "AI Agent (Ctrl+Shift+H)", Action::Ai),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let b = Rect::from_center_size(
+            egui::pos2(rect.right() - 15.0 - 28.0 * i as f32, rect.center().y),
+            vec2(26.0, 26.0),
+        );
+        let br = ui.interact(b, resp.id.with(tip), Sense::click());
+        if br.hovered() {
+            ui.painter()
+                .rect_filled(b, 4.0, c.hover.gamma_multiply(1.6));
+        }
+        icons::paint(ui, b.shrink(5.0), icon, c.secondary);
+        if br.on_hover_text(tip).clicked() {
+            act = Some(a);
+        }
     }
 
     // `Popup::menu` keeps its own open state in egui's memory; it has to be
@@ -201,108 +243,127 @@ fn menu_item(ui: &mut Ui, _c: &Colors, text: &str) -> bool {
     .clicked()
 }
 
+/// Everything under the header: the search pill, the page tree and, pinned
+/// to the bottom, Trash / Sync and the workspace footer.
 pub fn show(
     ui: &mut Ui,
     c: &Colors,
+    h: &Header<'_>,
     tree: &[PageEntry],
     open: &HashSet<String>,
     current: Option<&str>,
-    unread: usize,
-    no_person: bool,
 ) -> Option<Action> {
     let mut act = None;
-    let hint = RichText::new("Ctrl+K").small().color(c.secondary);
-    let search = nav_row(ui, c, Icon::Search, "Search", |ui| {
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(hint));
-    });
-    if search.clicked() {
+    if search_pill(ui, c).clicked() {
         act = Some(Action::Search);
     }
-    let inbox = nav_row(ui, c, Icon::Bell, "Updates", |ui| {
-        if unread > 0 {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(unread.to_string()).small().color(c.secondary));
-            });
+    ui.add_space(10.0);
+    ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+        ui.add_space(6.0);
+        if let Some(a) = workspace_row(ui, c, h) {
+            act = Some(a);
         }
-    });
-    if inbox.clicked() {
-        act = Some(Action::Updates);
-    }
-    if no_person {
-        ui.label(
-            RichText::new(crate::inbox::NO_PERSON)
-                .small()
-                .color(c.secondary),
-        );
-    }
-    let sync = nav_row(ui, c, Icon::Sync, "Sync everything", |_| {});
-    if sync.clicked() {
-        act = Some(Action::SyncAll);
-    }
-    let bin = nav_row(ui, c, Icon::Trash, "Trash", |_| {});
-    if bin.clicked() {
-        act = Some(Action::Dlg(crate::pages::Dlg::Bin { sel: 0 }));
-    }
-    let ai = nav_row(ui, c, Icon::Comment, "AI Agent", |_| {});
-    if ai.on_hover_text("Ask AI about the open page (Ctrl+Shift+H)").clicked() {
-        act = Some(Action::Ai);
-    }
-    let settings = nav_row(ui, c, Icon::Dots, "Settings", |_| {});
-    if settings.on_hover_text("Theme, text size, font, key binds, AI (Ctrl+,)").clicked() {
-        act = Some(Action::Settings);
-    }
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.add_space(7.0);
-        ui.label(RichText::new("Pages").size(12.0).color(c.secondary));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.add_space(4.0);
+        let line = ui.available_rect_before_wrap();
+        ui.painter()
+            .hline(line.x_range(), line.bottom(), (1.0, c.border));
+        ui.add_space(6.0);
+        if quiet_row(ui, c, Icon::Sync, "Sync everything").clicked() {
+            act = Some(Action::SyncAll);
+        }
+        if quiet_row(ui, c, Icon::Trash, "Trash").clicked() {
+            act = Some(Action::Dlg(crate::pages::Dlg::Bin { sel: 0 }));
+        }
+        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Pages").size(12.0).color(c.secondary));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_space(2.0);
+                    if icons::button(ui, 22.0, Icon::Plus, c.secondary, c.hover, Some("New page"))
+                        .clicked()
+                    {
+                        act = Some(Action::NewPage(None));
+                    }
+                });
+            });
             ui.add_space(2.0);
-            if icons::button(ui, 22.0, Icon::Plus, c.secondary, c.hover, Some("New page")).clicked()
-            {
-                act = Some(Action::NewPage(None));
-            }
+            let list = rows(tree, open);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ScrollArea::vertical().auto_shrink(false).show_rows(
+                ui,
+                ROW_H,
+                list.len(),
+                |ui, range| {
+                    for r in &list[range] {
+                        if let Some(a) = tree_row(ui, c, r, current) {
+                            act = Some(a);
+                        }
+                    }
+                },
+            );
         });
     });
-    ui.add_space(2.0);
-    let list = rows(tree, open);
-    ui.spacing_mut().item_spacing.y = 0.0;
-    ScrollArea::vertical()
-        .auto_shrink(false)
-        .show_rows(ui, ROW_H, list.len(), |ui, range| {
-            for r in &list[range] {
-                if let Some(a) = tree_row(ui, c, r, current) {
-                    act = Some(a);
-                }
-            }
-        });
     act
 }
 
-/// A top sidebar row: a 30 px clickable line with a 18 px icon and its label.
-fn nav_row(
-    ui: &mut Ui,
-    c: &Colors,
-    icon: Icon,
-    label: &str,
-    right: impl FnOnce(&mut Ui),
-) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
-    if resp.hovered() {
+/// Notion's "Search or ask" box: a rounded, bordered pill with the shortcut.
+fn search_pill(ui: &mut Ui, c: &Colors) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+    let fill = if resp.hovered() {
+        c.hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter()
+        .rect(rect, 8.0, fill, (1.0, c.border), StrokeKind::Inside);
+    let icon = Rect::from_center_size(
+        egui::pos2(rect.left() + 18.0, rect.center().y),
+        vec2(16.0, 16.0),
+    );
+    icons::paint(ui, icon, Icon::Search, c.secondary);
+    let p = ui.painter();
+    p.text(
+        egui::pos2(rect.left() + 34.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "Search",
+        FontId::proportional(14.0),
+        c.secondary,
+    );
+    let chip = p.layout_no_wrap("Ctrl+K".into(), FontId::proportional(11.5), c.secondary);
+    let cr = Rect::from_center_size(
+        egui::pos2(
+            rect.right() - 10.0 - chip.size().x / 2.0 - 5.0,
+            rect.center().y,
+        ),
+        chip.size() + vec2(10.0, 4.0),
+    );
+    p.rect_filled(cr, 4.0, c.hover.gamma_multiply(1.6));
+    p.galley(cr.center() - chip.size() / 2.0, chip, c.secondary);
+    resp
+}
+
+/// A muted bottom row, like Notion's "Customize sidebar".
+fn quiet_row(ui: &mut Ui, c: &Colors, icon: Icon, label: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+    let col = if resp.hovered() {
         ui.painter().rect_filled(rect, 6.0, c.hover);
-    }
-    let icon_rect = Rect::from_center_size(
+        c.text
+    } else {
+        c.secondary
+    };
+    let ir = Rect::from_center_size(
         egui::pos2(rect.left() + 17.0, rect.center().y),
-        vec2(18.0, 18.0),
+        vec2(16.0, 16.0),
     );
-    icons::paint(ui, icon_rect, icon, c.secondary);
-    let mut row = ui.new_child(
-        UiBuilder::new()
-            .max_rect(rect.shrink2(vec2(31.0, 0.0)))
-            .layout(Layout::left_to_right(Align::Center)),
+    icons::paint(ui, ir, icon, col);
+    ui.painter().text(
+        egui::pos2(rect.left() + 34.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.5),
+        col,
     );
-    row.style_mut().interaction.selectable_labels = false;
-    row.label(RichText::new(label).size(14.0).color(c.text));
-    row.with_layout(Layout::right_to_left(Align::Center), |ui| right(ui));
     resp
 }
 
@@ -377,6 +438,8 @@ mod tests {
             no_token: false,
             can_back: false,
             can_forward: false,
+            unread: 0,
+            no_person: false,
         };
         let frame = |events: Vec<Event>| {
             let raw = RawInput {
@@ -413,5 +476,58 @@ mod tests {
             Popup::is_any_open(&ctx),
             "the menu closed after the click frame"
         );
+    }
+
+    #[test]
+    fn footer_buttons_open_settings_and_ai() {
+        let ctx = Context::default();
+        crate::setup_fonts(&ctx);
+        crate::theme::install(&ctx);
+        let names = vec!["Mine".to_string()];
+        let h = Header {
+            workspace: &names[0],
+            names: &names,
+            no_token: false,
+            can_back: false,
+            can_forward: false,
+            unread: 0,
+            no_person: false,
+        };
+        let click = |x: f32| {
+            let pos = Pos2::new(x, ROW_H / 2.0);
+            let mut got = None;
+            for events in [
+                vec![Event::PointerMoved(pos)],
+                vec![
+                    Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    },
+                    Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+            ] {
+                let raw = RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 400.0))),
+                    events,
+                    ..Default::default()
+                };
+                ctx.run_ui(raw, |ui| {
+                    ui.set_width(260.0);
+                    let c = crate::theme::colors(ui);
+                    got = workspace_row(ui, c, &h).or(got.take());
+                })
+                .drop_without_applying_deltas();
+            }
+            got
+        };
+        assert!(matches!(click(245.0), Some(Action::Settings)));
+        assert!(matches!(click(217.0), Some(Action::Ai)));
     }
 }

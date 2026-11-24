@@ -35,6 +35,12 @@ pub enum Icon {
     Chart,
     /// A grid (the table view's tab).
     Table,
+    /// Settings.
+    Gear,
+    /// The AI agent: a four-point star.
+    Sparkle,
+    /// Send: an arrow pointing up.
+    ArrowUp,
 }
 
 /// Draws `icon` centred in `rect` in `color`. The stroke scales with the icon
@@ -194,6 +200,34 @@ pub fn paint(ui: &Ui, rect: Rect, icon: Icon, color: Color32) {
                 p(0.74, 0.52),
             ]);
             line(vec![p(0.50, 0.58), p(0.86, 0.22)]);
+        }
+        Icon::Gear => {
+            painter.circle_stroke(p(0.5, 0.5), 0.12 * s, stroke);
+            painter.circle_stroke(p(0.5, 0.5), 0.24 * s, stroke);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                let (x, y) = (a.cos(), a.sin());
+                line(vec![
+                    p(0.5 + 0.24 * x, 0.5 + 0.24 * y),
+                    p(0.5 + 0.34 * x, 0.5 + 0.34 * y),
+                ]);
+            }
+        }
+        Icon::Sparkle => {
+            closed(vec![
+                p(0.50, 0.14),
+                p(0.59, 0.41),
+                p(0.86, 0.50),
+                p(0.59, 0.59),
+                p(0.50, 0.86),
+                p(0.41, 0.59),
+                p(0.14, 0.50),
+                p(0.41, 0.41),
+            ]);
+        }
+        Icon::ArrowUp => {
+            line(vec![p(0.50, 0.82), p(0.50, 0.20)]);
+            line(vec![p(0.26, 0.44), p(0.50, 0.20), p(0.74, 0.44)]);
         }
         Icon::Home => {
             line(vec![p(0.20, 0.50), p(0.50, 0.20), p(0.80, 0.50)]);

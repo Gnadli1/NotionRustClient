@@ -2029,6 +2029,8 @@ impl App {
             no_token,
             can_back,
             can_forward,
+            unread: self.unread,
+            no_person: self.no_person,
         };
         // The sidebar runs the full height of the window, like Notion's, and
         // the tab strip only covers the content area next to it.
@@ -2045,20 +2047,16 @@ impl App {
                             .show(ui, |ui| crate::view::sidebar::header(ui, c, &header))
                             .inner;
                         let body = Frame::new()
-                            .inner_margin(Margin::symmetric(6, 0))
+                            .inner_margin(Margin::symmetric(8, 0))
                             .show(ui, |ui| {
-                                let row = crate::view::sidebar::workspace_row(ui, c, &header);
-                                row.or_else(|| {
-                                    crate::view::sidebar::show(
-                                        ui,
-                                        c,
-                                        &self.tree,
-                                        &self.tree_open,
-                                        self.current.as_deref(),
-                                        self.unread,
-                                        self.no_person,
-                                    )
-                                })
+                                crate::view::sidebar::show(
+                                    ui,
+                                    c,
+                                    &header,
+                                    &self.tree,
+                                    &self.tree_open,
+                                    self.current.as_deref(),
+                                )
                             })
                             .inner;
                         head.or(body)
