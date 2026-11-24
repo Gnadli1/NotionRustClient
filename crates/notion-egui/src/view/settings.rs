@@ -118,6 +118,9 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         .default_size(Vec2::new(560.0, 480.0))
         .open(&mut open)
         .show(ctx, |ui| {
+            if ui.is_sizing_pass() {
+                ui.ctx().request_repaint(); // a new window is invisible until the next frame
+            }
             ui.horizontal(|ui| {
                 for (i, t) in TABS.iter().enumerate() {
                     ui.selectable_value(&mut st.tab, i, *t);
@@ -515,6 +518,22 @@ mod tests {
         w.press(Key::Comma, Modifiers::CTRL);
         assert!(w.app.settings_ui.is_some());
         w.press(Key::Comma, Modifiers::CTRL);
+        assert!(w.app.settings_ui.is_none());
+        // also while a block is being edited
+        w.edit(0);
+        w.press(Key::Comma, Modifiers::CTRL);
+        w.frames(vec![]);
+        assert!(w.app.settings_ui.is_some());
+    }
+
+    #[test]
+    fn sidebar_buttons_open_settings_and_ai() {
+        let mut w = Win::with_texts(&["a"]);
+        w.app.apply(crate::app::Action::Settings);
+        w.app.apply(crate::app::Action::Ai);
+        w.frames(vec![]);
+        assert!(w.app.settings_ui.is_some() && w.app.ai.is_some());
+        w.app.apply(crate::app::Action::Settings);
         assert!(w.app.settings_ui.is_none());
     }
 

@@ -1725,18 +1725,8 @@ impl App {
             Command::Updates | Command::MarkAllRead
                 if self.switcher.is_some() || self.conflict.is_some() || self.dlg.is_some() => {}
             Command::Updates => self.toggle_inbox(),
-            Command::Settings => {
-                self.settings_ui = match self.settings_ui {
-                    Some(_) => None,
-                    None => Some(Default::default()),
-                }
-            }
-            Command::Ai => {
-                self.ai = match self.ai {
-                    Some(_) => None,
-                    None => Some(Default::default()),
-                }
-            }
+            Command::Settings => self.apply(Action::Settings),
+            Command::Ai => self.apply(Action::Ai),
             Command::MarkAllRead => self.mark_all_read(),
             Command::ToggleAll
                 if self.switcher.is_some()

@@ -164,6 +164,9 @@ pub(crate) enum Action {
     NewTab,
     /// Opens or closes the Updates inbox.
     Updates,
+    /// Opens or closes the Settings window / the AI panel.
+    Settings,
+    Ai,
     /// Opens the Ctrl+K switcher.
     Search,
     /// The sidebar's "Sync everything".
@@ -740,6 +743,18 @@ impl App {
             Action::Updates
                 if self.switcher.is_some() || self.conflict.is_some() || self.dlg.is_some() => {}
             Action::Updates => self.toggle_inbox(),
+            Action::Settings => {
+                self.settings_ui = match self.settings_ui {
+                    Some(_) => None,
+                    None => Some(Default::default()),
+                }
+            }
+            Action::Ai => {
+                self.ai = match self.ai {
+                    Some(_) => None,
+                    None => Some(Default::default()),
+                }
+            }
             Action::Dlg(d) => {
                 if self.commit() {
                     self.dlg = Some(d);

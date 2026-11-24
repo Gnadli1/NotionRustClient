@@ -243,6 +243,14 @@ pub fn show(
     if bin.clicked() {
         act = Some(Action::Dlg(crate::pages::Dlg::Bin { sel: 0 }));
     }
+    let ai = nav_row(ui, c, Icon::Comment, "AI Agent", |_| {});
+    if ai.on_hover_text("Ask AI about the open page (Ctrl+Shift+H)").clicked() {
+        act = Some(Action::Ai);
+    }
+    let settings = nav_row(ui, c, Icon::Dots, "Settings", |_| {});
+    if settings.on_hover_text("Theme, text size, font, key binds, AI (Ctrl+,)").clicked() {
+        act = Some(Action::Settings);
+    }
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.add_space(7.0);
