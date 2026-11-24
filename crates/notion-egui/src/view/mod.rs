@@ -4,6 +4,7 @@
 pub mod ai;
 pub mod browser_login;
 pub mod settings;
+pub mod share;
 pub mod sidebar;
 pub mod status;
 pub mod switcher;

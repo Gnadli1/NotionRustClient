@@ -62,6 +62,16 @@ pub enum Cmd {
         id: String,
         page: bool,
     },
+    /// Who can open a page (`Client::page_access`); answered by `Event::Access`.
+    Access {
+        page: String,
+    },
+    /// Shares a page with a workspace member, then answers like `Access`.
+    Share {
+        page: String,
+        user: String,
+        role: String,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -92,6 +102,11 @@ pub enum Event {
     Media {
         id: String,
         path: Result<PathBuf, String>,
+    },
+    /// The answer to `Access` and `Share`. A failed read stays here (not `Error`).
+    Access {
+        page: String,
+        access: Result<notion_core::model::Access, String>,
     },
     SyncedAll(SyncAllReport),
     /// (done, total) of a running `SyncAll`. Not an answer: the app must not
@@ -128,6 +143,13 @@ pub async fn run(
                 });
                 continue;
             }
+            if let Cmd::Access { page } = cmd {
+                emit(Event::Access {
+                    page,
+                    access: Err("offline".into()),
+                });
+                continue;
+            }
             emit(Event::Error("offline: no token for this workspace".into()));
             continue;
         };
@@ -146,6 +168,20 @@ pub async fn run(
             }
         }
         let ev = match cmd {
+            Cmd::Media { id, .. } if id.starts_with(crate::media::USER_PREFIX) => {
+                let url = store
+                    .user(&id[crate::media::USER_PREFIX.len()..])
+                    .ok()
+                    .flatten()
+                    .and_then(|u| u.avatar_url);
+                let path = match url {
+                    Some(u) => media::fetch_url(client, store, &id, &u)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    None => Err("no profile photo".into()),
+                };
+                Ok(Event::Media { id, path })
+            }
             Cmd::Media { id, page } => {
                 let owner = if page {
                     media::Owner::Page
@@ -157,6 +193,17 @@ pub async fn run(
                     .map_err(|e| e.to_string());
                 Ok(Event::Media { id, path })
             }
+            Cmd::Access { page } => {
+                let access = client.page_access(&page).await.map_err(|e| e.to_string());
+                Ok(Event::Access { page, access })
+            }
+            Cmd::Share { page, user, role } => match client.share_page(&page, &user, &role).await {
+                Ok(()) => {
+                    let access = client.page_access(&page).await.map_err(|e| e.to_string());
+                    Ok(Event::Access { page, access })
+                }
+                Err(e) => Err(e),
+            },
             Cmd::Pull { id, force } => sync::pull_any(client, store, &id, force)
                 .await
                 .map(|report| Event::Pulled { id, report }),

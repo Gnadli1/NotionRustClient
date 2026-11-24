@@ -138,6 +138,8 @@ pub(crate) enum Action {
     },
     EditTitle,
     TitleCommit,
+    /// Share the open page with a workspace member at a role.
+    Share { user: String, role: String },
     /// A table cell: (table row id, column).
     EditCell(String, usize),
     /// A page link, sidebar row or breadcrumb: shown, or pulled if uncached.
@@ -310,6 +312,11 @@ pub struct App {
     pub(crate) profiles_dir: Option<PathBuf>,
     /// settings.json, applied at start and on change.
     pub(crate) settings: crate::settings::Settings,
+    /// Access of the open page (page id, answer) and the Share popover.
+    pub(crate) access: Option<(String, Result<notion_core::model::Access, String>)>,
+    /// The page `Cmd::Access` was last sent for.
+    pub(crate) access_asked: Option<String>,
+    pub(crate) share_ui: crate::view::share::ShareUi,
     /// The Settings window, while open.
     pub(crate) settings_ui: Option<crate::view::settings::SettingsUi>,
     /// The AI panel, while open.
@@ -541,6 +548,9 @@ impl App {
             profiles: Profiles::default(),
             profiles_dir: None,
             settings: Default::default(),
+            access: None,
+            access_asked: None,
+            share_ui: Default::default(),
             settings_ui: None,
             ai: None,
             ai_secrets: Default::default(),
@@ -823,6 +833,11 @@ impl App {
             Action::Goto(i) if i < self.rows.len() => self.show_row(i),
             Action::Goto(_) => {}
             Action::NewTab => self.new_tab_with_switcher(),
+            Action::Share { user, role } => {
+                if let Some(page) = self.current.clone() {
+                    self.send(Cmd::Share { page, user, role });
+                }
+            }
             Action::Search => self.open_switcher(),
             Action::SyncAll => self.sync_all(),
             Action::ToggleProblems => {

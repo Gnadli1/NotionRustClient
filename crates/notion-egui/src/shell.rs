@@ -364,7 +364,9 @@ impl App {
 
     /// A command other than a picture download is in flight (those never block).
     fn busy(&self) -> bool {
-        self.sent.iter().any(|c| !matches!(c, Cmd::Media { .. }))
+        self.sent
+            .iter()
+            .any(|c| !matches!(c, Cmd::Media { .. } | Cmd::Access { .. }))
     }
 
     /// A push is queued or running: editing is paused.
@@ -402,6 +404,27 @@ impl App {
             && !self.sent.contains(&Cmd::PullUsers)
         {
             self.request_users();
+        }
+    }
+
+    /// Asks for who can open the page when the current page changes (not for
+    /// databases); drops the old answer. Only with a real worker thread (the
+    /// headless test windows have none, so their queues stay as they were).
+    fn access_tick(&mut self) {
+        let want = self
+            .current
+            .clone()
+            .filter(|_| self.db.is_none() && !self.worker_gone && self.worker.is_some());
+        if want == self.access_asked {
+            return;
+        }
+        self.access_asked = want.clone();
+        if self.access.as_ref().is_some_and(|a| Some(&a.0) != want.as_ref()) {
+            self.access = None;
+        }
+        self.share_ui.open = false;
+        if let Some(page) = want {
+            self.send(Cmd::Access { page });
         }
     }
 
@@ -675,6 +698,15 @@ impl App {
                 }
             }
             Event::Media { .. } => {} // taken above
+            Event::Access { page, access } => {
+                if let Ok(a) = &access {
+                    // the worker finds profile photos by user id in the store
+                    let _ = self.store.put_users(&a.users);
+                }
+                if self.current.as_deref() == Some(page.as_str()) {
+                    self.access = Some((page, access));
+                }
+            }
             Event::Error(e) => {
                 if answered == Some(Cmd::SyncAll) {
                     self.progress = None;
@@ -688,6 +720,7 @@ impl App {
                             | Cmd::Fetch { .. }
                             | Cmd::Resolve { .. }
                             | Cmd::SyncAll
+                            | Cmd::Share { .. }
                     )
                 ) {
                     self.pending_open = None;
@@ -1991,6 +2024,7 @@ impl App {
         self.poll_at(now, gained);
         self.poll_comments_at(now);
         self.users_tick(now);
+        self.access_tick();
         self.expire_flash(now);
         ctx.request_repaint_after(self.next_wake(now));
         let title = self.window_title();
@@ -2073,6 +2107,32 @@ impl App {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let mut act = None;
+                        let now = crate::comments::now_secs();
+                        let bar = view::share::Bar {
+                            edited: self
+                                .page_edit
+                                .as_ref()
+                                .map(|(_, t)| crate::people::edited_header(None, *t, now)),
+                            access: self
+                                .access
+                                .as_ref()
+                                .filter(|a| Some(&a.0) == self.current.as_ref())
+                                .map(|a| &a.1),
+                            users: &self.users,
+                            media: &self.media,
+                            waiting: self.sent.iter().any(|c| matches!(c, Cmd::Share { .. })),
+                        };
+                        let full = ui.available_rect_before_wrap();
+                        let w = view::share::width(&bar).min(full.width() / 2.0);
+                        let right = egui::Rect::from_min_max(egui::pos2(full.right() - w, full.top()), full.max);
+                        ui.set_max_width(full.width() - w);
+                        // a child, not a scope: it must not move the tabs' cursor
+                        let mut cluster = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(right)
+                                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                        );
+                        let share_act = view::share::show(&mut cluster, c, &mut self.share_ui, &bar);
                         if !self.sidebar {
                             ui.spacing_mut().item_spacing.x = 2.0;
                             if crate::icons::button(
@@ -2128,7 +2188,7 @@ impl App {
                         if act.is_none() {
                             act = view::tabbar::show(ui, c, &labels, self.active);
                         }
-                        act
+                        act.or(share_act)
                     })
                     .inner
                 })
@@ -4414,5 +4474,124 @@ mod tests {
         w.app.profiles.set_active("One");
         w.app.first_run();
         assert!(w.app.browser_login.is_none());
+    }
+
+    // ------------------------------------------------------------- sharing
+
+    fn person(id: &str, name: &str) -> notion_core::model::User {
+        notion_core::model::User::from_value(
+            &serde_json::json!({ "object": "user", "id": id, "type": "person", "name": name }),
+        )
+        .unwrap()
+    }
+
+    fn share_win() -> Win {
+        let mut w = two_pages();
+        // a worker thread makes the app ask for access (the other windows have none)
+        w.app.worker = Some(std::thread::spawn(|| {}));
+        w.app.store.put_users(&[person("u1", "Ada"), person("u2", "Bob"), person("u3", "Cy")]).unwrap();
+        w.app.load_users();
+        w.app.apply(Action::Open("p1".into()));
+        w.frames(vec![]);
+        w
+    }
+
+    fn access(ids: &[&str]) -> notion_core::model::Access {
+        notion_core::model::Access {
+            people: ids.iter().map(|i| (i.to_string(), "editor".to_string())).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn click_at(w: &mut Win, pos: egui::Pos2) {
+        let b = egui::PointerButton::Primary;
+        let m = Modifiers::NONE;
+        w.frames(vec![Ev::PointerMoved(pos)]);
+        w.frames(vec![Ev::PointerButton { pos, button: b, pressed: true, modifiers: m }]);
+        w.frames(vec![Ev::PointerButton { pos, button: b, pressed: false, modifiers: m }]);
+    }
+
+    #[test]
+    fn opening_a_page_asks_for_its_access_and_the_answer_is_kept_for_that_page_only() {
+        let mut w = share_win();
+        assert_eq!(w.cmds(), [Cmd::Access { page: "p1".into() }]);
+        w.answer(Event::Access { page: "p2".into(), access: Ok(access(&["u1"])) });
+        assert!(w.app.access.is_none(), "not the current page");
+        w.answer(Event::Access { page: "p1".into(), access: Ok(access(&["u1", "u2"])) });
+        assert_eq!(w.app.access.as_ref().map(|a| a.0.as_str()), Some("p1"));
+        assert!(w.app.sent.is_empty(), "the answer was taken off the queue");
+        w.app.apply(Action::Open("p2".into()));
+        w.frames(vec![]);
+        assert!(w.app.access.is_none());
+        assert_eq!(w.cmds(), [Cmd::Access { page: "p2".into() }]);
+    }
+
+    #[test]
+    fn clicking_a_member_in_the_popover_shares_at_the_chosen_role() {
+        let mut w = share_win();
+        w.cmds();
+        w.answer(Event::Access { page: "p1".into(), access: Ok(access(&["u1"])) });
+        let btn = w.app.share_ui.button.expect("the Share button");
+        click_at(&mut w, btn.center());
+        assert!(w.app.share_ui.open);
+        w.frames(vec![]);
+        let hits = w.app.share_ui.hits.clone();
+        let ids: Vec<_> = hits.iter().map(|h| h.0.as_str()).collect();
+        assert_eq!(ids, ["u2", "u3"], "Ada already has access");
+        click_at(&mut w, hits[0].1.center());
+        assert_eq!(
+            w.cmds(),
+            [Cmd::Share { page: "p1".into(), user: "u2".into(), role: "read_and_write".into() }]
+        );
+    }
+
+    #[test]
+    fn an_access_answer_stores_its_users_with_their_photos() {
+        let mut w = share_win();
+        w.cmds();
+        let mut a = access(&["u1"]);
+        a.users = vec![notion_core::model::User::from_value(&serde_json::json!({
+            "object": "user", "id": "u9", "type": "person", "name": "Zed",
+            "avatar_url": "https://s3.example/zed.png"
+        }))
+        .unwrap()];
+        w.answer(Event::Access { page: "p1".into(), access: Ok(a) });
+        let u = w.app.store.user("u9").unwrap().expect("stored");
+        assert_eq!(u.avatar_url.as_deref(), Some("https://s3.example/zed.png"));
+    }
+
+    #[test]
+    fn a_failed_share_leaves_the_popover_usable_and_pops_sent() {
+        let mut w = share_win();
+        w.cmds();
+        w.answer(Event::Access { page: "p1".into(), access: Ok(access(&["u1"])) });
+        let btn = w.app.share_ui.button.expect("the Share button");
+        click_at(&mut w, btn.center());
+        w.frames(vec![]);
+        let hits = w.app.share_ui.hits.clone();
+        click_at(&mut w, hits[0].1.center());
+        assert!(matches!(w.cmds().as_slice(), [Cmd::Share { .. }]));
+        assert!(w.app.sent.iter().any(|c| matches!(c, Cmd::Share { .. })));
+        w.answer(Event::Error("403 forbidden".into()));
+        assert!(w.app.sent.is_empty(), "the failed share was taken off the queue");
+        assert!(w.app.last_error.is_some());
+        assert!(w.app.share_ui.open, "popover still open");
+        w.frames(vec![]);
+        assert!(!w.app.share_ui.hits.is_empty(), "still clickable");
+        let again = w.app.share_ui.hits[0].1.center();
+        click_at(&mut w, again);
+        assert!(matches!(w.cmds().as_slice(), [Cmd::Share { .. }]), "can retry");
+    }
+
+    #[test]
+    fn without_a_browser_session_share_is_disabled_and_nothing_is_sent() {
+        let mut w = share_win();
+        w.cmds();
+        w.answer(Event::Access { page: "p1".into(), access: Err("not a browser-session client".into()) });
+        let btn = w.app.share_ui.button.expect("the Share button");
+        click_at(&mut w, btn.center());
+        assert!(!w.app.share_ui.open);
+        assert!(w.cmds().is_empty());
+        assert!(w.app.share_ui.hits.is_empty());
     }
 }

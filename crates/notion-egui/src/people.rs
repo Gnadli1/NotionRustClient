@@ -1,6 +1,5 @@
-//! People (C2): names and initials avatars for the cached workspace users,
-//! and the "edited by" lines. Avatar *images* are not downloaded (F7 does
-//! image loading); the user's `avatar_url` is cached but unused here.
+//! People (C2): names and avatars (profile photo via F7's media cache, else
+//! initials) for the cached workspace users, and the "edited by" lines.
 
 use eframe::egui::{self, Color32, FontId, Sense, Ui};
 use notion_core::model::User;
@@ -58,8 +57,8 @@ pub fn initials(name: &str) -> String {
 }
 
 /// A round avatar for user `id` shown as `name` (see [`name_of`]).
-pub fn avatar(ui: &mut Ui, id: &str, name: &str, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
+pub fn avatar(ui: &mut Ui, id: &str, name: &str, size: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
     ui.painter()
         .circle_filled(rect.center(), size / 2.0, avatar_color(id));
     ui.painter().text(
@@ -69,6 +68,31 @@ pub fn avatar(ui: &mut Ui, id: &str, name: &str, size: f32) {
         FontId::proportional(size * 0.45),
         Color32::WHITE,
     );
+    resp
+}
+
+/// A round avatar of `size` px: the user's photo once loaded, else initials (existing `avatar`).
+pub(crate) fn face(
+    ui: &mut Ui,
+    media: &crate::media::Media,
+    user: &User,
+    size: f32,
+) -> egui::Response {
+    let tex = user.avatar_url.as_deref().and_then(|url| {
+        let id = format!("{}{}", crate::media::USER_PREFIX, user.id);
+        match media.show(ui.ctx(), &id, false, url) {
+            crate::media::Shown::Tex(t) => Some(t),
+            _ => None,
+        }
+    });
+    match tex {
+        Some(t) => ui.add(
+            egui::Image::new(&t)
+                .fit_to_exact_size(egui::vec2(size, size))
+                .corner_radius(size / 2.0),
+        ),
+        None => avatar(ui, &user.id, &user.name, size),
+    }
 }
 
 /// Page header: "Edited by Ada · 5 min ago" (`who` None: no editor on record).
@@ -312,5 +336,48 @@ mod tests {
         w.frames(vec![]);
         assert!(w.shown.contains("01234567 · "), "{}", w.shown);
         assert!(w.shown.contains("you · "), "{}", w.shown);
+    }
+
+    fn with_photo(id: &str, url: Option<&str>) -> User {
+        let mut u = user(id, "Ada Lovelace");
+        u.avatar_url = url.map(Into::into);
+        u
+    }
+
+    fn draw(m: &crate::media::Media, ctx: &egui::Context, u: &User) {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            face(ui, m, u, 24.0);
+        })
+        .textures_delta
+        .clear();
+    }
+
+    #[test]
+    fn a_photo_is_wanted_once_keyed_by_url_and_none_means_initials() {
+        let (m, ctx) = (crate::media::Media::default(), egui::Context::default());
+        let u = with_photo("u1", Some("https://x.test/a.png"));
+        draw(&m, &ctx, &u);
+        draw(&m, &ctx, &u);
+        assert_eq!(m.take_wants(5), [("user:u1".to_string(), false)]);
+        // initials need no download
+        draw(&m, &ctx, &with_photo("u2", None));
+        assert!(m.take_wants(5).is_empty());
+    }
+
+    #[test]
+    fn a_failed_photo_falls_back_to_initials() {
+        let (m, ctx) = (crate::media::Media::default(), egui::Context::default());
+        let u = with_photo("u1", Some("https://x.test/a.png"));
+        draw(&m, &ctx, &u);
+        m.take_wants(1);
+        m.downloaded("user:u1".into(), Err("boom".into()));
+        let mut size = None;
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            size = Some(face(ui, &m, &u, 24.0).rect.size());
+        })
+        .textures_delta
+        .clear();
+        assert_eq!(size, Some(egui::vec2(24.0, 24.0)));
+        assert!(m.take_wants(5).is_empty(), "not asked again");
     }
 }

@@ -19,6 +19,10 @@ pub(crate) const IN_FLIGHT: usize = 3;
 const MAX_SIDE: u32 = 2048;
 /// Covers and gallery thumbnails (page pictures) are shrunk to this.
 const THUMB_SIDE: u32 = 512;
+/// Profile photos (owner ids `user:<id>`) are shrunk to this.
+const FACE_SIDE: u32 = 128;
+/// Owner ids of profile photos start with this; the worker finds the URL in the users cache.
+pub(crate) const USER_PREFIX: &str = "user:";
 /// Textures kept; the least recently shown is dropped past this.
 const MAX_TEX: usize = 32;
 /// Decodes at once.
@@ -265,7 +269,9 @@ impl Media {
             match res {
                 Err(e) => g.fail(&done_id, e),
                 Ok(path) => {
-                    let max = if matches!(slot, Slot::Sent(true)) {
+                    let max = if done_id.starts_with(USER_PREFIX) {
+                        FACE_SIDE
+                    } else if matches!(slot, Slot::Sent(true)) {
                         THUMB_SIDE
                     } else {
                         MAX_SIDE

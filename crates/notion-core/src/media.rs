@@ -437,6 +437,56 @@ pub async fn fetch(client: &Client, store: &Store, id: &str, owner: Owner) -> Re
     Ok(path)
 }
 
+/// A profile photo by URL (cache row `id`, e.g. `user:<uid>`). The Notion file
+/// cookie goes only to Notion hosts; one retry on 403 with a fresh token.
+pub async fn fetch_url(client: &Client, store: &Store, id: &str, url: &str) -> Result<PathBuf> {
+    let key = url.split(['?', '#']).next().unwrap_or_default().to_string();
+    if let Some(m) = store
+        .media_get(id)?
+        .filter(|m| m.url == key && m.path.is_file())
+    {
+        return Ok(m.path);
+    }
+    let dir = store
+        .media_dir()
+        .ok_or_else(|| Error::Invalid("no cache directory (in-memory store)".into()))?;
+    sweep_parts(&dir);
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()?;
+    let mut cookie = if client.file_cookie_ok(url) {
+        Some(format!("file_token={}", client.file_token().await?))
+    } else {
+        None
+    };
+    let mut res = download(&http, url, MAX_DOWNLOAD, cookie.as_deref()).await;
+    if matches!(res, Err(Dl::Forbidden)) && cookie.is_some() {
+        client.clear_file_token();
+        cookie = Some(format!("file_token={}", client.file_token().await?));
+        res = download(&http, url, MAX_DOWNLOAD, cookie.as_deref()).await;
+    }
+    let bytes = match res {
+        Ok(b) => b,
+        Err(Dl::Forbidden) => return Err(Error::Invalid("the photo was refused (403)".into())),
+        Err(Dl::Failed(e)) => return Err(e),
+    };
+    std::fs::create_dir_all(&dir).map_err(io)?;
+    let path = dir.join(file_name(id));
+    let part = path.with_extension("part");
+    std::fs::write(&part, &bytes).map_err(io)?;
+    std::fs::rename(&part, &path).map_err(io)?;
+    store.media_put(&CachedMedia {
+        owner_id: id.into(),
+        url: key,
+        fetched_at: ts(&Utc::now()),
+        path: path.clone(),
+        size: bytes.len() as u64,
+    })?;
+    store.media_evict(CACHE_CAP)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1042,6 +1092,75 @@ mod tests {
             att,
             "the stable attachment URL is cached, not the signature"
         );
+    }
+
+    async fn token_route(s: &MockServer, times: u64) {
+        Mock::given(method("GET"))
+            .and(path("/f/refresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Set-Cookie", "file_token=ft; Domain=.notion.so; Path=/f"),
+            )
+            .expect(times)
+            .mount(s)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_url_downloads_into_the_cache_and_a_second_call_is_a_hit() {
+        let (s, d) = (MockServer::start().await, tempfile::tempdir().unwrap());
+        serve(&s, "/me.png", 200, b"FACE", 1).await;
+        let st = store(d.path(), &[]);
+        let url = format!("{}/me.png?sig=1", s.uri());
+        let c = client(&s);
+        let p = fetch_url(&c, &st, "user:u1", &url).await.unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"FACE");
+        assert_eq!(fetch_url(&c, &st, "user:u1", &url).await.unwrap(), p);
+        assert_eq!(
+            st.media_get("user:u1").unwrap().unwrap().url,
+            format!("{}/me.png", s.uri()),
+            "no signature stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_url_sends_the_file_cookie_to_the_own_host_only() {
+        let (own, foreign, d) = (
+            MockServer::start().await,
+            MockServer::start().await,
+            tempfile::tempdir().unwrap(),
+        );
+        token_route(&own, 1).await;
+        Mock::given(method("GET"))
+            .and(path("/own.png"))
+            .and(header("cookie", "file_token=ft"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"OWN"))
+            .expect(1)
+            .mount(&own)
+            .await;
+        serve(&foreign, "/x.png", 200, b"X", 1).await;
+        let st = store(d.path(), &[]);
+        let c = private_client(&own);
+        fetch_url(&c, &st, "user:a", &format!("{}/own.png", own.uri()))
+            .await
+            .unwrap();
+        fetch_url(&c, &st, "user:b", &format!("{}/x.png", foreign.uri()))
+            .await
+            .unwrap();
+        for r in foreign.received_requests().await.unwrap() {
+            assert!(!r.headers.contains_key("cookie"), "cookie leaked to a foreign host");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_url_rejects_non_http_urls() {
+        let (s, d) = (MockServer::start().await, tempfile::tempdir().unwrap());
+        let st = store(d.path(), &[]);
+        for u in ["file:///etc/passwd", "ftp://h/a.png", "data:image/png;base64,AA", ""] {
+            let e = fetch_url(&client(&s), &st, "user:u", u).await.unwrap_err();
+            assert!(e.to_string().contains("http"), "{u}: {e}");
+        }
+        assert!(st.media_get("user:u").unwrap().is_none());
     }
 
     #[tokio::test]
