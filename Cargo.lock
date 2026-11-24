@@ -2440,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "notion-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2451,7 +2451,7 @@ dependencies = [
 
 [[package]]
 name = "notion-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "futures",
@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "notion-egui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "eframe",
  "image",
