@@ -54,6 +54,15 @@ use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 use notion_core::paths;
 use notion_core::store::Store;
 
+/// Creates `dir` and makes it yours alone (0700): tokens, keys, cached pages,
+/// images and sessions all live under it, so no file inside is readable by
+/// other users whatever its own mode.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
 fn open_store(db: &Path) -> Result<Store, String> {
     if let Some(dir) = db.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -147,6 +156,11 @@ fn setup_fonts(ctx: &egui::Context) {
 fn main() -> eframe::Result {
     let data = paths::data_dir();
     let dir = paths::config_dir();
+    for d in data.iter().chain(dir.iter()) {
+        if let Err(e) = private_dir(d) {
+            eprintln!("can't make {} private: {e}", d.display());
+        }
+    }
     let (profiles, profiles_problem) = dir
         .as_deref()
         .map(profiles::Profiles::load)
@@ -275,3 +289,20 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod testkit;
+
+#[cfg(test)]
+mod private_dir_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_dir_creates_and_tightens_to_0700() {
+        let d = std::env::temp_dir().join(format!("nc-private-{}", std::process::id()));
+        let inner = d.join("a/b");
+        super::private_dir(&inner).unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::private_dir(&inner).unwrap(); // an existing open dir is tightened too
+        let mode = std::fs::metadata(&inner).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(mode, 0o700);
+    }
+}
