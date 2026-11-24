@@ -58,7 +58,13 @@ impl App {
         let empty = f.text.is_empty();
         f.cursor = cursor_of(ctx, id, &f.text);
         let mut paste = None;
-        let (cmds, [enter, tab, shift_tab, bs, esc]) = ctx.input_mut(|i| {
+        let pending = std::mem::take(&mut f.pending);
+        // a menu pick runs on the selection the menu was opened on
+        if let (false, Some(r), Some(mut s)) = (pending.is_empty(), f.sel, TextEditState::load(ctx, id)) {
+            s.cursor.set_char_range(Some(r));
+            s.store(ctx, id);
+        }
+        let (mut cmds, [enter, tab, shift_tab, bs, esc]) = ctx.input_mut(|i| {
             let ev = &mut i.events;
             // several lines pasted into an empty row become one block each
             if row && empty && !f.code {
@@ -99,6 +105,7 @@ impl App {
             }
             (cmds, n)
         });
+        cmds.extend(pending);
         let mut act = paste.map(Action::Paste);
         for (n, a) in [
             (esc, if row { Action::Select } else { Action::Blur }),

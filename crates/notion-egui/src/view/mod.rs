@@ -8,6 +8,7 @@ pub mod share;
 pub mod sidebar;
 pub mod status;
 pub mod switcher;
+pub mod textmenu;
 pub mod tabbar;
 pub mod workspace;
 

@@ -83,6 +83,10 @@ pub(crate) struct Focus {
     pub(crate) failed: bool,
     /// The cursor (char index) as the keys that need it last saw it.
     pub(crate) cursor: usize,
+    /// Commands picked in the right-click menu: run as if their key was pressed.
+    pub(crate) pending: Vec<crate::keys::Command>,
+    /// The selection before a right-click (which would move the cursor).
+    pub(crate) sel: Option<CCursorRange>,
 }
 
 impl Focus {
@@ -109,6 +113,8 @@ impl Focus {
             scroll: true,
             failed: false,
             cursor: 0,
+            pending: Vec::new(),
+            sel: None,
         }
     }
 
@@ -169,6 +175,8 @@ pub(crate) enum Action {
     /// Opens or closes the Settings window / the AI panel.
     Settings,
     Ai,
+    /// Opens the AI panel with `prompt`; `send`: ask at once.
+    AiAsk { prompt: String, send: bool },
     /// Opens the Ctrl+K switcher.
     Search,
     /// The sidebar's "Sync everything".
@@ -763,6 +771,16 @@ impl App {
                 self.ai = match self.ai {
                     Some(_) => None,
                     None => Some(Default::default()),
+                }
+            }
+            // commit first: the menu click left the row editor unfocused
+            Action::AiAsk { prompt, send } => {
+                if self.commit() {
+                    let p = self.ai.get_or_insert_with(Default::default);
+                    if p.job.is_none() {
+                        p.prompt = prompt;
+                        p.auto = send;
+                    }
                 }
             }
             Action::Dlg(d) => {
@@ -1874,15 +1892,13 @@ impl App {
             job.wrap.max_width = wrap;
             ui.fonts_mut(|f| f.layout_job(job))
         };
-        // no focus outline: the editing row looks like the others (as in Notion)
-        let sel = ui.visuals().selection.stroke;
-        ui.visuals_mut().selection.stroke.color = egui::Color32::TRANSPARENT;
         let mut out = egui::TextEdit::multiline(&mut f.text)
             .id(id)
             .desired_width(f32::INFINITY)
             .desired_rows(1)
-            // the theme's 8 px side padding would shift the text while editing
-            .margin(egui::Margin::symmetric(0, 2))
+            // no focus outline and no 8 px side padding: the editing row
+            // looks like the others (as in Notion)
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(0, 2)))
             .event_filter(egui::EventFilter {
                 tab: true,
                 horizontal_arrows: true,
@@ -1891,14 +1907,59 @@ impl App {
             })
             .layouter(&mut layouter)
             .show(ui);
-        ui.visuals_mut().selection.stroke = sel;
         f.galley = Some(out.galley.clone());
         let resp = out.response.response.clone();
         if f.scroll {
             resp.scroll_to_me(None);
             f.scroll = false;
         }
-        if resp.lost_focus() && act.is_none() {
+        // a right-click keeps the selection (egui would move the cursor there)
+        let right = resp.hovered()
+            && ctx.input(|i| i.pointer.secondary_down() || i.pointer.secondary_released());
+        match f.sel {
+            Some(r) if right => {
+                out.state.cursor.set_char_range(Some(r));
+                out.state.clone().store(&ctx, id);
+                out.cursor_range = Some(r);
+            }
+            // frozen while a menu pick waits: regaining focus moves the cursor
+            _ if !f.pending.is_empty() => {}
+            // (None while the open menu has the focus)
+            _ => f.sel = out.cursor_range.or(f.sel),
+        }
+        let mut pick = None;
+        resp.context_menu(|ui| {
+            pick = crate::view::textmenu::show(ui, theme::colors(ui), f.cell.is_none(), f.code);
+        });
+        match pick {
+            Some(crate::view::textmenu::Pick::Cmd(c)) => {
+                // the menu click took the focus: give it back, selection intact
+                f.pending.push(c);
+                ctx.memory_mut(|m| m.request_focus(id));
+                ctx.request_repaint();
+            }
+            Some(crate::view::textmenu::Pick::Comment) => {
+                act = Some(Action::OpenComments(f.block_id.clone()));
+            }
+            Some(crate::view::textmenu::Pick::Ai(instr, send)) => {
+                let sel = f.sel.map(|r| {
+                    let (a, b) = (r.primary.index.0, r.secondary.index.0);
+                    let (a, b) = (a.min(b), a.max(b));
+                    f.text.chars().skip(a).take(b - a).collect::<String>()
+                });
+                let text = sel.filter(|s| !s.trim().is_empty()).unwrap_or(f.text.clone());
+                act = Some(Action::AiAsk {
+                    prompt: if instr.is_empty() {
+                        format!("{text}\n\n")
+                    } else {
+                        format!("{instr}:\n\n{text}")
+                    },
+                    send,
+                });
+            }
+            None => {}
+        }
+        if resp.lost_focus() && act.is_none() && pick.is_none() {
             act = Some(Action::Blur);
         }
         let cur = out.cursor_range.map_or(cur, |r| r.primary.index.0);

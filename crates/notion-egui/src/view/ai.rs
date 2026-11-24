@@ -25,6 +25,8 @@ pub struct AiPanel {
     pub answer: String,
     pub job: Option<crate::ai::Job>,
     pub error: Option<String>,
+    /// Ask with `prompt` on the next frame (a right-click AI action).
+    pub auto: bool,
 }
 
 /// The empty chat's one-click prompts: (icon, label, prompt).
@@ -94,6 +96,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let (mut send, mut stop, mut insert, mut close, mut fresh, mut setup) =
         (false, false, false, false, false, false);
     let model = model_label(&app.settings.ai);
+    let Some(p) = app.ai.as_mut() else { return };
+    if std::mem::take(&mut p.auto) && p.job.is_none() {
+        start(app, ui.ctx());
+    }
     let Some(p) = app.ai.as_mut() else { return };
     if let Some(j) = p.job.take() {
         if !drain(p, &j.rx) {

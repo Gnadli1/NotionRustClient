@@ -378,6 +378,20 @@ fn tree_row(ui: &mut Ui, c: &Colors, r: &TreeRow, current: Option<&str>) -> Opti
     let x = rect.left() + 5.0 + INDENT * r.depth as f32;
     let arrow = Rect::from_center_size(egui::pos2(x + 8.0, rect.center().y), vec2(18.0, 18.0));
     let mut act = None;
+    resp.context_menu(|ui| {
+        let id = &r.entry.id;
+        if ui.button("Open in new tab").clicked() {
+            act = Some(Action::Link {
+                link: crate::links::Link::Page(id.clone()),
+                new_tab: true,
+            });
+        }
+        let local = id.starts_with("local-");
+        let b = ui.add_enabled(!local, egui::Button::new("Move to Trash"));
+        if b.on_disabled_hover_text("Not pushed yet: push it (Ctrl+S) first").clicked() {
+            act = Some(Action::Dlg(crate::pages::Dlg::Trash(id.clone(), r.entry.title.clone())));
+        }
+    });
     if r.has_children {
         let a = ui.interact(arrow, resp.id.with("arrow"), Sense::click());
         if a.hovered() {
