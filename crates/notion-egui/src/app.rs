@@ -1846,10 +1846,15 @@ impl App {
             job.wrap.max_width = wrap;
             ui.fonts_mut(|f| f.layout_job(job))
         };
+        // no focus outline: the editing row looks like the others (as in Notion)
+        let sel = ui.visuals().selection.stroke;
+        ui.visuals_mut().selection.stroke.color = egui::Color32::TRANSPARENT;
         let mut out = egui::TextEdit::multiline(&mut f.text)
             .id(id)
             .desired_width(f32::INFINITY)
             .desired_rows(1)
+            // the theme's 8 px side padding would shift the text while editing
+            .margin(egui::Margin::symmetric(0, 2))
             .event_filter(egui::EventFilter {
                 tab: true,
                 horizontal_arrows: true,
@@ -1858,6 +1863,7 @@ impl App {
             })
             .layouter(&mut layouter)
             .show(ui);
+        ui.visuals_mut().selection.stroke = sel;
         f.galley = Some(out.galley.clone());
         let resp = out.response.response.clone();
         if f.scroll {
