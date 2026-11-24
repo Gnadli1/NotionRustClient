@@ -1241,81 +1241,15 @@ impl App {
                     }
                 }
                 Marker::ChildPage(t) => {
-                    let (rect, r) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 24.0),
-                        Sense::click(),
-                    );
-                    crate::icons::paint(
-                        ui,
-                        egui::Rect::from_center_size(
-                            egui::pos2(rect.left() + 8.0, rect.center().y),
-                            egui::vec2(16.0, 16.0),
-                        ),
-                        crate::icons::Icon::Page,
-                        grey,
-                    );
-                    ui.painter().text(
-                        egui::pos2(rect.left() + 20.0, rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        if t.is_empty() { "Untitled" } else { t.as_str() },
-                        egui::FontId::proportional(16.0),
-                        c.text,
-                    );
-                    let tw = ui
-                        .painter()
-                        .layout_no_wrap(t.clone(), egui::FontId::proportional(16.0), c.text)
-                        .size()
-                        .x;
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(rect.left() + 20.0, rect.center().y + 9.0),
-                            egui::pos2(rect.left() + 20.0 + tw, rect.center().y + 9.0),
-                        ],
-                        egui::Stroke::new(1.0, c.text.gamma_multiply(0.35)),
-                    );
+                    let id = self.rows[idx].block_id.clone();
+                    let r = self.page_link(ui, &id, t);
                     if let Some(new_tab) = clicked_new_tab(ui, &r) {
-                        let link = Link::Page(self.rows[idx].block_id.clone());
+                        let link = Link::Page(id);
                         act = Some(Action::Link { link, new_tab });
                     }
                 }
                 Marker::LinkToPage { id, title, .. } => {
-                    let text = if title.is_empty() {
-                        "Untitled".to_string()
-                    } else {
-                        title.clone()
-                    };
-                    let (rect, r) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 24.0),
-                        Sense::click(),
-                    );
-                    crate::icons::paint(
-                        ui,
-                        egui::Rect::from_center_size(
-                            egui::pos2(rect.left() + 8.0, rect.center().y),
-                            egui::vec2(16.0, 16.0),
-                        ),
-                        crate::icons::Icon::Page,
-                        c.secondary,
-                    );
-                    ui.painter().text(
-                        egui::pos2(rect.left() + 20.0, rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        &text,
-                        egui::FontId::proportional(16.0),
-                        c.text,
-                    );
-                    let tw = ui
-                        .painter()
-                        .layout_no_wrap(text.clone(), egui::FontId::proportional(16.0), c.text)
-                        .size()
-                        .x;
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(rect.left() + 20.0, rect.center().y + 9.0),
-                            egui::pos2(rect.left() + 20.0 + tw, rect.center().y + 9.0),
-                        ],
-                        egui::Stroke::new(1.0, c.text.gamma_multiply(0.35)),
-                    );
+                    let r = self.page_link(ui, id, title);
                     if let Some(new_tab) = clicked_new_tab(ui, &r) {
                         act = Some(Action::Link {
                             link: Link::Page(id.clone()),
@@ -1425,7 +1359,13 @@ impl App {
                 _ => body(self, ui),
             }
         });
-        self.edited_hover(ui, idx, row.response.rect);
+        // a page link has its own hover card
+        if !matches!(
+            self.rows[idx].marker,
+            Marker::ChildPage(_) | Marker::LinkToPage { .. }
+        ) {
+            self.edited_hover(ui, idx, row.response.rect);
+        }
         if comments > 0 {
             let mut r = row.response.rect;
             r.set_right(ui.max_rect().right());
@@ -1467,6 +1407,94 @@ impl App {
     }
 
     /// A tooltip over the row's full width saying who edited the block last.
+    /// A link to page `id`: its emoji (or a page icon) and the underlined
+    /// title. Hovered: a tint, the hand, and a card like Notion's (icon,
+    /// where it lives, title, the first lines of the cached page).
+    fn page_link(&self, ui: &mut Ui, id: &str, title: &str) -> egui::Response {
+        let c = theme::colors(ui);
+        let entry = self.tree.iter().find(|e| e.id == id);
+        let title = match entry.map(|e| e.title.as_str()).filter(|t| !t.is_empty()) {
+            Some(t) => t,
+            None if title.is_empty() => "Untitled",
+            None => title,
+        };
+        let icon = entry.and_then(|e| e.icon.as_deref());
+        let font = egui::FontId::proportional(16.0);
+        let tw = ui
+            .painter()
+            .layout_no_wrap(title.to_string(), font.clone(), c.text)
+            .size()
+            .x;
+        let (rect, r) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), Sense::click());
+        if r.hovered() {
+            ui.painter().rect_filled(rect, 4.0, c.hover);
+        }
+        let glyph = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 12.0, rect.center().y),
+            egui::vec2(18.0, 18.0),
+        );
+        crate::icons::page_glyph(ui, glyph, icon, false, c.secondary);
+        let x = rect.left() + 26.0;
+        ui.painter().text(
+            egui::pos2(x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            title,
+            font,
+            c.text,
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(x, rect.center().y + 10.0),
+                egui::pos2(x + tw, rect.center().y + 10.0),
+            ],
+            egui::Stroke::new(1.0, c.text.gamma_multiply(0.35)),
+        );
+        let r = r.on_hover_cursor(egui::CursorIcon::PointingHand);
+        // the card's lines, read once per hover
+        let key = Id::unique(("link-card", id));
+        if !r.hovered() {
+            ui.ctx().data_mut(|d| d.remove::<Vec<String>>(key));
+            return r;
+        }
+        let lines = ui.ctx().data_mut(|d| {
+            d.get_temp_mut_or_insert_with(key, || {
+                outline::flatten(&self.store, id)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|row| plain_text(&row.rich_text))
+                    .filter(|t| !t.trim().is_empty())
+                    .take(4)
+                    .collect::<Vec<String>>()
+            })
+            .clone()
+        });
+        let path: Vec<String> = crate::sidebar::trail(&self.tree, id)
+            .iter()
+            .map(|e| crate::view::untitled(&e.title).to_string())
+            .collect();
+        r.on_hover_ui(|ui| {
+            ui.set_width(300.0);
+            let big = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(36.0, 36.0));
+            ui.allocate_rect(big, Sense::hover());
+            crate::icons::page_glyph(ui, big, icon, false, c.secondary);
+            if !path.is_empty() {
+                let p = match path.len() {
+                    1 | 2 => path.join(" / "),
+                    n => format!("{} / … / {}", path[0], path[n - 1]),
+                };
+                ui.label(RichText::new(p).size(12.0).color(c.secondary));
+            }
+            ui.label(RichText::new(title).strong());
+            if !lines.is_empty() {
+                ui.add_space(6.0);
+                for l in &lines {
+                    ui.add(Label::new(RichText::new(l).color(c.secondary)).truncate());
+                }
+            }
+        })
+    }
+
     /// Not on the row being edited.
     fn edited_hover(&self, ui: &Ui, idx: usize, mut rect: egui::Rect) {
         let id = &self.rows[idx].block_id;
