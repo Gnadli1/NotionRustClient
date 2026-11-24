@@ -179,7 +179,7 @@ pub fn outline(ui: &mut Ui, c: &Colors, heads: &[(usize, u8, String)]) -> Option
     let step = (area.height() / heads.len().max(1) as f32).min(14.0);
     let top = area.center().y - step * heads.len() as f32 / 2.0;
     let mut act = None;
-    for (k, (row, level, text)) in heads.iter().enumerate() {
+    for (k, (row, level, _)) in heads.iter().enumerate() {
         let band = Rect::from_min_size(
             pos2(area.left(), top + k as f32 * step),
             vec2(area.width(), step),
@@ -192,12 +192,53 @@ pub fn outline(ui: &mut Ui, c: &Colors, heads: &[(usize, u8, String)]) -> Option
             [pos2(x, y), pos2(band.right() - 4.0, y)],
             Stroke::new(2.0, color),
         );
-        if r.on_hover_text(untitled(text))
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
-        {
+        if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             act = Some(Action::Goto(*row));
         }
     }
+    // hovering the ticks (or the list itself) shows the headings as a list
+    let ctx = ui.ctx().clone();
+    let pop = Id::unique("outline-pop");
+    let last: Option<Rect> = ctx.data(|d| d.get_temp(pop));
+    let over = ctx.pointer_hover_pos().is_some_and(|p| {
+        area.contains(p) || last.is_some_and(|r| r.expand(8.0).contains(p))
+    });
+    if !over {
+        ctx.data_mut(|d| d.remove::<Rect>(pop));
+        return act;
+    }
+    let shown = egui::Area::new(pop)
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::RIGHT_CENTER)
+        .fixed_pos(pos2(area.left() - 4.0, area.center().y))
+        .show(&ctx, |ui| {
+            if ui.is_sizing_pass() {
+                ui.ctx().request_repaint(); // a new Area is invisible on its sizing pass
+            }
+            egui::Frame::popup(ui.style())
+                .corner_radius(12)
+                .show(ui, |ui| {
+                    ui.set_width(240.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(area.height() - 80.0)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            for (row, level, text) in heads {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(14.0 * f32::from(level.saturating_sub(1)));
+                                    let b = egui::Button::selectable(
+                                        false,
+                                        RichText::new(untitled(text)).color(c.secondary),
+                                    )
+                                    .wrap();
+                                    if ui.add(b).clicked() {
+                                        act = Some(Action::Goto(*row));
+                                    }
+                                });
+                            }
+                        });
+                });
+        });
+    ctx.data_mut(|d| d.insert_temp(pop, shown.response.rect));
     act
 }
