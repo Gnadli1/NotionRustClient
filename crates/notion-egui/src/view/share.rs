@@ -117,9 +117,9 @@ pub fn show(ui: &mut Ui, c: &Colors, st: &mut ShareUi, b: &Bar) -> Option<Action
             for (i, (id, _)) in a.people.iter().take(3).enumerate() {
                 let rect =
                     Rect::from_min_size(faces.min + vec2(STEP * i as f32, 0.0), vec2(FACE, FACE));
-                ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-                    face(ui, b, user(id, a, b.users), id, FACE);
-                });
+                // a child, not a scope: a scope moves the cursor back over the faces
+                let mut one = ui.new_child(UiBuilder::new().max_rect(rect));
+                face(&mut one, b, user(id, a, b.users), id, FACE);
                 ui.painter()
                     .circle_stroke(rect.center(), FACE / 2.0, Stroke::new(1.5, c.sidebar));
             }
@@ -265,6 +265,11 @@ mod tests {
 
     /// The texts painted for a bar with `n` people.
     fn texts(n: usize) -> Vec<String> {
+        painted(n).into_iter().map(|(t, _)| t).collect()
+    }
+
+    /// The texts painted for a bar with `n` people, with their left/right x.
+    fn painted(n: usize) -> Vec<(String, (f32, f32))> {
         let ctx = egui::Context::default();
         crate::theme::install(&ctx);
         let acc = Ok(Access {
@@ -295,7 +300,8 @@ mod tests {
         let mut t = Vec::new();
         for s in &out.shapes {
             if let Shape::Text(x) = &s.shape {
-                t.push(x.galley.text().to_string());
+                let l = x.pos.x + x.galley.rect.left();
+                t.push((x.galley.text().to_string(), (l, l + x.galley.rect.width())));
             }
         }
         out.drop_without_applying_deltas();
@@ -315,5 +321,16 @@ mod tests {
         let t = texts(2);
         assert!(!t.iter().any(|s| s.starts_with('+')), "{t:?}");
         assert_eq!(faces(&t), 2, "{t:?}");
+    }
+
+    #[test]
+    fn the_edited_text_stays_left_of_the_faces() {
+        let p = painted(5);
+        let edited = p.iter().find(|(t, _)| t.starts_with("Edited")).unwrap().1;
+        for (t, (l, _)) in &p {
+            if !t.starts_with("Edited") {
+                assert!(edited.1 <= *l, "{t} at {l} under the Edited text ending at {}", edited.1);
+            }
+        }
     }
 }
