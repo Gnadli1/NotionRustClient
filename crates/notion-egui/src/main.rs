@@ -43,6 +43,7 @@ mod tabs;
 mod tex;
 mod theme;
 mod undo;
+mod update;
 mod view;
 mod views;
 mod worker;

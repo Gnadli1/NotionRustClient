@@ -1,0 +1,35 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check tag matches Cargo.toml version
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ "${GITHUB_REF_NAME#v}" = "$VERSION" ] || { echo "tag $GITHUB_REF_NAME != Cargo.toml $VERSION"; exit 1; }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      - run: sh packaging/build-release.sh
+      - name: Build AppImage
+        run: |
+          curl -fsSL -o appimagetool-x86_64.AppImage https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool-x86_64.AppImage" | sha256sum -c
+          chmod +x appimagetool-x86_64.AppImage
+          sh packaging/build-appimage.sh ./appimagetool-x86_64.AppImage
+      - name: Bare binary (name is a contract with the in-app updater)
+        run: |
+          cp "dist/notion-client-$VERSION-x86_64-linux/notion-egui" dist/notion-egui-x86_64-linux
+          (cd dist && sha256sum notion-egui-x86_64-linux > notion-egui-x86_64-linux.sha256)
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes \
+            "dist/Notion_Client-$VERSION-x86_64.AppImage" "dist/Notion_Client-$VERSION-x86_64.AppImage.sha256" \
+            "dist/notion-client-$VERSION-x86_64-linux.tar.gz" "dist/notion-client-$VERSION-x86_64-linux.tar.gz.sha256" \
+            dist/notion-egui-x86_64-linux dist/notion-egui-x86_64-linux.sha256

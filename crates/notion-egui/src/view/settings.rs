@@ -33,6 +33,7 @@ pub struct SettingsUi {
     /// A running connection test, and the last result.
     test: Option<Test>,
     test_result: Option<Result<String, String>>,
+    updater: crate::update::Updater,
 }
 
 impl SettingsUi {
@@ -109,7 +110,7 @@ fn save_secrets(app: &mut App) {
 }
 
 /// The left column: (name, heading subtitle, icon) per tab.
-const TABS: [(&str, &str, Icon); 3] = [
+const TABS: [(&str, &str, Icon); 4] = [
     ("Appearance", "Choose how the app looks and feels on this computer", Icon::Sidebar),
     (
         "Keyboard shortcuts",
@@ -121,6 +122,7 @@ const TABS: [(&str, &str, Icon); 3] = [
         "Connect Claude with your subscription, or any AI with an API key",
         Icon::Sparkle,
     ),
+    ("Updates", "Get the newest version from GitHub", Icon::Sync),
 ];
 
 /// Shows the window when `app.settings_ui` is Some; edits `app.settings`,
@@ -182,14 +184,15 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 .show(&mut bui, |ui| {
                     ui.set_max_width(760.0);
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    let (title, sub, _) = TABS[st.tab.min(2)];
+                    let (title, sub, _) = TABS[st.tab.min(3)];
                     ui.label(RichText::new(title).size(28.0).strong().color(c.text));
                     ui.add_space(6.0);
                     ui.label(RichText::new(sub).size(15.0).color(c.secondary));
                     match st.tab {
                         0 => appearance(app, &mut st, ui),
                         1 => keys_tab(app, &mut st, ui),
-                        _ => ai_tab(app, &mut st, ui),
+                        2 => ai_tab(app, &mut st, ui),
+                        _ => updates_tab(&mut st, ui),
                     }
                     ui.add_space(24.0);
                 });
@@ -215,6 +218,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             }
         }
     }
+    // ponytail: closing drops the Updater; a running download still finishes and replaces the binary, its result just isn't shown
     if open {
         app.settings_ui = Some(st);
     }
@@ -474,6 +478,52 @@ fn keys_tab(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
     }
 }
 
+fn updates_tab(st: &mut SettingsUi, ui: &mut egui::Ui) {
+    use crate::update::{State, CURRENT};
+    let c = theme::colors(ui);
+    let u = &mut st.updater;
+    u.poll();
+    u.tick(ui.ctx());
+    section(ui, c, "Version");
+    ui.label(RichText::new(format!("Version {CURRENT}")).color(c.text));
+    ui.add_space(10.0);
+    match u.state.clone() {
+        State::Idle | State::UpToDate | State::Error(_) => {
+            if ui.button("Check for updates").clicked() {
+                u.check();
+            }
+            match &u.state {
+                State::UpToDate => {
+                    ui.label(RichText::new("You're up to date.").color(c.secondary));
+                }
+                State::Error(e) => {
+                    ui.label(RichText::new(e).color(c.error));
+                }
+                _ => {}
+            }
+        }
+        State::Checking | State::Downloading => {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0));
+                let t = if u.state == State::Checking { "Checking…" } else { "Downloading…" };
+                ui.label(RichText::new(t).color(c.secondary));
+            });
+        }
+        State::Available(tag) => {
+            ui.label(RichText::new(format!("Version {} is available", tag.trim_start_matches('v'))).color(c.text));
+            if ui.button("Update now").clicked() {
+                u.install();
+            }
+        }
+        State::Done(tag) => {
+            ui.label(
+                RichText::new(format!("Updated to {}. Restart the app to use it.", tag.trim_start_matches('v')))
+                    .color(c.accent),
+            );
+        }
+    }
+}
+
 fn ai_tab(app: &mut App, st: &mut SettingsUi, ui: &mut egui::Ui) {
     let c = theme::colors(ui);
     let cfg = &mut app.settings.ai;
@@ -643,7 +693,7 @@ mod tests {
     fn renders_all_tabs() {
         let mut w = Win::with_texts(&["a"]);
         w.app.settings_ui = Some(Default::default());
-        for tab in 0..3 {
+        for tab in 0..4 {
             w.app.settings_ui.as_mut().unwrap().tab = tab;
             run(&mut w, vec![]);
             run(&mut w, vec![]);
