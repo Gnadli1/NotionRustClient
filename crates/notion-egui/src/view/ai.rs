@@ -288,11 +288,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                 ui.label(RichText::new(what).size(13.0).color(c.secondary));
                             });
                             ui.add_space(4.0);
-                            // ponytail: plain selectable text, not rendered Markdown
-                            ui.add(
-                                egui::Label::new(RichText::new(&p.answer).size(14.0).color(c.text))
-                                    .selectable(true),
-                            );
+                            crate::md::show_markdown(ui, c, &p.answer);
                             if let Some(e) = &p.error {
                                 ui.add_space(6.0);
                                 ui.colored_label(c.error, e);

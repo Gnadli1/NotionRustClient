@@ -61,6 +61,8 @@ pub struct Menu {
     pub filter: String,
     /// `@` only; fixed when it opens, so a menu open over midnight stays consistent.
     pub days: Days,
+    /// An entry was clicked (it is `selected`): resolve it like Enter.
+    pub clicked: bool,
 }
 
 impl Menu {
@@ -72,6 +74,7 @@ impl Menu {
             selected: 0,
             filter: String::new(),
             days,
+            clicked: false,
         }
     }
 
@@ -371,7 +374,7 @@ pub fn menu_step(menu: &mut Menu, entries: &[Entry], key: EditKey) -> Outcome {
 }
 
 /// Draws the popup at `pos` (just under the trigger or the cursor).
-pub fn show(ctx: &egui::Context, pos: egui::Pos2, menu: &Menu, entries: &[Entry]) {
+pub fn show(ctx: &egui::Context, pos: egui::Pos2, menu: &mut Menu, entries: &[Entry]) {
     let hl = ctx.global_style().visuals.selection.bg_fill;
     egui::Area::new(Id::unique("block-menu"))
         .order(egui::Order::Foreground)
@@ -389,10 +392,25 @@ pub fn show(ctx: &egui::Context, pos: egui::Pos2, menu: &Menu, entries: &[Entry]
                     if n == menu.selected {
                         t = t.strong().background_color(hl);
                     }
-                    ui.add(Label::new(t).selectable(false));
+                    let r = ui.add(Label::new(t).selectable(false).sense(egui::Sense::click()));
+                    if r.hovered() && ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO) {
+                        menu.selected = n;
+                    }
+                    if r.clicked() {
+                        menu.selected = n;
+                        menu.clicked = true;
+                    }
                 }
             });
         });
+}
+
+/// The pointer is over the popup drawn last frame (a press there takes the
+/// editor's focus, which must not count as a blur).
+pub fn pointer_over(ctx: &egui::Context) -> bool {
+    let rect = ctx.memory(|m| m.area_rect(Id::unique("block-menu")));
+    rect.zip(ctx.input(|i| i.pointer.interact_pos()))
+        .is_some_and(|(r, p)| r.contains(p))
 }
 
 #[cfg(test)]
@@ -705,5 +723,75 @@ mod tests {
             !tt.iter().any(|e| matches!(e.pick, Pick::Upload)),
             "a block can't turn into an upload"
         );
+    }
+
+    #[test]
+    fn a_click_picks_the_entry_under_the_mouse() {
+        let ctx = egui::Context::default();
+        let es = slash_entries("");
+        let mut m = menu(Kind::Slash);
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 900.0)));
+        let frame = |m: &mut Menu, events: Vec<egui::Event>| {
+            let raw = egui::RawInput { screen_rect: screen, events, ..Default::default() };
+            ctx.run_ui(raw, |ui| show(ui.ctx(), egui::pos2(10.0, 10.0), m, &es))
+                .drop_without_applying_deltas();
+        };
+        frame(&mut m, vec![]);
+        let r = ctx.memory(|mem| mem.area_rect(Id::unique("block-menu"))).unwrap();
+        let p = egui::pos2(r.center().x, r.top() + r.height() * 2.5 / es.len() as f32);
+        let btn = |pressed| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(&mut m, vec![egui::Event::PointerMoved(p)]);
+        frame(&mut m, vec![btn(true)]);
+        frame(&mut m, vec![btn(false)]);
+        assert!(m.clicked);
+        assert_eq!(
+            menu_step(&mut m, &es, EditKey::Enter),
+            Outcome::Pick(es[m.selected].pick.clone())
+        );
+        assert_eq!(m.selected, 2);
+    }
+
+    #[test]
+    fn hover_moves_the_highlight_only_while_the_pointer_moves_and_outside_clicks_dont_pick() {
+        let ctx = egui::Context::default();
+        let es = slash_entries("");
+        let mut m = menu(Kind::Slash);
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 900.0)));
+        let frame = |m: &mut Menu, events: Vec<egui::Event>| {
+            let raw = egui::RawInput { screen_rect: screen, events, ..Default::default() };
+            ctx.run_ui(raw, |ui| show(ui.ctx(), egui::pos2(10.0, 10.0), m, &es))
+                .drop_without_applying_deltas();
+        };
+        frame(&mut m, vec![]);
+        let r = ctx.memory(|mem| mem.area_rect(Id::unique("block-menu"))).unwrap();
+        let at = |k: f32| egui::pos2(r.center().x, r.top() + r.height() * k / es.len() as f32);
+        assert!(!pointer_over(&ctx));
+        frame(&mut m, vec![egui::Event::PointerMoved(at(3.4))]);
+        frame(&mut m, vec![egui::Event::PointerMoved(at(3.5))]);
+        assert_eq!(m.selected, 3);
+        assert!(pointer_over(&ctx));
+        // pointer parked: selection (e.g. moved by keys) stays
+        m.selected = 1;
+        frame(&mut m, vec![]);
+        assert_eq!(m.selected, 1);
+        // click far outside: no pick
+        let out = egui::pos2(700.0, 800.0);
+        let btn = |pressed| egui::Event::PointerButton {
+            pos: out,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(&mut m, vec![egui::Event::PointerMoved(out)]);
+        assert!(!pointer_over(&ctx));
+        frame(&mut m, vec![btn(true)]);
+        frame(&mut m, vec![btn(false)]);
+        assert!(!m.clicked);
+        assert_eq!(m.selected, 1);
     }
 }

@@ -4,11 +4,12 @@
 
 use eframe::egui::{
     text::{LayoutJob, TextFormat},
-    Color32, FontFamily, FontId, Stroke,
+    Color32, FontFamily, FontId, Frame, Label, Margin, Stroke, Ui,
 };
 use notion_core::model::{RichText, RichTextKind, User};
 
 use crate::tex::pretty_tex;
+use crate::theme::Colors;
 
 const LINK: Color32 = Color32::from_rgb(70, 130, 220);
 const CODE_BG: Color32 = Color32::from_rgba_premultiplied(40, 40, 40, 40);
@@ -280,6 +281,219 @@ pub fn md_job(src: &str, size: f32, bold: bool, dim: Color32) -> LayoutJob {
     job
 }
 
+/// Inline Markdown with the markers dropped: (text, style, link url).
+fn inline(s: &str) -> Vec<(String, Style, Option<String>)> {
+    let mut out = Vec::new();
+    let mut st = Style::default();
+    let mut buf = String::new();
+    let mut i = 0;
+    fn flush(out: &mut Vec<(String, Style, Option<String>)>, buf: &mut String, st: Style) {
+        if !buf.is_empty() {
+            out.push((std::mem::take(buf), st, None));
+        }
+    }
+    while i < s.len() {
+        let rest = &s[i..];
+        let ch = rest.chars().next().unwrap_or(' ');
+        if st.code {
+            if ch == '`' {
+                flush(&mut out, &mut buf, st);
+                st.code = false;
+            } else {
+                buf.push(ch);
+            }
+            i += ch.len_utf8();
+            continue;
+        }
+        let prev = s[..i].chars().next_back();
+        let d = ["**", "~~", "`", "*", "_"].into_iter().find(|d| rest.starts_with(d));
+        if let Some(d) = d {
+            let n = d.len();
+            let on = match d {
+                "**" => st.bold,
+                "~~" => st.strike,
+                "`" => false,
+                _ => st.italic,
+            };
+            let ok = on
+                || (rest[n..].contains(d)
+                    && !rest[n..].starts_with(char::is_whitespace)
+                    && !(d == "_" && prev.is_some_and(char::is_alphanumeric)));
+            if ok {
+                flush(&mut out, &mut buf, st);
+                match d {
+                    "**" => st.bold = !on,
+                    "~~" => st.strike = !on,
+                    "`" => st.code = true,
+                    _ => st.italic = !on,
+                }
+                i += n;
+                continue;
+            }
+        } else if ch == '[' {
+            if let Some((label, url)) = rest.find("](").and_then(|m| {
+                let e = rest[m..].find(')')?;
+                Some((&rest[1..m], &rest[m + 2..m + e]))
+            }) {
+                flush(&mut out, &mut buf, st);
+                out.push((label.to_string(), st, Some(url.to_string())));
+                i += label.len() + url.len() + 4;
+                continue;
+            }
+        }
+        buf.push(ch);
+        i += ch.len_utf8();
+    }
+    flush(&mut out, &mut buf, st);
+    out
+}
+
+#[derive(Debug, PartialEq)]
+enum Block {
+    /// heading level 1..=6
+    Head(usize, String),
+    /// nesting level, marker, text
+    Item(usize, String, String),
+    Code(String),
+    Quote(String),
+    Rule,
+    Para(String),
+    Table(String),
+}
+
+/// Lines to blocks; an unclosed fence (a streaming answer) runs to the end.
+fn blocks(text: &str) -> Vec<Block> {
+    let mut out: Vec<Block> = Vec::new();
+    let mut fence: Option<String> = None;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") {
+            match fence.take() {
+                Some(code) => out.push(Block::Code(code)),
+                None => fence = Some(String::new()),
+            }
+            continue;
+        }
+        if let Some(code) = &mut fence {
+            if !code.is_empty() {
+                code.push('\n');
+            }
+            code.push_str(line);
+            continue;
+        }
+        let level = (line.len() - t.len()) / 2;
+        let hashes = t.chars().take_while(|&c| c == '#').count();
+        let digits = t.chars().take_while(char::is_ascii_digit).count();
+        let t = t.trim_end();
+        if t.is_empty() {
+            continue;
+        } else if (1..=6).contains(&hashes) && t[hashes..].starts_with(' ') {
+            out.push(Block::Head(hashes, t[hashes..].trim().to_string()));
+        } else if t.len() >= 3 && t.chars().all(|c| c == '-') | t.chars().all(|c| c == '*') | t.chars().all(|c| c == '_') {
+            out.push(Block::Rule);
+        } else if let Some(q) = t.strip_prefix('>') {
+            out.push(Block::Quote(q.trim_start().to_string()));
+        } else if let Some(r) = ["- ", "* ", "+ "].iter().find_map(|m| t.strip_prefix(m)) {
+            out.push(Block::Item(level, "•".into(), r.to_string()));
+        } else if digits > 0 && t[digits..].starts_with(". ") {
+            out.push(Block::Item(level, t[..=digits].to_string(), t[digits + 2..].to_string()));
+        } else if t.starts_with('|') {
+            match out.last_mut() {
+                Some(Block::Table(s)) => {
+                    s.push('\n');
+                    s.push_str(t);
+                }
+                _ => out.push(Block::Table(t.to_string())),
+            }
+        } else {
+            out.push(Block::Para(t.to_string()));
+        }
+    }
+    if let Some(code) = fence {
+        out.push(Block::Code(code));
+    }
+    out
+}
+
+/// A line of inline Markdown, wrapped, selectable; links are clickable.
+fn show_inline(ui: &mut Ui, c: &Colors, text: &str, size: f32, bold: bool) {
+    let spans = inline(text);
+    let fmt = |st: Style| {
+        let mut f = format(size, Style { bold: st.bold || bold, ..st });
+        if f.color == Color32::PLACEHOLDER {
+            f.color = c.text;
+        }
+        f
+    };
+    if spans.iter().all(|s| s.2.is_none()) {
+        let mut job = LayoutJob::default();
+        for (t, st, _) in &spans {
+            job.append(t, 0.0, fmt(*st));
+        }
+        ui.add(Label::new(job).selectable(true));
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for (t, st, url) in &spans {
+            // only web links: AI output must not open file: or app handlers
+            let web = |u: &&String| u.starts_with("https://") || u.starts_with("http://");
+            match url.as_ref().filter(web) {
+                Some(u) => {
+                    ui.hyperlink_to(eframe::egui::RichText::new(t).size(size).color(c.accent), u);
+                }
+                None => {
+                    let mut job = LayoutJob::default();
+                    job.append(t, 0.0, fmt(*st));
+                    ui.add(Label::new(job).selectable(true));
+                }
+            }
+        }
+    });
+}
+
+/// Markdown rendered with the markers hidden (the AI panel's answer).
+pub(crate) fn show_markdown(ui: &mut Ui, c: &Colors, text: &str) {
+    for b in blocks(text) {
+        match b {
+            Block::Head(n, t) => {
+                ui.add_space(4.0);
+                show_inline(ui, c, &t, [22.0, 19.0, 16.5, 15.0, 14.5, 14.0][n - 1], true);
+            }
+            Block::Item(level, m, t) => {
+                let left = (14 * level.min(8) + 4) as i8;
+                Frame::new()
+                    .inner_margin(eframe::egui::Margin { left, ..Default::default() })
+                    .show(ui, |ui| show_inline(ui, c, &format!("{m} {t}"), 14.0, false));
+            }
+            Block::Code(s) | Block::Table(s) => {
+                Frame::new()
+                    .fill(c.hover)
+                    .corner_radius(6)
+                    .inner_margin(Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.add(
+                            Label::new(eframe::egui::RichText::new(s).monospace().size(13.0).color(c.text))
+                                .selectable(true),
+                        );
+                    });
+            }
+            Block::Quote(t) => {
+                let r = Frame::new()
+                    .inner_margin(Margin { left: 12, ..Default::default() })
+                    .show(ui, |ui| show_inline(ui, c, &t, 14.0, false));
+                let b = r.response.rect;
+                ui.painter().vline(b.left() + 2.0, b.y_range(), Stroke::new(3.0, c.border));
+            }
+            Block::Rule => {
+                ui.separator();
+            }
+            Block::Para(t) => show_inline(ui, c, &t, 14.0, false),
+        }
+        ui.add_space(3.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +612,68 @@ mod tests {
             job.sections[0].format.background != Color32::TRANSPARENT,
             "the mention pill"
         );
+    }
+
+    #[test]
+    fn markdown_inline_and_blocks() {
+        let v = inline("**a** `b` [x](http://u) _i_");
+        assert_eq!((v[0].0.as_str(), v[0].1.bold), ("a", true));
+        assert_eq!((v[2].0.as_str(), v[2].1.code), ("b", true));
+        assert_eq!(v[4].2.as_deref(), Some("http://u"));
+        assert!(v[6].1.italic);
+        let b = blocks("# T\n- x\n  1. y\n```rs\nlet a;\n");
+        assert_eq!(b[0], Block::Head(1, "T".into()));
+        assert_eq!(b[2], Block::Item(1, "1.".into(), "y".into()));
+        assert_eq!(b[3], Block::Code("let a;".into()));
+        inline("**unclosed `x [a](");
+    }
+
+    fn flat(s: &str) -> String {
+        inline(s).into_iter().map(|v| v.0).collect()
+    }
+
+    #[test]
+    fn markdown_edge_cases() {
+        let v = inline("***x***");
+        assert_eq!(flat("***x***"), "x");
+        assert!(v.iter().any(|s| s.1.bold && s.1.italic), "{v:?}");
+        let v = inline("snake_case_word");
+        assert_eq!(flat("snake_case_word"), "snake_case_word");
+        assert!(v.iter().all(|s| !s.1.italic));
+        // link without closing paren stays literal
+        assert_eq!(flat("[a](http://x"), "[a](http://x");
+        assert!(inline("[a](http://x").iter().all(|s| s.2.is_none()));
+        assert_eq!(flat("[a] (b)"), "[a] (b)");
+        assert!(inline("").is_empty());
+        assert!(blocks("").is_empty());
+        assert!(blocks("\n  \n").is_empty());
+        assert_eq!(blocks("10. ten")[0], Block::Item(0, "10.".into(), "ten".into()));
+        assert_eq!(blocks("10.5 not a list")[0], Block::Para("10.5 not a list".into()));
+        assert_eq!(blocks("---")[0], Block::Rule);
+        assert_eq!(blocks("> q")[0], Block::Quote("q".into()));
+        assert_eq!(blocks("#nospace")[0], Block::Para("#nospace".into()));
+        assert_eq!(blocks("####### x")[0], Block::Para("####### x".into()));
+        let t = blocks("| a | b |\n|---|---|\n| 1 | 2 |");
+        assert_eq!(t.len(), 1);
+        assert!(matches!(&t[0], Block::Table(s) if s.lines().count() == 3));
+        // multibyte next to markers and links
+        assert_eq!(flat("ä**ö**[é](u)ü"), "äöéü");
+    }
+
+    #[test]
+    fn show_markdown_survives_a_long_mixed_doc() {
+        let doc = "# H1\n###### H6\ntext **b** *i* `c` ~~s~~ [l](http://x) [bad](x\n- a\n  - b\n    - c\n1. one\n10. ten\n> quote\n---\n| a | b |\n|---|---|\n| 1 | 2 |\n```rs\nfn main() {}\n```\nüñí **ä**\n```\nunclosed";
+        let ctx = eframe::egui::Context::default();
+        let c = crate::theme::LIGHT;
+        for text in [doc.to_string(), doc.repeat(30), String::new()] {
+            let raw = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(400.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| show_markdown(ui, &c, &text)).drop_without_applying_deltas();
+        }
     }
 }
