@@ -1091,6 +1091,10 @@ async fn apply(
             if let Some(c) = c {
                 return Ok(Outcome::Conflict(c));
             }
+            // copying a trashed original (a retry after a half-done move) only makes duplicates
+            if remote.in_trash {
+                return Ok(Outcome::Failed("cannot move: the block is in the trash".into()));
+            }
             let tree = if remote.has_children {
                 client.block_tree(&id).await?
             } else {
@@ -3966,6 +3970,59 @@ mod tests {
             f[0].error.as_deref(),
             Some("cannot move: subtree contains image")
         );
+        s.reset().await;
+
+        // a trashed original (a half-done earlier try) is not copied again
+        store.enqueue(op("z"), None, None).unwrap();
+        let mut z = blk("z", pp("p"), "Z", T, false);
+        z["in_trash"] = json!(true);
+        get(&s, "/v1/blocks/z", ok(z)).await;
+        Mock::given(method("PATCH"))
+            .respond_with(ok(json!({})))
+            .expect(0)
+            .mount(&s)
+            .await;
+        push(&client(&s), &store).await.unwrap();
+        let f = store.ops_by_status(OpStatus::Failed).unwrap();
+        assert_eq!(
+            f[1].error.as_deref(),
+            Some("cannot move: the block is in the trash")
+        );
+        s.verify().await;
+    }
+
+    #[tokio::test]
+    async fn move_to_a_page_named_as_a_block_parent() {
+        // the private API answers a copy on a page with a block_id parent
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["m", "t"]).await;
+        store
+            .enqueue(
+                OpKind::MoveBlock {
+                    block_id: "t".into(),
+                    new_parent_id: "p".into(),
+                    after: None,
+                },
+                Some(T.parse().unwrap()),
+                None,
+            )
+            .unwrap();
+        get(&s, "/v1/blocks/t", ok(blk("t", pp("p"), "T", T, false))).await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/p/children"))
+            .respond_with(list(vec![blk("nt", bp("p"), "T", T2, false)]))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/blocks/t"))
+            .respond_with(ok(blk("t", pp("p"), "T", T2, false)))
+            .mount(&s)
+            .await;
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!(r.applied, 1, "{r:?}");
+        assert_eq!(ids(&store.children("p").unwrap()), ["m", "nt"]);
     }
 
     #[tokio::test]

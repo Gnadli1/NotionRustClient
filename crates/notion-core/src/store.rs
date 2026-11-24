@@ -302,6 +302,8 @@ impl Store {
                             |r| r.get(0),
                         )
                         .optional()?
+                        // the private API names a page parent a block (pages are blocks there)
+                        .or(self.get_page(&parent_id)?.map(|p| p.id))
                         .ok_or_else(|| {
                             Error::Invalid(format!("parent block {parent_id} not cached"))
                         })?,
@@ -894,6 +896,10 @@ mod tests {
             s.put_block(&block("x", bp("unknown"), "x")),
             Err(Error::Invalid(_))
         ));
+        // a page named as a block parent (the private API does that) is still the page
+        s.upsert_page(&page("q", pp("root"), "Q")).unwrap();
+        s.put_block(&block("y", bp("q"), "y")).unwrap();
+        assert_eq!(ids(&s.children("q").unwrap()), ["y"]);
 
         s.rename_block("local-1", "real-1").unwrap();
         assert_eq!(s.get_block("local-1").unwrap(), None);
