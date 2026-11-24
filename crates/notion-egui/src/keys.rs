@@ -102,6 +102,7 @@ impl Chord {
         let s = s.trim().to_lowercase();
         let (mods, key) = match s.strip_suffix("++") {
             Some(m) => (m, "+"),
+            None if s == "+" => ("", "+"),
             None => s.rsplit_once('+').unwrap_or(("", &s)),
         };
         let key = match key {
@@ -131,6 +132,18 @@ impl Chord {
             }
         }
         Some(c)
+    }
+
+    /// Safe to bind: with ctrl/alt/super anything goes; bare, not the
+    /// editor's own keys nor any key that types text (letters, digits,
+    /// punctuation, space), with or without Shift. Tab, F-keys, Delete... ok.
+    pub fn is_bindable(&self) -> bool {
+        self.ctrl
+            || self.alt
+            || self.logo
+            || !(EDITOR_KEYS.contains(&self.key.as_str())
+                || self.key == "space"
+                || self.key.chars().count() == 1)
     }
 
     fn with(m: Modifiers, key: String) -> Chord {
@@ -248,6 +261,10 @@ pub enum Command {
     /// The local Updates inbox (C5), and marking all of it read.
     Updates,
     MarkAllRead,
+    /// Ctrl+,: the Settings window.
+    Settings,
+    /// Ctrl+Shift+H: the AI panel.
+    Ai,
 }
 
 impl Command {
@@ -284,15 +301,20 @@ impl Command {
                 | Command::TrashView
                 | Command::Updates
                 | Command::MarkAllRead
+                | Command::Settings
+                | Command::Ai
         )
     }
 }
 
-const NAMES: &[(&str, Command)] = &[
+pub const NAMES: &[(&str, Command)] = &[
     ("paragraph", Command::Block(TargetKind::Paragraph)),
     ("heading_1", Command::Block(TargetKind::Heading1)),
     ("heading_2", Command::Block(TargetKind::Heading2)),
     ("heading_3", Command::Block(TargetKind::Heading3)),
+    ("toggle_heading_1", Command::Block(TargetKind::ToggleHeading1)),
+    ("toggle_heading_2", Command::Block(TargetKind::ToggleHeading2)),
+    ("toggle_heading_3", Command::Block(TargetKind::ToggleHeading3)),
     ("bulleted", Command::Block(TargetKind::Bulleted)),
     ("numbered", Command::Block(TargetKind::Numbered)),
     ("to_do", Command::Block(TargetKind::ToDo)),
@@ -345,6 +367,8 @@ const NAMES: &[(&str, Command)] = &[
     ("trash_view", Command::TrashView),
     ("updates", Command::Updates),
     ("mark_all_read", Command::MarkAllRead),
+    ("settings", Command::Settings),
+    ("ai", Command::Ai),
 ];
 
 /// Notion's Linux keys (Ctrl+Shift+0-9 for block types; 9, "page", has no
@@ -413,10 +437,17 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("ctrl+shift+delete", "trash_view"),
     ("ctrl+shift+j", "updates"),
     ("ctrl+shift+a", "mark_all_read"),
+    ("ctrl+,", "settings"),
+    ("ctrl+shift+h", "ai"),
 ];
 
 fn command(name: &str) -> Option<Command> {
     NAMES.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
+}
+
+/// `c`'s name in keys.json.
+pub fn name(c: Command) -> &'static str {
+    NAMES.iter().find(|(_, x)| *x == c).map_or("?", |(n, _)| n)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -443,6 +474,49 @@ impl Keymap {
         cs.iter().find_map(|c| self.get(c))
     }
 
+    /// Every binding, sorted by command name then chord.
+    pub fn bindings(&self) -> Vec<(Chord, Command)> {
+        let mut v: Vec<_> = self.0.iter().map(|(k, c)| (k.clone(), *c)).collect();
+        v.sort_by_key(|(k, c)| (name(*c), k.to_string()));
+        v
+    }
+
+    /// Binds `chord` to `cmd`, or unbinds it (None).
+    pub fn set(&mut self, chord: Chord, cmd: Option<Command>) {
+        match cmd {
+            Some(c) => self.0.insert(chord, c),
+            None => self.0.remove(&chord),
+        };
+    }
+
+    /// Rewrites `dir/keys.json` with this whole map (tmp + rename). Default
+    /// chords left unbound are written as "none" so they stay unbound.
+    pub fn save(&self, dir: &Path) -> std::io::Result<()> {
+        let mut lines: Vec<String> = Keymap::default()
+            .0
+            .keys()
+            .filter(|k| !self.0.contains_key(*k))
+            .map(|k| format!("  {}: \"none\"", serde_json::json!(k.to_string())))
+            .collect();
+        lines.sort();
+        lines.extend(self.bindings().into_iter().map(|(k, c)| {
+            format!("  {}: {}", serde_json::json!(k.to_string()), serde_json::json!(name(c)))
+        }));
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join("keys.json");
+        // a hand-edited file `load` couldn't fully read: keep it as keys.json.bad
+        if let Ok(src) = std::fs::read(&path) {
+            let ok = serde_json::from_slice::<Entries>(&src)
+                .is_ok_and(|Entries(e)| Keymap::merge(e).1.is_empty());
+            if !ok {
+                std::fs::copy(&path, dir.join("keys.json.bad"))?;
+            }
+        }
+        let tmp = dir.join("keys.json.tmp");
+        std::fs::write(&tmp, format!("{{\n{}\n}}\n", lines.join(",\n")))?;
+        std::fs::rename(tmp, path)
+    }
+
     /// Defaults overridden by `entries` (file order); `"none"` or `null`
     /// unbinds. Returns the problems found, for the status bar.
     fn merge(entries: Vec<(String, Value)>) -> (Keymap, Vec<String>) {
@@ -450,10 +524,7 @@ impl Keymap {
         let (mut bad, mut unknown, mut dup) = (Vec::new(), Vec::new(), Vec::new());
         let mut seen = std::collections::HashSet::new();
         for (k, v) in entries {
-            // the editor's own keys can't be taken without ctrl/alt/super
-            let Some(chord) = Chord::parse(&k)
-                .filter(|c| c.ctrl || c.alt || c.logo || !EDITOR_KEYS.contains(&c.key.as_str()))
-            else {
+            let Some(chord) = Chord::parse(&k).filter(Chord::is_bindable) else {
                 bad.push(k);
                 continue;
             };
@@ -492,7 +563,8 @@ impl Keymap {
     }
 }
 
-/// Keys the editor hard-wires; bindable only with ctrl, alt or super.
+/// Keys the editor hard-wires; bindable only with ctrl, alt or super
+/// (see [`Chord::is_bindable`]).
 const EDITOR_KEYS: &[&str] = &[
     "enter",
     "backspace",
@@ -1171,5 +1243,88 @@ mod tests {
             DEFAULTS.iter().all(|(c, _)| chords.insert(*c)),
             "duplicate default chord"
         );
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut k = Keymap::default();
+        let unbound = *DEFAULTS.iter().map(|(c, _)| c).next().unwrap();
+        k.set(ch(unbound), None);
+        let h1 = command("toggle_heading_1").expect("toggle_heading_1 name");
+        k.set(ch("ctrl+alt+9"), Some(h1));
+        k.save(dir.path()).unwrap();
+        let (l, p) = load(dir.path());
+        assert!(p.is_empty(), "{p:?}");
+        assert_eq!(l, k);
+        assert_eq!(l.get(&ch(unbound)), None);
+        assert_eq!(l.get(&ch("ctrl+alt+9")), Some(h1));
+    }
+
+    #[test]
+    fn bindable_chords_round_trip_and_bare_text_keys_are_not_bindable() {
+        let mut keys: Vec<String> = NAMED.iter().map(|(_, n)| n.to_string()).collect();
+        keys.extend(CHARS.iter().map(|(_, c)| c.to_string()));
+        keys.extend(('a'..='z').map(String::from));
+        keys.extend(["ß".into(), "ä".into(), " ".into()]);
+        let mut n = 0;
+        for key in &keys {
+            for bits in 0..16u8 {
+                let c = Chord {
+                    ctrl: bits & 1 != 0,
+                    alt: bits & 2 != 0,
+                    shift: bits & 4 != 0,
+                    logo: bits & 8 != 0,
+                    key: if key == " " { "space".into() } else { key.clone() },
+                };
+                if c.is_bindable() {
+                    n += 1;
+                    assert_eq!(Chord::parse(&c.to_string()), Some(c.clone()), "{c}");
+                }
+            }
+        }
+        assert!(n > 300);
+        for bad in ["a", "shift+a", "1", "shift+1", "space", "shift+space", "+", ",", "enter", "up", "ß"] {
+            assert!(!ch(bad).is_bindable(), "{bad}");
+        }
+        for ok in ["tab", "shift+tab", "f5", "delete", "home", "ctrl+a", "alt+a", "super+1", "ctrl++"] {
+            assert!(ch(ok).is_bindable(), "{ok}");
+        }
+        assert!(DEFAULTS.iter().all(|(c, _)| ch(c).is_bindable()));
+        let (k, p) = Keymap::merge(entries(&[("a", "bold"), ("shift+x", "bold")]));
+        assert_eq!(p, ["keys.json: bad chords: a, shift+x"]);
+        assert_eq!(k, Keymap::default());
+    }
+
+    #[test]
+    fn save_keeps_a_broken_file_as_bad() {
+        let dir = tempfile::tempdir().unwrap();
+        let (f, bad) = (dir.path().join("keys.json"), dir.path().join("keys.json.bad"));
+        std::fs::write(&f, "{ not json").unwrap();
+        Keymap::default().save(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), "{ not json");
+        assert_eq!(load(dir.path()), (Keymap::default(), vec![]));
+        // merge problems count as broken too
+        std::fs::remove_file(&bad).unwrap();
+        std::fs::write(&f, r#"{"ctrl+q": "explode"}"#).unwrap();
+        Keymap::default().save(dir.path()).unwrap();
+        assert!(bad.exists());
+        // a clean file is not copied
+        std::fs::remove_file(&bad).unwrap();
+        Keymap::default().save(dir.path()).unwrap();
+        assert!(!bad.exists());
+    }
+
+    #[test]
+    fn every_name_chord_display_parses_back() {
+        for (c, _) in Keymap::default().bindings() {
+            assert_eq!(Chord::parse(&c.to_string()), Some(c.clone()), "{c}");
+        }
+        assert_eq!(ch("ctrl+,").to_string(), "ctrl+,");
+        for (n, c) in NAMES {
+            assert_eq!(name(*c), *n);
+        }
+        let mut seen = std::collections::HashSet::new();
+        assert!(NAMES.iter().all(|(n, _)| seen.insert(*n)), "duplicate name");
     }
 }

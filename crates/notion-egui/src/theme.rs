@@ -64,9 +64,139 @@ pub const TABLE_PAD_Y: i8 = 6;
 /// Fill of the table's header row.
 pub const TABLE_HEADER_TINT: f32 = 0.06;
 
+const fn rgb(v: u32) -> Color32 {
+    Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+
+const fn pal(name: &'static str, dark: bool, c: [u32; 7]) -> Palette {
+    let tint = if dark {
+        Color32::from_rgba_premultiplied(14, 14, 14, 14)
+    } else {
+        Color32::from_rgba_premultiplied(3, 3, 3, 15)
+    };
+    Palette {
+        name,
+        dark,
+        colors: Colors {
+            bg: rgb(c[0]),
+            text: rgb(c[1]),
+            secondary: rgb(c[2]),
+            sidebar: rgb(c[3]),
+            hover: tint,
+            border: rgb(c[4]),
+            accent: rgb(c[5]),
+            error: rgb(c[6]),
+        },
+    }
+}
+
+/// A selectable theme; "System" (follow the OS) is not in the list.
+pub struct Palette {
+    pub name: &'static str,
+    pub colors: Colors,
+    pub dark: bool,
+}
+
+// [bg, text, secondary, sidebar, border, accent, error]
+pub const THEMES: &[Palette] = &[
+    Palette {
+        name: "Light",
+        colors: LIGHT,
+        dark: false,
+    },
+    Palette {
+        name: "Dark",
+        colors: DARK,
+        dark: true,
+    },
+    pal(
+        "Ocean",
+        true,
+        [
+            0x0D2137, 0xDCEBF7, 0x8FB1CC, 0x112B47, 0x1F4468, 0x4DB3FF, 0xFF7B7B,
+        ],
+    ),
+    pal(
+        "Forest",
+        true,
+        [
+            0x12261B, 0xDDEFE2, 0x8DB79B, 0x173222, 0x27503A, 0x4CC38A, 0xFF8A80,
+        ],
+    ),
+    pal(
+        "Sunset",
+        false,
+        [
+            0xFFF4EA, 0x4A2C1A, 0x8A5A3C, 0xFFE8D3, 0xF5CBA7, 0xE8590C, 0xC92A2A,
+        ],
+    ),
+    pal(
+        "Lavender",
+        false,
+        [
+            0xF6F1FF, 0x2E2150, 0x6B5B95, 0xEBE2FA, 0xD5C6F0, 0x7048E8, 0xC92A5A,
+        ],
+    ),
+    pal(
+        "Rose",
+        true,
+        [
+            0x2A1620, 0xF8E1EA, 0xC596A9, 0x351C29, 0x5A2E42, 0xFF6FA5, 0xFF8A80,
+        ],
+    ),
+    pal(
+        "Mint",
+        false,
+        [
+            0xECFAF6, 0x12403B, 0x3F7B73, 0xD9F3EC, 0xB3E3D8, 0x0B8F7E, 0xC92A2A,
+        ],
+    ),
+    pal(
+        "Sepia",
+        false,
+        [
+            0xF4ECD8, 0x433422, 0x7A6648, 0xEADFC3, 0xD6C7A1, 0xA0522D, 0xB02A2A,
+        ],
+    ),
+    pal(
+        "Midnight",
+        true,
+        [
+            0x0E0B26, 0xE6E3FF, 0x9E98D6, 0x15113A, 0x2B2562, 0x8B6BFF, 0xFF7A8A,
+        ],
+    ),
+];
+
+fn choice_id() -> egui::Id {
+    egui::Id::unique("theme-choice")
+}
+
+/// Applies the theme `name`: "System" follows the OS, else a palette from
+/// `THEMES` (unknown names count as "System").
+pub fn select(ctx: &egui::Context, name: &str) {
+    match THEMES.iter().position(|p| p.name == name) {
+        Some(i) => {
+            let p = &THEMES[i];
+            let v = visuals(&p.colors, p.dark);
+            ctx.set_visuals_of(Theme::Light, v.clone());
+            ctx.set_visuals_of(Theme::Dark, v);
+            ctx.set_theme(if p.dark { Theme::Dark } else { Theme::Light });
+            ctx.data_mut(|d| d.insert_temp(choice_id(), i));
+        }
+        None => {
+            install(ctx);
+            ctx.set_theme(egui::ThemePreference::System);
+            ctx.data_mut(|d| d.remove_temp::<usize>(choice_id()));
+        }
+    }
+}
+
 /// The palette of the theme `ui` is drawn in.
 pub fn colors(ui: &egui::Ui) -> &'static Colors {
-    if ui.visuals().dark_mode {
+    let chosen = ui.ctx().data(|d| d.get_temp::<usize>(choice_id()));
+    if let Some(p) = chosen.and_then(|i| THEMES.get(i)) {
+        &p.colors
+    } else if ui.visuals().dark_mode {
         &DARK
     } else {
         &LIGHT
@@ -192,5 +322,62 @@ mod tests {
         ctx.run_ui(egui::RawInput::default(), |_| {})
             .drop_without_applying_deltas();
         assert_eq!(ctx.global_style().visuals.panel_fill, LIGHT.bg);
+    }
+
+    fn lum(c: Color32) -> f32 {
+        let f = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+    }
+
+    #[test]
+    fn palettes_unique_and_readable() {
+        assert!(THEMES.len() >= 8);
+        for (i, p) in THEMES.iter().enumerate() {
+            assert!(THEMES[..i].iter().all(|q| q.name != p.name), "{}", p.name);
+            let (a, b) = (lum(p.colors.text), lum(p.colors.bg));
+            let r = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+            assert!(r >= 4.5, "{}: contrast {r}", p.name);
+            let ratio = |x: Color32, y: Color32| {
+                let (a, b) = (lum(x), lum(y));
+                (a.max(b) + 0.05) / (a.min(b) + 0.05)
+            };
+            let c = &p.colors;
+            let (acc, sec) = (ratio(c.accent, c.bg), ratio(c.secondary, c.sidebar));
+            assert!(acc >= 3.0, "{}: accent/bg {acc}", p.name);
+            assert!(sec >= 4.0, "{}: secondary/sidebar {sec}", p.name);
+        }
+    }
+
+    #[test]
+    fn select_picks_palette_colours() {
+        let ctx = egui::Context::default();
+        select(&ctx, "Ocean");
+        let ocean = THEMES.iter().find(|p| p.name == "Ocean").unwrap();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert_eq!(*colors(ui), ocean.colors);
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn system_restores_the_system_palette() {
+        let ctx = egui::Context::default();
+        select(&ctx, "Ocean");
+        assert!(ctx.data(|d| d.get_temp::<usize>(choice_id())).is_some());
+        select(&ctx, "System");
+        assert!(ctx.data(|d| d.get_temp::<usize>(choice_id())).is_none());
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .drop_without_applying_deltas();
+        let fill = ctx.global_style().visuals.panel_fill;
+        assert!(fill == LIGHT.bg || fill == DARK.bg);
+        select(&ctx, "Nope");
+        assert!(ctx.data(|d| d.get_temp::<usize>(choice_id())).is_none());
     }
 }

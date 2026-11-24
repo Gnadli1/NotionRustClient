@@ -5,6 +5,7 @@
 //! shared `cache.db` in the data folder. `NOTION_EGUI_KEYLOG=1` prints raw
 //! key/text/IME events to stderr.
 
+mod ai;
 mod app;
 mod browser_login;
 mod comments;
@@ -29,6 +30,7 @@ mod profiles;
 mod resolve;
 #[allow(dead_code)]
 mod session;
+mod settings;
 mod shell;
 #[allow(dead_code)]
 mod sidebar;
@@ -236,7 +238,15 @@ fn main() -> eframe::Result {
             app.start_space_refresh();
             app.first_run();
             if let Some(dir) = dir {
-                let (keys, notes) = keys::load(&dir);
+                let (keys, mut notes) = keys::load(&dir);
+                let (mut settings, settings_problem) = settings::load(&dir);
+                notes.extend(settings_problem);
+                if let Some(p) = settings::apply(&cc.egui_ctx, &settings) {
+                    settings.font.clear();
+                    notes.push(p);
+                }
+                app.settings = settings;
+                app.ai_secrets = ai::load_secrets(&dir);
                 app.keys = keys;
                 if !notes.is_empty() {
                     let note = notes.join("; ");

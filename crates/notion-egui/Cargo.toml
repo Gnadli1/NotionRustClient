@@ -9,6 +9,7 @@ eframe.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+reqwest.workspace = true
 image.workspace = true
 webbrowser = "1"
 

@@ -305,6 +305,14 @@ pub struct App {
     /// One token per workspace, and the active one.
     pub(crate) profiles: Profiles,
     pub(crate) profiles_dir: Option<PathBuf>,
+    /// settings.json, applied at start and on change.
+    pub(crate) settings: crate::settings::Settings,
+    /// The Settings window, while open.
+    pub(crate) settings_ui: Option<crate::view::settings::SettingsUi>,
+    /// The AI panel, while open.
+    pub(crate) ai: Option<crate::view::ai::AiPanel>,
+    /// API keys for the AI agent (ai-keys.json).
+    pub(crate) ai_secrets: crate::ai::Secrets,
     pub(crate) data_dir: Option<PathBuf>,
     /// The add/edit workspace dialog, while open.
     pub(crate) ws_form: Option<crate::profiles::Form>,
@@ -529,6 +537,10 @@ impl App {
             session_file: crate::shell::SESSION_FILE.to_string(),
             profiles: Profiles::default(),
             profiles_dir: None,
+            settings: Default::default(),
+            settings_ui: None,
+            ai: None,
+            ai_secrets: Default::default(),
             data_dir: None,
             ws_form: None,
             pending_switch: None,
@@ -836,7 +848,7 @@ impl App {
         let out = area.show(ui, |ui| {
             let w = ui.available_width();
             let col = (w - 2.0 * theme::PAGE_PAD)
-                .clamp(200.0, theme::PAGE_MAX_WIDTH)
+                .clamp(200.0, if self.settings.full_width { f32::INFINITY } else { theme::PAGE_MAX_WIDTH })
                 .min(w);
             if std::env::var_os("NOTION_EGUI_DEBUG").is_some() {
                 eprintln!(

@@ -1,7 +1,9 @@
 //! Drawing of the shell: tabs, sidebar, status bar, switcher. Each function
 //! returns the `Action` the user triggered, if any; `App::apply` runs it.
 
+pub mod ai;
 pub mod browser_login;
+pub mod settings;
 pub mod sidebar;
 pub mod status;
 pub mod switcher;

@@ -1593,6 +1593,10 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Command> {
         let ctrl = ctx.input(|i| i.modifiers.ctrl);
         let map = &self.keys;
+        // the Settings window is capturing a chord: it gets the keys untouched
+        if self.settings_ui.as_ref().is_some_and(|s| s.capturing()) {
+            return Vec::new();
+        }
         let mut out =
             ctx.input_mut(|i| keys::take_commands(&mut i.events, ctrl, map, Command::is_global));
         out.extend(ctx.input(|i| keys::mouse_nav(&i.events)));
@@ -1721,6 +1725,18 @@ impl App {
             Command::Updates | Command::MarkAllRead
                 if self.switcher.is_some() || self.conflict.is_some() || self.dlg.is_some() => {}
             Command::Updates => self.toggle_inbox(),
+            Command::Settings => {
+                self.settings_ui = match self.settings_ui {
+                    Some(_) => None,
+                    None => Some(Default::default()),
+                }
+            }
+            Command::Ai => {
+                self.ai = match self.ai {
+                    Some(_) => None,
+                    None => Some(Default::default()),
+                }
+            }
             Command::MarkAllRead => self.mark_all_read(),
             Command::ToggleAll
                 if self.switcher.is_some()
@@ -1956,6 +1972,10 @@ impl App {
         if self.keylog {
             ctx.input(|i| keys::log(&i.raw.events));
         }
+        // first: while it captures a chord it takes the key before the editor
+        if self.settings_ui.is_some() {
+            view::settings::show(self, &ctx);
+        }
         self.drain_events();
         self.poll_browser_login(&ctx);
         self.poll_space_refresh(&ctx);
@@ -2178,6 +2198,9 @@ impl App {
                 self.find_out(o);
             }
         }
+        if self.ai.is_some() {
+            view::ai::show(self, ui);
+        }
         if self.current.is_some() && self.heads.len() >= 2 && ctx.content_rect().width() >= 1000.0 {
             acts.extend(
                 egui::Panel::right("outline")
@@ -2298,6 +2321,10 @@ fn icon_of(e: &notion_core::store::PageEntry) -> String {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.frame(ui);
+    }
+
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        crate::settings::scale_scroll(raw, self.settings.scroll_speed);
     }
 
     fn on_exit(&mut self) {

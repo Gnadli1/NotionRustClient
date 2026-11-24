@@ -2474,6 +2474,7 @@ dependencies = [
  "eframe",
  "image",
  "notion-core",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

@@ -429,6 +429,7 @@ impl App {
             || self.conflict.is_some()
             || self.problems_open
             || self.comments.is_some()
+            || self.settings_ui.is_some()
             || ctx.egui_wants_keyboard_input()
         {
             return;
@@ -503,8 +504,30 @@ impl App {
     /// The selected blocks and their children as Markdown, one block per line
     /// (children indented two spaces per level).
     fn sel_markdown(&self) -> String {
+        self.rows_markdown(&self.sel_idx())
+    }
+
+    /// The whole open page as Markdown (same format as `sel_markdown`).
+    pub(crate) fn page_markdown(&self) -> String {
+        let tops: Vec<usize> = (0..self.rows.len())
+            .filter(|&i| self.rows[i].depth == 0)
+            .collect();
+        self.rows_markdown(&tops)
+    }
+
+    /// Appends Markdown at the end of the page as blocks.
+    pub(crate) fn insert_markdown(&mut self, md: &str) {
+        self.append_block_at_end();
+        let before = self.last_error.clone();
+        self.paste_lines(md);
+        if self.last_error == before {
+            self.info = Some("inserted".into());
+        }
+    }
+
+    fn rows_markdown(&self, idx: &[usize]) -> String {
         let mut out = Vec::new();
-        for i in self.sel_idx() {
+        for &i in idx {
             let d0 = self.rows[i].depth;
             for r in std::iter::once(&self.rows[i]).chain(outline::subtree(&self.rows, i)) {
                 let md = to_markdown(&r.rich_text);
@@ -2222,5 +2245,30 @@ mod tests {
         w.edit(0);
         w.type_text("t");
         assert!(w.text().ends_with('t'));
+    }
+
+    // -------------------------------------------------------------- AI helpers
+
+    #[test]
+    fn page_markdown_includes_nested_children() {
+        let mut w = Win::with_texts(&["a", "b", "c"]);
+        w.edit(1);
+        w.press(Key::Tab, Modifiers::NONE);
+        w.edit(2);
+        w.press(Key::Tab, Modifiers::NONE);
+        w.press(Key::Tab, Modifiers::NONE);
+        assert_eq!(w.app.rows[2].depth, 2);
+        assert_eq!(w.app.page_markdown(), "a\n  b\n    c");
+    }
+
+    #[test]
+    fn insert_markdown_into_empty_and_nonempty_pages() {
+        let mut w = Win::with_texts(&[]);
+        w.app.insert_markdown("# H\n- x");
+        assert_eq!(w.app.page_markdown(), "# H\n- x");
+        let mut w = Win::with_texts(&["keep"]);
+        w.app.insert_markdown("new");
+        assert_eq!(w.app.page_markdown(), "keep\nnew");
+        assert_eq!(w.app.info.as_deref(), Some("inserted"));
     }
 }
