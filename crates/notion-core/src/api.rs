@@ -1654,6 +1654,117 @@ impl Client {
             .map(drop)
     }
 
+    /// Who can open `page_id` (browser sessions only; `Invalid` otherwise).
+    pub async fn page_access(&self, page_id: &str) -> Result<crate::model::Access> {
+        self.private_auth()?;
+        let mut access = crate::model::Access::default();
+        let (mut table, mut id) = ("block".to_string(), page_id.to_string());
+        for _ in 0..32 {
+            let resp = self
+                .private_post(
+                    "syncRecordValues",
+                    json!({ "requests": [{ "pointer": { "table": table, "id": id },
+                                          "version": -1 }] }),
+                )
+                .await?;
+            let mut records = Records::default();
+            records.merge_response(&resp);
+            let Some(rec) = records
+                .blocks
+                .get(&id)
+                .or_else(|| records.collections.get(&id))
+            else {
+                break;
+            };
+            for p in rec
+                .get("permissions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(role) = p
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .filter(|r| *r != "none")
+                else {
+                    continue;
+                };
+                let role = role.to_string();
+                match p.get("type").and_then(Value::as_str) {
+                    Some("user_permission") => {
+                        if let Some(u) = p.get("user_id").and_then(Value::as_str) {
+                            if !access.people.iter().any(|(x, _)| x == u) {
+                                access.people.push((u.to_string(), role));
+                            }
+                        }
+                    }
+                    Some("space_permission") => {
+                        access.workspace.get_or_insert(role);
+                    }
+                    Some("public_permission") => {
+                        access.public.get_or_insert(role);
+                    }
+                    _ => {}
+                }
+            }
+            let parent = rec.get("parent_id").and_then(Value::as_str);
+            let parent_table = rec.get("parent_table").and_then(Value::as_str);
+            match (parent, parent_table) {
+                (Some(p), Some(t @ ("block" | "collection"))) => {
+                    id = p.to_string();
+                    table = t.to_string();
+                }
+                _ => break,
+            }
+        }
+        if !access.people.is_empty() {
+            let requests: Vec<Value> = access
+                .people
+                .iter()
+                .map(|(u, _)| json!({ "pointer": { "table": "notion_user", "id": u }, "version": -1 }))
+                .collect();
+            // names and photos only: without them the bar still shows initials
+            if let Ok(resp) = self
+                .private_post("syncRecordValues", json!({ "requests": requests }))
+                .await
+            {
+                let mut records = Records::default();
+                records.merge_response(&resp);
+                access.users = records.users();
+            }
+        }
+        Ok(access)
+    }
+
+    /// Shares `page_id` with workspace member `user_id` at `role` (browser sessions only).
+    pub async fn share_page(&self, page_id: &str, user_id: &str, role: &str) -> Result<()> {
+        self.private_auth()?;
+        // Notion's ids: lowercase 8-4-4-4-12
+        let uuid = |s: &str| {
+            s.len() == 36
+                && s.bytes().enumerate().all(|(i, b)| match i {
+                    8 | 13 | 18 | 23 => b == b'-',
+                    _ => matches!(b, b'0'..=b'9' | b'a'..=b'f'),
+                })
+        };
+        if !["editor", "read_and_write", "comment_only", "reader"].contains(&role)
+            || !uuid(page_id)
+            || !uuid(user_id)
+        {
+            return Err(Error::Invalid("bad page id, user id or role".into()));
+        }
+        let space = self.private_space_id()?;
+        self.private_transact(vec![private::list_op(
+            page_id,
+            &space,
+            "permissions",
+            "setPermissionItem",
+            json!({ "type": "user_permission", "role": role, "user_id": user_id }),
+        )])
+        .await
+        .map(drop)
+    }
+
     /// The integration's own (bot) user id: `created_by` of comments made here.
     pub async fn me(&self) -> Result<String> {
         Ok(self.me_identity().await?.0)
@@ -2562,6 +2673,136 @@ mod private_api_tests {
                 ..Default::default()
             },
         )
+    }
+
+    const PID: &str = "11111111-1111-1111-1111-111111111111";
+    const SUB: &str = "22222222-2222-2222-2222-222222222222";
+    const UA: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const UB: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+    async fn mount_record(s: &MockServer, table: &str, id: &str, value: Value) {
+        Mock::given(method("POST"))
+            .and(path("/api/v3/syncRecordValues"))
+            .and(body_partial_json(
+                json!({ "requests": [{ "pointer": { "table": table, "id": id } }] }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "recordMap": { table: { id: { "role": "editor", "value": value } } } }),
+            ))
+            .mount(s)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn page_access_inherits_and_nearer_entry_wins() {
+        let s = MockServer::start().await;
+        mount_record(&s, "block", SUB, json!({
+            "id": SUB, "type": "page", "parent_id": PID, "parent_table": "block",
+            "permissions": [{ "role": "reader", "type": "user_permission", "user_id": UA }],
+        })).await;
+        mount_record(&s, "block", PID, json!({
+            "id": PID, "type": "page", "parent_id": "s1", "parent_table": "space",
+            "permissions": [
+                { "role": "editor", "type": "user_permission", "user_id": UA },
+                { "role": "comment_only", "type": "user_permission", "user_id": UB },
+                { "role": { "x": 1 }, "type": "bot_permission", "bot_id": "bot" },
+                { "role": "reader", "type": "space_permission" },
+                { "role": "reader", "type": "public_permission" },
+            ],
+        })).await;
+        mount_record(&s, "notion_user", UA, json!({ "id": UA, "name": "Ann" })).await;
+        let a = client(&s).page_access(SUB).await.unwrap();
+        assert_eq!(
+            a.people,
+            vec![(UA.to_string(), "reader".to_string()), (UB.to_string(), "comment_only".to_string())]
+        );
+        assert_eq!(a.workspace.as_deref(), Some("reader"));
+        assert_eq!(a.public.as_deref(), Some("reader"));
+        assert_eq!(a.users.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sharing_needs_a_session_and_valid_input() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&s).await;
+        let c = client(&s);
+        assert!(c.share_page(PID, UA, "owner").await.is_err());
+        assert!(c.share_page("p1", UA, "editor").await.is_err());
+        let off = Client::new("secret_x".into(), ClientConfig::default());
+        assert!(off.page_access(PID).await.is_err());
+        assert!(off.share_page(PID, UA, "editor").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn share_page_sends_one_set_permission_item() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/saveTransactionsFanout"))
+            .and(body_partial_json(json!({ "transactions": [{ "spaceId": "s1", "operations": [{
+                "pointer": { "id": PID, "table": "block", "spaceId": "s1" },
+                "path": ["permissions"], "command": "setPermissionItem",
+                "args": { "type": "user_permission", "role": "editor", "user_id": UA },
+            }] }] })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        client(&s).share_page(PID, UA, "editor").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn page_access_inherits_through_a_collection() {
+        let s = MockServer::start().await;
+        let (col, db) = ("33333333-3333-3333-3333-333333333333", "44444444-4444-4444-4444-444444444444");
+        mount_record(&s, "block", SUB, json!({
+            "id": SUB, "type": "page", "parent_id": col, "parent_table": "collection",
+        })).await;
+        mount_record(&s, "collection", col, json!({
+            "id": col, "parent_id": db, "parent_table": "block",
+        })).await;
+        mount_record(&s, "block", db, json!({
+            "id": db, "type": "collection_view_page", "parent_id": "s1", "parent_table": "space",
+            "permissions": [{ "role": "editor", "type": "user_permission", "user_id": UB }],
+        })).await;
+        mount_record(&s, "notion_user", UB, json!({ "id": UB, "name": "Bo" })).await;
+        let a = client(&s).page_access(SUB).await.unwrap();
+        assert_eq!(a.people, vec![(UB.to_string(), "editor".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn page_access_terminates_on_self_parent_and_skips_missing_user_id() {
+        let s = MockServer::start().await;
+        mount_record(&s, "block", SUB, json!({
+            "id": SUB, "type": "page", "parent_id": SUB, "parent_table": "block",
+            "permissions": [
+                { "role": "editor", "type": "user_permission" },
+                { "role": "editor", "type": "user_permission", "user_id": 5 },
+                { "role": "none", "type": "user_permission", "user_id": UB },
+                { "role": "reader", "type": "user_permission", "user_id": UA },
+            ],
+        })).await;
+        mount_record(&s, "notion_user", UA, json!({ "id": UA, "name": "Ann" })).await;
+        let a = client(&s).page_access(SUB).await.unwrap();
+        assert_eq!(a.people, vec![(UA.to_string(), "reader".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn share_page_rejects_uppercase_ids_without_request() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&s).await;
+        let upper = UA.to_uppercase();
+        assert!(client(&s).share_page(&upper, UB, "editor").await.is_err());
+        assert!(client(&s).share_page(PID, &upper, "editor").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn share_page_rejects_garbage_ids_without_request() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&s).await;
+        let c = client(&s);
+        for (p, u) in [(PID, "ZZZZZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZZZZZZZZZ"), (PID, "../../x"), ("", UA), (PID, "")] {
+            assert!(c.share_page(p, u, "editor").await.is_err(), "{p} {u}");
+        }
     }
 
     fn page_value() -> Value {

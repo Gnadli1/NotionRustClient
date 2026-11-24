@@ -785,6 +785,20 @@ impl User {
     }
 }
 
+/// Who can open a page (browser sessions only), merged up the parent chain:
+/// the nearest entry for a user wins.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Access {
+    /// (user id, role): "editor", "read_and_write", "comment_only", "reader".
+    pub people: Vec<(String, String)>,
+    /// Role for everyone in the workspace, if set.
+    pub workspace: Option<String>,
+    /// Role for anyone with the link, if set.
+    pub public: Option<String>,
+    /// The people's records, for names and photos.
+    pub users: Vec<User>,
+}
+
 /// Every user object (`"object": "user"` with an id) anywhere in `v`: the
 /// `created_by` / `last_edited_by` of a page or block, user mentions, people
 /// properties. Duplicates are kept; the store merges them.
