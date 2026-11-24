@@ -545,7 +545,14 @@ impl App {
             return;
         }
         if let Event::Media { id, path } = ev {
-            self.sent.pop_front();
+            // pictures are answered concurrently, out of order with the rest
+            if let Some(i) = self
+                .sent
+                .iter()
+                .position(|c| matches!(c, Cmd::Media { id: m, .. } if *m == id))
+            {
+                self.sent.remove(i);
+            }
             self.media.downloaded(id, path);
             return;
         }
@@ -558,7 +565,11 @@ impl App {
         // pushed ops can't be undone, nor edits a pull rewrote under them; a
         // poll clears only what it changed (see `on_poll`)
         let pulled = matches!(&ev, Event::Pulled { report, .. } if !report.skipped);
-        let answered = self.sent.pop_front();
+        let answered = self
+            .sent
+            .iter()
+            .position(|c| !matches!(c, Cmd::Media { .. }))
+            .and_then(|i| self.sent.remove(i));
         let poll = matches!(answered, Some(Cmd::Poll { .. }));
         if answered == Some(Cmd::Push) || (pulled && !poll) {
             self.undo.clear();
@@ -3094,6 +3105,22 @@ mod tests {
         assert!(!w.app.commit());
         assert!(w.app.focus.is_some());
         assert!(w.app.last_error.is_some());
+    }
+
+    #[test]
+    fn a_media_answer_does_not_take_the_place_of_the_push_or_syncall() {
+        let mut w = Win::with_texts(&["a"]);
+        w.app.sent.push_back(Cmd::Push);
+        w.app.sent.push_back(Cmd::Media { id: "m".into(), page: false });
+        w.app.on_event(Event::Media { id: "m".into(), path: Err("x".into()) });
+        assert!(w.app.pushing(), "the push is still running");
+        w.app.on_event(Event::Pushed(Default::default()));
+        assert!(!w.app.pushing());
+        w.app.sent.push_back(Cmd::SyncAll);
+        w.app.sent.push_back(Cmd::Media { id: "n".into(), page: false });
+        w.app.on_event(Event::Media { id: "n".into(), path: Err("x".into()) });
+        w.app.sync_all();
+        assert_eq!(w.app.sent.iter().filter(|c| **c == Cmd::SyncAll).count(), 1);
     }
 
     #[test]

@@ -17,6 +17,19 @@ use crate::store::{ts, Store};
 use crate::sync::local_create_json;
 use crate::{Error, Result};
 
+/// One shared download client (connection pool); it carries no credentials.
+fn http_client() -> Result<&'static reqwest::Client> {
+    static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(c) = HTTP.get() {
+        return Ok(c);
+    }
+    let c = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()?;
+    Ok(HTTP.get_or_init(|| c))
+}
+
 /// Notion's single-part upload limit.
 pub const MAX_UPLOAD: u64 = 20 * 1024 * 1024;
 /// A download over this is refused (it is held in memory).
@@ -375,10 +388,7 @@ pub async fn fetch(client: &Client, store: &Store, id: &str, owner: Owner) -> Re
         .media_dir()
         .ok_or_else(|| Error::Invalid("no cache directory (in-memory store)".into()))?;
     sweep_parts(&dir);
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .redirect(reqwest::redirect::Policy::limited(3))
-        .build()?;
+    let http = http_client()?;
     if src.stale() {
         src = refresh(client, id, owner).await?;
     }
@@ -392,12 +402,12 @@ pub async fn fetch(client: &Client, store: &Store, id: &str, owner: Owner) -> Re
     } else {
         None
     };
-    let bytes = match download(&http, &src.url, MAX_DOWNLOAD, file_cookie.as_deref()).await {
+    let bytes = match download(http, &src.url, MAX_DOWNLOAD, file_cookie.as_deref()).await {
         Err(Dl::Forbidden) if file_cookie.is_some() => {
             // The file token can expire; exchange the API session once more.
             client.clear_file_token();
             file_cookie = Some(format!("file_token={}", client.file_token().await?));
-            match download(&http, &src.url, MAX_DOWNLOAD, file_cookie.as_deref()).await {
+            match download(http, &src.url, MAX_DOWNLOAD, file_cookie.as_deref()).await {
                 Ok(b) => b,
                 Err(Dl::Forbidden) => {
                     return Err(Error::Invalid("Notion refused the download (403)".into()))
@@ -407,7 +417,7 @@ pub async fn fetch(client: &Client, store: &Store, id: &str, owner: Owner) -> Re
         }
         Err(Dl::Forbidden) if src.hosted => {
             src = refresh(client, id, owner).await?;
-            match download(&http, &src.url, MAX_DOWNLOAD, None).await {
+            match download(http, &src.url, MAX_DOWNLOAD, None).await {
                 Ok(b) => b,
                 Err(Dl::Forbidden) => {
                     return Err(Error::Invalid("Notion refused the download (403)".into()))
@@ -451,20 +461,17 @@ pub async fn fetch_url(client: &Client, store: &Store, id: &str, url: &str) -> R
         .media_dir()
         .ok_or_else(|| Error::Invalid("no cache directory (in-memory store)".into()))?;
     sweep_parts(&dir);
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .redirect(reqwest::redirect::Policy::limited(3))
-        .build()?;
+    let http = http_client()?;
     let mut cookie = if client.file_cookie_ok(url) {
         Some(format!("file_token={}", client.file_token().await?))
     } else {
         None
     };
-    let mut res = download(&http, url, MAX_DOWNLOAD, cookie.as_deref()).await;
+    let mut res = download(http, url, MAX_DOWNLOAD, cookie.as_deref()).await;
     if matches!(res, Err(Dl::Forbidden)) && cookie.is_some() {
         client.clear_file_token();
         cookie = Some(format!("file_token={}", client.file_token().await?));
-        res = download(&http, url, MAX_DOWNLOAD, cookie.as_deref()).await;
+        res = download(http, url, MAX_DOWNLOAD, cookie.as_deref()).await;
     }
     let bytes = match res {
         Ok(b) => b,
@@ -760,7 +767,8 @@ mod tests {
             .contains("cannot read"));
         let st = store(d.path(), &[]);
         assert!(local_create_media(&st, "p", None, &big, MediaKind::File).is_err());
-        assert!(s.received_requests().await.unwrap().is_empty());
+        let r = s.received_requests().await.unwrap();
+        assert!(r.is_empty(), "{:?}", r.iter().map(|q| format!("{} {} {:?}", q.method, q.url, q.headers)).collect::<Vec<_>>());
     }
 
     fn page_with_cover(id: &str, url: &str, expiry: DateTime<Utc>) -> Value {
@@ -891,8 +899,9 @@ mod tests {
             "{e}"
         );
         // connection refused: reqwest errors normally embed the URL
-        let url = format!("{}/c.png?sig=SECRET", s.uri());
-        drop(s);
+        // port 1 is refused, and never an ephemeral mock-server port (a
+        // dropped server's port can be reused by a parallel test's mock)
+        let url = "http://127.0.0.1:1/c.png?sig=SECRET".to_string();
         let (s2, d2) = (MockServer::start().await, tempfile::tempdir().unwrap());
         let st2 = store(d2.path(), &[image("b", &url, soon())]);
         let e = fetch(&client(&s2), &st2, "b", Owner::Block)
@@ -1165,11 +1174,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_signed_download_leaves_the_query_out_of_the_error() {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = l.local_addr().unwrap().port();
-        drop(l);
-        let url = format!("http://127.0.0.1:{port}/a.png?X-Amz-Signature=SECRET");
-        let Err(Dl::Failed(e)) = download(&reqwest::Client::new(), &url, 10, None).await else {
+        let url = "http://127.0.0.1:1/a.png?X-Amz-Signature=SECRET"; // refused; see above
+        let Err(Dl::Failed(e)) = download(&reqwest::Client::new(), url, 10, None).await else {
             panic!("expected a failure");
         };
         assert!(!e.to_string().contains("SECRET"), "{e}");

@@ -125,8 +125,10 @@ pub async fn run(
     client: Option<&Client>,
     user_id: Option<String>,
     mut cmds: tmpsc::UnboundedReceiver<Cmd>,
-    mut emit: impl FnMut(Event),
+    emit: impl FnMut(Event),
 ) {
+    let emit = std::cell::RefCell::new(emit);
+    let mut pending: Pending = Vec::new();
     // who "you" are, for the Updates inbox: `users/me` the first time a
     // command that records activity runs, retried at most every 5 minutes
     // until it works; a profile's user id (not a secret) names the person
@@ -134,23 +136,33 @@ pub async fn run(
     // refetched once per session so a removed or changed user id takes effect
     let mut identity_done = false;
     let mut identity_try: Option<std::time::Instant> = None;
-    while let Some(cmd) = cmds.recv().await {
+    loop {
+        let cmd = tokio::select! {
+            c = cmds.recv() => match c {
+                Some(c) => c,
+                None => break,
+            },
+            done = next_done(&mut pending) => {
+                (emit.borrow_mut())(done);
+                continue;
+            }
+        };
         let Some(client) = client else {
             if let Cmd::Media { id, .. } = cmd {
-                emit(Event::Media {
+                (emit.borrow_mut())(Event::Media {
                     id,
                     path: Err("offline".into()),
                 });
                 continue;
             }
             if let Cmd::Access { page } = cmd {
-                emit(Event::Access {
+                (emit.borrow_mut())(Event::Access {
                     page,
                     access: Err("offline".into()),
                 });
                 continue;
             }
-            emit(Event::Error("offline: no token for this workspace".into()));
+            (emit.borrow_mut())(Event::Error("offline: no token for this workspace".into()));
             continue;
         };
         if !identity_done
@@ -167,94 +179,123 @@ pub async fn run(
                     .is_ok();
             }
         }
-        let ev = match cmd {
-            Cmd::Media { id, .. } if id.starts_with(crate::media::USER_PREFIX) => {
-                let url = store
-                    .user(&id[crate::media::USER_PREFIX.len()..])
-                    .ok()
-                    .flatten()
-                    .and_then(|u| u.avatar_url);
-                let path = match url {
-                    Some(u) => media::fetch_url(client, store, &id, &u)
-                        .await
-                        .map_err(|e| e.to_string()),
-                    None => Err("no profile photo".into()),
-                };
-                Ok(Event::Media { id, path })
-            }
-            Cmd::Media { id, page } => {
-                let owner = if page {
-                    media::Owner::Page
+        // images run beside everything else: they only wait for the loop to
+        // be polled, never behind a SyncAll or Push
+        if let Cmd::Media { id, page } = cmd {
+            pending.push(Box::pin(async move {
+                let path = if let Some(uid) = id.strip_prefix(crate::media::USER_PREFIX) {
+                    match store.user(uid).ok().flatten().and_then(|u| u.avatar_url) {
+                        Some(u) => media::fetch_url(client, store, &id, &u)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        None => Err("no profile photo".into()),
+                    }
                 } else {
-                    media::Owner::Block
+                    let owner = if page {
+                        media::Owner::Page
+                    } else {
+                        media::Owner::Block
+                    };
+                    media::fetch(client, store, &id, owner)
+                        .await
+                        .map_err(|e| e.to_string())
                 };
-                let path = media::fetch(client, store, &id, owner)
-                    .await
-                    .map_err(|e| e.to_string());
-                Ok(Event::Media { id, path })
-            }
-            Cmd::Access { page } => {
-                let access = client.page_access(&page).await.map_err(|e| e.to_string());
-                Ok(Event::Access { page, access })
-            }
-            Cmd::Share { page, user, role } => match client.share_page(&page, &user, &role).await {
-                Ok(()) => {
+                Event::Media { id, path }
+            }));
+            continue;
+        }
+        let work = async {
+            match cmd {
+                Cmd::Media { .. } => unreachable!("handled above"),
+                Cmd::Access { page } => {
                     let access = client.page_access(&page).await.map_err(|e| e.to_string());
                     Ok(Event::Access { page, access })
                 }
-                Err(e) => Err(e),
-            },
-            Cmd::Pull { id, force } => sync::pull_any(client, store, &id, force)
-                .await
-                .map(|report| Event::Pulled { id, report }),
-            Cmd::Poll { id, skip } => sync::poll_any(client, store, &id, skip)
-                .await
-                .map(|report| Event::Pulled { id, report }),
-            Cmd::Push => sync::push(client, store).await.map(Event::Pushed),
-            Cmd::PullComments { id } => sync::pull_comments(client, store, &id)
-                .await
-                .map(|_| Event::CommentsPulled),
-            Cmd::Me => client.me_identity().await.map(|(bot, owner)| {
-                identity_done |= store
-                    .set_identity(&bot, owner.as_deref(), env_user.as_deref())
-                    .is_ok();
-                Event::Me(bot)
-            }),
-            Cmd::PullUsers => match sync::pull_users(client, store).await {
-                Ok(_) => Ok(Event::UsersPulled),
-                Err(Error::Api { status: 403, .. }) => Ok(Event::UsersDenied),
-                Err(e) => Err(e),
-            },
-            Cmd::Fetch { op } => sync::fetch_conflict(client, store, op)
-                .await
-                .map(|what| Event::Fetched { op, what }),
-            Cmd::Resolve { op, merged, seen } => {
-                sync::resolve_mine(client, store, op, merged.as_deref(), seen.as_deref())
+                Cmd::Share { page, user, role } => {
+                    match client.share_page(&page, &user, &role).await {
+                        Ok(()) => {
+                            let access = client.page_access(&page).await.map_err(|e| e.to_string());
+                            Ok(Event::Access { page, access })
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                Cmd::Pull { id, force } => sync::pull_any(client, store, &id, force)
                     .await
-                    .map(|_| Event::Resolved(op))
+                    .map(|report| Event::Pulled { id, report }),
+                Cmd::Poll { id, skip } => sync::poll_any(client, store, &id, skip)
+                    .await
+                    .map(|report| Event::Pulled { id, report }),
+                Cmd::Push => sync::push(client, store).await.map(Event::Pushed),
+                Cmd::PullComments { id } => sync::pull_comments(client, store, &id)
+                    .await
+                    .map(|_| Event::CommentsPulled),
+                Cmd::Me => client.me_identity().await.map(|(bot, owner)| {
+                    identity_done |= store
+                        .set_identity(&bot, owner.as_deref(), env_user.as_deref())
+                        .is_ok();
+                    Event::Me(bot)
+                }),
+                Cmd::PullUsers => match sync::pull_users(client, store).await {
+                    Ok(_) => Ok(Event::UsersPulled),
+                    Err(Error::Api { status: 403, .. }) => Ok(Event::UsersDenied),
+                    Err(e) => Err(e),
+                },
+                Cmd::Fetch { op } => sync::fetch_conflict(client, store, op)
+                    .await
+                    .map(|what| Event::Fetched { op, what }),
+                Cmd::Resolve { op, merged, seen } => {
+                    sync::resolve_mine(client, store, op, merged.as_deref(), seen.as_deref())
+                        .await
+                        .map(|_| Event::Resolved(op))
+                }
+                Cmd::SyncAll => sync::pull_all(client, store, |done, total, _| {
+                    (emit.borrow_mut())(Event::Progress { done, total })
+                })
+                .await
+                .map(Event::SyncedAll),
+                Cmd::Views { ds } => client.list_views(&ds).await.map(|vs| Event::Views {
+                    views: vs.iter().filter_map(SavedView::from_value).collect(),
+                    ds,
+                }),
+                Cmd::Search(q) => client.search(&q).await.map(|rs| {
+                    Event::SearchResults(
+                        rs.into_iter()
+                            .filter_map(|r| match r {
+                                SearchResult::Page(p) => Some((p.id.clone(), p.title())),
+                                SearchResult::DataSource(_) => None,
+                            })
+                            .collect(),
+                    )
+                }),
             }
-            Cmd::SyncAll => sync::pull_all(client, store, |done, total, _| {
-                emit(Event::Progress { done, total })
-            })
-            .await
-            .map(Event::SyncedAll),
-            Cmd::Views { ds } => client.list_views(&ds).await.map(|vs| Event::Views {
-                views: vs.iter().filter_map(SavedView::from_value).collect(),
-                ds,
-            }),
-            Cmd::Search(q) => client.search(&q).await.map(|rs| {
-                Event::SearchResults(
-                    rs.into_iter()
-                        .filter_map(|r| match r {
-                            SearchResult::Page(p) => Some((p.id.clone(), p.title())),
-                            SearchResult::DataSource(_) => None,
-                        })
-                        .collect(),
-                )
-            }),
         };
-        emit(ev.unwrap_or_else(|e| Event::Error(e.to_string())));
+        tokio::pin!(work);
+        // keeps the pending images moving while the command runs
+        let ev = loop {
+            tokio::select! {
+                r = &mut work => break r,
+                done = next_done(&mut pending) => (emit.borrow_mut())(done),
+            }
+        };
+        (emit.borrow_mut())(ev.unwrap_or_else(|e| Event::Error(e.to_string())));
     }
+}
+
+type Pending<'a> = Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Event> + 'a>>>;
+
+/// The next finished one of `pending` (never ready while it is empty).
+async fn next_done(pending: &mut Pending<'_>) -> Event {
+    std::future::poll_fn(|cx| {
+        for i in 0..pending.len() {
+            if let std::task::Poll::Ready(ev) = pending[i].as_mut().poll(cx) {
+                drop(pending.swap_remove(i));
+                return std::task::Poll::Ready(ev);
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
 /// Starts the worker thread for one workspace profile: the token and optional
