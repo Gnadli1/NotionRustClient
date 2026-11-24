@@ -619,20 +619,24 @@ impl Client {
             }
             return Ok(nodes);
         }
-        let mut nodes = Vec::new();
-        for block in self.block_children(id).await? {
-            let leaf = matches!(
-                block.kind,
-                BlockKind::ChildPage { .. } | BlockKind::ChildDatabase { .. }
-            );
-            let children = if block.has_children && !leaf {
-                Box::pin(self.block_tree(&block.id)).await?
-            } else {
-                Vec::new()
-            };
-            nodes.push(BlockNode { block, children });
-        }
-        Ok(nodes)
+        use futures::{stream, StreamExt, TryStreamExt};
+        // siblings' subtrees load a few at a time; `buffered` keeps their order
+        stream::iter(self.block_children(id).await?)
+            .map(|block| async move {
+                let leaf = matches!(
+                    block.kind,
+                    BlockKind::ChildPage { .. } | BlockKind::ChildDatabase { .. }
+                );
+                let children = if block.has_children && !leaf {
+                    Box::pin(self.block_tree(&block.id)).await?
+                } else {
+                    Vec::new()
+                };
+                Ok(BlockNode { block, children })
+            })
+            .buffered(4)
+            .try_collect()
+            .await
     }
 
     fn private_node(&self, records: &Records, block: Block) -> Result<BlockNode> {
@@ -669,6 +673,7 @@ impl Client {
             }
             return Ok(out);
         }
+        // `BlockKind::to_request_json` refuses `_width`, so none reaches the public API
         let children = children
             .iter()
             .map(|b| b.kind.to_request_json())
@@ -946,7 +951,16 @@ impl Client {
             }
             return self.get_block(id).await;
         }
-        self.call(Method::PATCH, &format!("/v1/blocks/{id}"), Some(body))
+        // `_width` is a private-only extra the public API would reject
+        let mut body = body.clone();
+        if let Some(p) = body.as_object_mut().into_iter().flat_map(|o| o.values_mut()).find_map(Value::as_object_mut) {
+            p.remove("_width");
+            if p.is_empty() {
+                // only the width was set: nothing for the public API
+                return self.get_block(id).await;
+            }
+        }
+        self.call(Method::PATCH, &format!("/v1/blocks/{id}"), Some(&body))
             .await
     }
 
@@ -2314,6 +2328,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_block_patch_drops_the_private_width() {
+        let s = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/b"))
+            .and(body_json(json!({ "image": { "caption": [] } })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(block("b", false)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let body = json!({ "image": { "caption": [], "_width": 320 } });
+        client(&s, 0).update_block("b", &body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_block_patch_drops_the_private_width_for_video_too() {
+        let s = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/b"))
+            .and(body_json(json!({ "video": { "caption": [] } })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(block("b", false)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let body = json!({ "video": { "caption": [], "_width": 99 } });
+        client(&s, 0).update_block("b", &body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_block_patch_with_only_a_width_sends_nothing() {
+        let s = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(block("b", false)))
+            .expect(0)
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/blocks/b"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(block("b", false)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let body = json!({ "image": { "_width": 320 } });
+        client(&s, 0).update_block("b", &body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_append_of_an_image_carrying_a_width_is_refused_before_any_request() {
+        let s = MockServer::start().await;
+        let mut v = block("tmp", false);
+        v["type"] = json!("image");
+        v["image"] = json!({ "type": "external", "external": { "url": "u" }, "caption": [], "_width": 300 });
+        let img: Block = serde_json::from_value(v).unwrap();
+        assert!(client(&s, 0).append_children("root", &[img], None).await.is_err());
+        assert!(s.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn block_children_paginates() {
         let s = MockServer::start().await;
         let p = "/v1/blocks/root/children";
@@ -2464,6 +2535,33 @@ mod tests {
         assert_eq!(tree[1].block.id, "cp");
         assert!(tree[1].children.is_empty());
         s.verify().await;
+    }
+
+    #[tokio::test]
+    async fn block_tree_keeps_sibling_order_whatever_answers_first() {
+        let s = MockServer::start().await;
+        Mock::given(path("/v1/blocks/root/children"))
+            .respond_with(list(
+                vec![block("a", true), block("b", true), block("c", true)],
+                None,
+            ))
+            .mount(&s)
+            .await;
+        for (p, kid, ms) in [("a", "a1", 200), ("b", "b1", 0), ("c", "c1", 100)] {
+            Mock::given(path(format!("/v1/blocks/{p}/children")))
+                .respond_with(
+                    list(vec![block(kid, false)], None)
+                        .set_delay(std::time::Duration::from_millis(ms)),
+                )
+                .mount(&s)
+                .await;
+        }
+        let tree = client(&s, 0).block_tree("root").await.unwrap();
+        let got: Vec<_> = tree
+            .iter()
+            .map(|n| (n.block.id.as_str(), n.children[0].block.id.as_str()))
+            .collect();
+        assert_eq!(got, [("a", "a1"), ("b", "b1"), ("c", "c1")]);
     }
 
     #[tokio::test]
@@ -3101,6 +3199,22 @@ mod private_api_tests {
         assert!(ops
             .iter()
             .all(|o| o["path"] != json!([]) && o["path"] != json!(["type"])));
+    }
+
+    #[tokio::test]
+    async fn an_image_width_update_sets_only_format_block_width() {
+        let s = MockServer::start().await;
+        let mut r = record("i1", "image", "p1", "block");
+        r["format"] = json!({ "display_source": "https://x/a.png", "block_width": 100 });
+        serve_records(&s, vec![r]).await;
+        mount_fanout(&s).await;
+        let body = json!({ "image": { "_width": 320 } });
+        client(&s).update_block("i1", &body).await.unwrap();
+        let ops = fanout_ops(&s).await;
+        assert_eq!(ops.len(), 1, "{ops:?}");
+        assert_eq!(ops[0]["path"], json!(["format", "block_width"]));
+        assert_eq!(ops[0]["command"], "set");
+        assert_eq!(ops[0]["args"], json!(320));
     }
 
     #[tokio::test]

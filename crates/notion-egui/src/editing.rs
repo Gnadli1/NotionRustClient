@@ -15,7 +15,7 @@ use crate::edit::{key_action, Caret, EditKey, KeyAction};
 use crate::keys::{self, Command};
 use crate::links::{self, Link};
 use crate::menu::{Kind, Menu};
-use crate::outline::{self, Marker, Row};
+use crate::outline::{self, Marker, Row, Slot};
 
 const CTRL_SHIFT: Modifiers = Modifiers {
     ctrl: true,
@@ -382,6 +382,65 @@ impl App {
             self.last_error = Some(e.to_string());
         }
         self.refresh();
+    }
+
+    /// A block dropped by its grip: commit any edit, then move it (with its
+    /// subtree) under `parent` after `after`, and bring it into view.
+    pub(crate) fn drop_block(&mut self, id: &str, parent: &str, slot: &Slot) {
+        if self.pushing() {
+            self.last_error = Some("editing is paused while a push runs".into());
+            return;
+        }
+        if !self.flush() {
+            return;
+        }
+        let Some(i) = self.rows.iter().position(|r| r.block_id == id) else {
+            return;
+        };
+        if let Some(m) = outline::unmovable_in_subtree(&self.rows, i) {
+            self.last_error = Some(format!("can't move: its subtree contains {}", m.label()));
+            return;
+        }
+        let res = self.store.atomic(|| {
+            let (id, parent) = (self.resolved(i)?, self.store.resolve_id(parent)?);
+            match slot {
+                Slot::After(a) => {
+                    let a = self.store.resolve_id(a)?;
+                    sync::local_move_block(&self.store, &id, &parent, Some(&a)).map(drop)
+                }
+                // nothing can be put first: after the first sibling S, then S after it
+                Slot::First => {
+                    let kids = self.store.children(&parent)?;
+                    if kids.first().is_some_and(|b| b.id == id) {
+                        return Ok(()); // already first
+                    }
+                    let first = kids.into_iter().find(|b| b.id != id);
+                    let Some(s) = first.map(|b| b.id) else {
+                        return sync::local_move_block(&self.store, &id, &parent, None).map(drop);
+                    };
+                    if let Some(m) = self
+                        .rows
+                        .iter()
+                        .position(|r| r.block_id == s)
+                        .and_then(|k| outline::unmovable_in_subtree(&self.rows, k))
+                    {
+                        return Err(notion_core::Error::Invalid(format!(
+                            "can't move: its subtree contains {}",
+                            m.label()
+                        )));
+                    }
+                    sync::local_move_block(&self.store, &id, &parent, Some(&s))?;
+                    sync::local_move_block(&self.store, &s, &parent, Some(&id)).map(drop)
+                }
+            }
+        });
+        if let Err(e) = res {
+            self.last_error = Some(e.to_string());
+        }
+        self.refresh();
+        if let Some(i) = self.rows.iter().position(|r| r.block_id == id) {
+            self.show_row(i);
+        }
     }
 
     // ---------------------------------------------------- block editing
@@ -1031,6 +1090,119 @@ mod tests {
         w.frames(vec![]);
     }
 
+    #[test]
+    fn dropping_a_dragged_block_moves_it() {
+        let mut w = Win::with_texts(&["a", "b", "c"]);
+        w.app.apply(Action::Drop("p-0".into(), "p".into(), Slot::After("p-2".into())));
+        w.frames(vec![]);
+        assert_eq!(ids(&w), ["p-1", "p-2", "p-0"]);
+        assert!(kinds(&w).contains(&"move_block".to_string()), "{:?}", kinds(&w));
+    }
+
+    /// page p: a (kids a1, a2), b (toggle, empty), c
+    fn nested() -> Win {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_page(&page_in("p", None)).unwrap();
+        let para = |id: &str, parent: &str| blk(id, parent, "paragraph", json!({ "rich_text": rt(id) }));
+        let top = [
+            para("a", "p"),
+            blk("b", "p", "toggle", json!({ "rich_text": rt("b") })),
+            para("c", "p"),
+        ];
+        store.replace_children("p", "p", &top).unwrap();
+        store.replace_children("p", "a", &[para("a1", "a"), para("a2", "a")]).unwrap();
+        let mut w = Win::new(store);
+        w.app.apply(Action::Open("p".into()));
+        w.frames(vec![]);
+        w
+    }
+
+    fn comment_on(w: &mut Win, block: &str) {
+        let c: notion_core::model::Comment = serde_json::from_value(json!({
+            "object": "comment", "id": "c1", "discussion_id": "d1",
+            "parent": { "type": "block_id", "block_id": block },
+            "created_time": "2025-01-01T00:00:00.000Z", "last_edited_time": "2025-01-01T00:00:00.000Z",
+            "created_by": { "object": "user", "id": "u" },
+            "rich_text": [{ "type": "text", "text": { "content": "x" }, "plain_text": "x", "annotations": {} }],
+        }))
+        .unwrap();
+        w.app.store.put_comment(&c).unwrap();
+        w.app.refresh();
+    }
+
+    #[test]
+    fn dropping_a_block_into_its_own_subtree_is_refused() {
+        let mut w = nested();
+        let before = ids(&w);
+        assert_eq!(before, ["a", "a1", "a2", "b", "c"]);
+        for (parent, after) in [("a", Slot::First), ("a", Slot::After("a1".into())), ("a1", Slot::First)] {
+            w.app.last_error = None;
+            w.app.drop_block("a", parent, &after);
+            assert!(w.app.last_error.is_some(), "{parent} {after:?}");
+            assert_eq!((ids(&w), w.queued()), (before.clone(), 0));
+        }
+    }
+
+    #[test]
+    fn dropping_a_block_with_children_moves_the_whole_subtree() {
+        let mut w = nested();
+        w.app.drop_block("a", "p", &Slot::After("c".into()));
+        w.frames(vec![]);
+        assert!(w.app.last_error.is_none(), "{:?}", w.app.last_error);
+        assert_eq!(ids(&w), ["b", "c", "a", "a1", "a2"]);
+        assert_eq!(w.app.rows[3].depth, 1);
+        assert_eq!(kinds(&w), ["move_block"]);
+    }
+
+    #[test]
+    fn dropping_a_commented_block_is_refused_without_an_op() {
+        let mut w = nested();
+        comment_on(&mut w, "c");
+        w.app.drop_block("c", "p", &Slot::First);
+        assert!(w.app.last_error.as_deref().unwrap_or("").contains("comments"));
+        assert_eq!((ids(&w), w.queued()), (vec!["a", "a1", "a2", "b", "c"].into_iter().map(String::from).collect::<Vec<_>>(), 0));
+    }
+
+    #[test]
+    fn dropping_as_first_child_of_a_toggle_and_at_the_end() {
+        let mut w = nested();
+        w.app.drop_block("c", "b", &Slot::First);
+        w.frames(vec![]);
+        assert!(w.app.last_error.is_none(), "{:?}", w.app.last_error);
+        assert_eq!(ids(&w), ["a", "a1", "a2", "b", "c"]);
+        assert_eq!((w.app.rows[4].depth, w.app.rows[4].parent.as_str()), (1, "b"));
+        w.app.drop_block("a", "p", &Slot::After("b".into()));
+        w.frames(vec![]);
+        assert_eq!(ids(&w), ["b", "c", "a", "a1", "a2"]);
+        assert_eq!(w.app.rows[2].parent, "p");
+        // very end of the page: after the last top-level block
+        w.app.drop_block("b", "p", &Slot::After("a".into()));
+        w.frames(vec![]);
+        assert_eq!(ids(&w), ["a", "a1", "a2", "b", "c"]);
+        assert_eq!(w.app.rows.last().unwrap().parent, "b");
+        assert_eq!(w.app.rows[3].parent, "p");
+    }
+
+    #[test]
+    fn dropping_first_puts_the_block_before_existing_siblings() {
+        let mut w = nested();
+        // top of the page
+        w.app.drop_block("c", "p", &Slot::First);
+        w.frames(vec![]);
+        assert!(w.app.last_error.is_none(), "{:?}", w.app.last_error);
+        assert_eq!(ids(&w), ["c", "a", "a1", "a2", "b"]);
+        // first child of a block that already has children
+        w.app.drop_block("c", "a", &Slot::First);
+        w.frames(vec![]);
+        assert_eq!(ids(&w), ["a", "c", "a1", "a2", "b"]);
+        assert_eq!(w.app.rows[1].parent, "a");
+        // a toggle without children: first = only child
+        w.app.drop_block("a1", "b", &Slot::First);
+        w.frames(vec![]);
+        assert_eq!(ids(&w), ["a", "c", "a2", "b", "a1"]);
+        assert_eq!(w.app.rows[4].parent, "b");
+    }
+
     // ------------------------------------------------------------ Enter
 
     #[test]
@@ -1221,6 +1393,18 @@ mod tests {
     }
 
     #[test]
+    fn resize_image_caches_the_width_and_queues_one_update() {
+        let mut w = Win::with_texts(&["a"]);
+        let img = blk("img", "p", "image", json!({ "type": "external", "external": { "url": "u" } }));
+        w.app.store.replace_children("p", "p", &[img]).unwrap();
+        w.app.refresh();
+        w.app.apply(Action::ResizeImage { id: "img".into(), width: 320.0 });
+        let b = w.app.store.get_block("img").unwrap().unwrap();
+        assert_eq!(notion_core::model::image_width(&b.raw), Some(320.0));
+        assert_eq!(kinds(&w), ["update_block"]);
+    }
+
+    #[test]
     fn ctrl_shift_2_makes_a_heading_and_undo_reverts_the_conversion() {
         let mut w = Win::with_texts(&["abc"]);
         w.edit(0);
@@ -1278,6 +1462,89 @@ mod tests {
         w.press(Key::Num8, CS);
         w.type_text("/");
         assert!(w.menu().is_none(), "nor in a code row");
+    }
+
+    fn img_with(w: &mut Win, id: &str, ty: &str, payload: serde_json::Value) {
+        let b = blk(id, "p", ty, payload);
+        w.app.store.replace_children("p", "p", &[b]).unwrap();
+        w.app.refresh();
+    }
+
+    fn width_of(w: &Win, id: &str) -> Option<f32> {
+        let b = w.app.store.get_block(id).unwrap().unwrap();
+        notion_core::model::image_width(&b.raw)
+    }
+
+    #[test]
+    fn resizing_twice_before_a_push_keeps_the_last_width_in_one_op() {
+        let mut w = Win::with_texts(&["a"]);
+        img_with(&mut w, "img", "image", json!({ "type": "external", "external": { "url": "u" } }));
+        w.app.apply(Action::ResizeImage { id: "img".into(), width: 200.0 });
+        w.app.apply(Action::ResizeImage { id: "img".into(), width: 340.0 });
+        assert_eq!(width_of(&w, "img"), Some(340.0));
+        let ops = w.app.store.queued_ops().unwrap();
+        assert_eq!(ops.len(), 1, "{ops:?}");
+        let OpKind::UpdateBlock { body, .. } = &ops[0].kind else { panic!() };
+        assert_eq!(body["image"]["_width"], json!(340.0));
+    }
+
+    #[test]
+    fn undo_of_a_resize_restores_the_previous_width() {
+        let mut w = Win::with_texts(&["a"]);
+        img_with(&mut w, "img", "image", json!({ "type": "external", "external": { "url": "u" }, "_width": 150 }));
+        assert_eq!(width_of(&w, "img"), Some(150.0));
+        w.app.apply(Action::ResizeImage { id: "img".into(), width: 400.0 });
+        assert_eq!(width_of(&w, "img"), Some(400.0));
+        w.press(Key::Z, Modifiers::CTRL);
+        assert_eq!((width_of(&w, "img"), w.queued()), (Some(150.0), 0));
+    }
+
+    #[test]
+    fn undo_of_the_first_resize_removes_the_width() {
+        let mut w = Win::with_texts(&["a"]);
+        img_with(&mut w, "img", "image", json!({ "type": "external", "external": { "url": "u" } }));
+        w.app.apply(Action::ResizeImage { id: "img".into(), width: 400.0 });
+        w.press(Key::Z, Modifiers::CTRL);
+        assert_eq!(width_of(&w, "img"), None);
+    }
+
+    #[test]
+    fn video_and_pdf_resize_without_trouble() {
+        for ty in ["video", "pdf"] {
+            let mut w = Win::with_texts(&["a"]);
+            img_with(&mut w, "m", ty, json!({ "type": "external", "external": { "url": "u" } }));
+            w.app.apply(Action::ResizeImage { id: "m".into(), width: 300.0 });
+            assert_eq!(width_of(&w, "m"), Some(300.0), "{ty}");
+            assert!(w.app.last_error.is_none(), "{ty}: {:?}", w.app.last_error);
+        }
+    }
+
+    #[test]
+    fn width_on_a_block_whose_create_is_queued_folds_into_the_create_and_never_reaches_the_public_body() {
+        let mut w = Win::with_texts(&["a"]);
+        let b = blk("local-img", "p", "image", json!({ "type": "external", "external": { "url": "u" } }));
+        w.app.store.replace_children("p", "p", std::slice::from_ref(&b)).unwrap();
+        w.app
+            .store
+            .enqueue(
+                OpKind::CreateBlock { parent_id: "p".into(), after: None, block: serde_json::to_value(&b).unwrap() },
+                None,
+                None,
+            )
+            .unwrap();
+        w.app.refresh();
+        w.app.apply(Action::ResizeImage { id: "local-img".into(), width: 250.0 });
+        let ops = w.app.store.queued_ops().unwrap();
+        assert_eq!(ops.len(), 1, "{ops:?}");
+        let OpKind::CreateBlock { block, .. } = &ops[0].kind else { panic!("{ops:?}") };
+        // the create op keeps the width in its cached copy ...
+        assert_eq!(block["image"]["_width"], json!(250.0));
+        // ... but the public request body is built from the typed kind, which can't write media
+        let local: notion_core::model::Block = serde_json::from_value(block.clone()).unwrap();
+        match local.kind.to_request_json() {
+            Err(_) => {}
+            Ok(v) => assert!(v["image"].get("_width").is_none(), "_width leaks into the CreateBlock body: {v}"),
+        }
     }
 
     // ------------------------------------------------------------- undo

@@ -630,6 +630,13 @@ impl TargetKind {
     }
 }
 
+/// Stored display width (px) of an image/video/file block: the private-only
+/// `raw[type]["_width"]`, from Notion's `format.block_width`.
+pub fn image_width(raw: &Value) -> Option<f32> {
+    let t = raw["type"].as_str()?;
+    raw[t]["_width"].as_f64().filter(|w| w.is_finite() && *w > 0.0).map(|w| w as f32)
+}
+
 impl Block {
     /// User id of whoever last edited the block, as of the last pull.
     pub fn last_edited_by(&self) -> Option<&str> {
@@ -1112,6 +1119,18 @@ pub(crate) fn data_source_from_json(v: Value) -> Result<DataSource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_width_reads_only_numbers_under_the_block_type() {
+        assert_eq!(image_width(&json!({ "type": "image", "image": { "_width": 320 } })), Some(320.0));
+        assert_eq!(image_width(&json!({ "type": "video", "video": { "_width": 12.5 } })), Some(12.5));
+        assert_eq!(image_width(&json!({ "type": "pdf", "pdf": {} })), None);
+        assert_eq!(image_width(&json!({ "type": "image", "image": { "_width": "320" } })), None);
+        assert_eq!(image_width(&json!({ "type": "image", "image": { "_width": null } })), None);
+        assert_eq!(image_width(&json!({ "type": "image", "video": { "_width": 5 } })), None);
+        assert_eq!(image_width(&json!({ "image": { "_width": 5 } })), None);
+        assert_eq!(image_width(&json!(null)), None);
+    }
 
     const T: &str = "2025-01-01T09:30:00.000Z";
 

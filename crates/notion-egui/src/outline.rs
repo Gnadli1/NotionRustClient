@@ -3,11 +3,17 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
+use eframe::egui;
 use notion_core::markdown::is_markdown_editable;
 use notion_core::model::{plain_text, BlockKind, RichText, RichTextKind};
 use notion_core::store::Store;
 use notion_core::Result;
 use serde_json::Value;
+
+use crate::theme;
+
+/// Pixels one nesting level indents a row.
+pub const INDENT: f32 = 26.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Marker {
@@ -274,6 +280,82 @@ pub fn outdent_target(rows: &[Row], idx: usize) -> Option<(String, Option<String
         return None;
     }
     Some((parent.parent.clone(), Some(parent.block_id.clone())))
+}
+
+/// A place among a parent's children.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Slot {
+    First,
+    After(String),
+}
+
+/// Where a dragged block would land: its new place plus where to draw the
+/// line (`y`, and `x` where the block's text would start).
+#[derive(Debug, PartialEq)]
+pub struct DropAt {
+    pub parent: String,
+    pub slot: Slot,
+    pub y: f32,
+    pub x: f32,
+}
+
+/// The drop position for dragging row `from` with the pointer at `p`:
+/// between the shown rows `bounds` (row index, rect) by pointer y, at the
+/// depth the pointer x picks (a child of the row above only if it can hold
+/// children). None when that is where the block already is.
+pub fn drop_target(
+    rows: &[Row],
+    bounds: &[(usize, egui::Rect)],
+    from: usize,
+    p: egui::Pos2,
+) -> Option<DropAt> {
+    let k = bounds.iter().position(|(_, r)| p.y < r.center().y);
+    let k = k.unwrap_or(bounds.len());
+    let (above, below) = (k.checked_sub(1).map(|n| bounds[n]), bounds.get(k));
+    let left = bounds.first()?.1.left();
+    let y = match (above, below) {
+        (Some((_, a)), Some((_, b))) => (a.bottom() + b.top()) / 2.0,
+        (Some((_, a)), None) => a.bottom(),
+        (None, Some((_, b))) => b.top(),
+        _ => return None,
+    };
+    let want = ((p.x - left - theme::TEXT_INSET) / INDENT).round().max(0.0) as usize;
+    let (parent, slot, level) = match above {
+        None => (rows[below?.0].parent.clone(), Slot::First, 0),
+        Some((j, _)) => {
+            let jd = rows[j].depth;
+            let kids = rows.get(j + 1).is_some_and(|r| r.depth > jd);
+            let holds = can_have_children(&rows[j].marker)
+                || (matches!(rows[j].marker, Marker::Heading(_)) && (rows[j].toggle || kids));
+            let hi = jd + usize::from(holds);
+            let lo = below.map_or(0, |(b, _)| rows[*b].depth).min(hi);
+            let level = want.clamp(lo, hi);
+            if level > jd {
+                (rows[j].block_id.clone(), Slot::First, level)
+            } else {
+                let a = &rows[rows[..=j].iter().rposition(|r| r.depth == level)?];
+                (a.parent.clone(), Slot::After(a.block_id.clone()), level)
+            }
+        }
+    };
+    let d = rows[from].depth;
+    let prev = rows[..from].iter().rposition(|r| r.depth <= d);
+    let prev = prev.filter(|&i| rows[i].depth == d).map(|i| &rows[i].block_id);
+    let after = match &slot {
+        Slot::First => None,
+        Slot::After(a) => Some(a),
+    };
+    let inside = |id: &String| {
+        *id == rows[from].block_id || subtree(rows, from).iter().any(|r| r.block_id == *id)
+    };
+    if after == Some(&rows[from].block_id)
+        || (parent == rows[from].parent && after == prev)
+        || inside(&parent)
+    {
+        return None;
+    }
+    let x = left + theme::TEXT_INSET + INDENT * level as f32;
+    Some(DropAt { parent, slot, y, x })
 }
 
 /// First block of row `idx` and its subtree that push's copy-then-delete
@@ -553,6 +635,68 @@ pub(crate) mod tests {
             color: String::new(),
             level: 0,
         }
+    }
+
+    #[test]
+    fn drop_targets() {
+        use eframe::egui::{pos2, Rect};
+        // a, a/a1, b, c(divider)
+        let rows = vec![
+            r("a", PID, 0, Marker::None),
+            r("a1", "a", 1, Marker::None),
+            r("b", PID, 0, Marker::None),
+            r("c", PID, 0, Marker::Divider),
+        ];
+        let bounds: Vec<_> = (0..4)
+            .map(|i| (i, Rect::from_min_size(pos2(0.0, 30.0 * i as f32), egui::vec2(500.0, 30.0))))
+            .collect();
+        let at = |from, x, y| drop_target(&rows, &bounds, from, pos2(x, y));
+        let to = |d: Option<DropAt>| d.map(|d| (d.parent, d.slot));
+        let s = |p: &str, a: Option<&str>| {
+            let slot = a.map_or(Slot::First, |a| Slot::After(a.to_string()));
+            Some((p.to_string(), slot))
+        };
+        // b dropped between a and a1 (y 25..<45): child of a, first
+        assert_eq!(to(at(2, 60.0, 29.0)), s("a", None));
+        // a1 dropped below c (divider): sibling at top level, not a child
+        assert_eq!(to(at(1, 200.0, 200.0)), s(PID, Some("c")));
+        // below a1 with the pointer left: sibling of a
+        assert_eq!(to(at(2, 0.0, 59.0)), None, "b is already after a");
+        assert_eq!(to(at(0, 0.0, 119.0)), s(PID, Some("c")));
+        // above everything: first
+        assert_eq!(to(at(3, 0.0, 1.0)), s(PID, None));
+        // right below itself, or its own gap: same place
+        assert_eq!(to(at(2, 0.0, 70.0)), None);
+        assert_eq!(to(at(2, 0.0, 89.0)), None);
+        // inside the dragged block's own subtree: no target
+        assert_eq!(to(at(0, 60.0, 29.0)), None);
+        // under c (divider) deeper is clamped to its level
+        assert_eq!(to(at(0, 300.0, 120.0)), s(PID, Some("c")));
+    }
+
+    #[test]
+    fn drop_target_edges_and_midpoints() {
+        use eframe::egui::{pos2, Rect};
+        let rows = vec![
+            r("a", PID, 0, Marker::None),
+            r("b", PID, 0, Marker::None),
+            r("c", PID, 0, Marker::None),
+        ];
+        let bounds: Vec<_> = (0..3)
+            .map(|i| (i, Rect::from_min_size(pos2(0.0, 30.0 * i as f32), egui::vec2(500.0, 30.0))))
+            .collect();
+        let to = |from, y: f32| {
+            drop_target(&rows, &bounds, from, pos2(0.0, y)).map(|d| (d.slot, d.y))
+        };
+        // above the first row (even negative y): first position
+        assert_eq!(to(2, -50.0), Some((Slot::First, 0.0)));
+        // below the last row: after c, line at its bottom
+        assert_eq!(to(0, 500.0), Some((Slot::After("c".into()), 90.0)));
+        // exactly on a midpoint (y 45 = centre of b): not above b, so after b
+        assert_eq!(to(0, 45.0), Some((Slot::After("b".into()), 60.0)));
+        assert_eq!(to(2, 44.9), Some((Slot::After("a".into()), 30.0)));
+        // no rows shown: no target
+        assert!(drop_target(&rows, &[], 0, pos2(0.0, 0.0)).is_none());
     }
 
     #[test]

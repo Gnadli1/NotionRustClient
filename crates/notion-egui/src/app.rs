@@ -152,6 +152,8 @@ pub(crate) enum Action {
     Open(String),
     Toggle(usize),
     Check(usize),
+    /// An image's resize handle was released at `width` px.
+    ResizeImage { id: String, width: f32 },
     /// Expand or collapse a sidebar page.
     ToggleTree(String),
     Switch(usize),
@@ -235,6 +237,8 @@ pub(crate) enum Action {
     InsertBelow(usize),
     /// A click below the last block: edit the trailing empty line, else add one.
     AppendEnd,
+    /// A dragged block dropped: (block, new parent, after).
+    Drop(String, String, outline::Slot),
 }
 
 /// Opens a web link outside the app (injectable for tests).
@@ -304,6 +308,8 @@ pub struct App {
     pub(crate) find: Option<Find>,
     /// A row to scroll into view on the next frame, once.
     pub(crate) goto: Option<usize>,
+    /// The block being dragged by its grip.
+    pub(crate) drag: Option<String>,
     /// The open page's headings (row, level, text), for the outline.
     pub(crate) heads: Vec<(usize, u8, String)>,
     /// Recently opened pages, most recent first.
@@ -547,6 +553,7 @@ impl App {
             hists: Vec::new(),
             find: None,
             goto: None,
+            drag: None,
             heads: Vec::new(),
             recent: Vec::new(),
             visited: HashMap::new(),
@@ -659,6 +666,22 @@ impl App {
             .store
             .resolve_id(&self.rows[i].block_id)
             .and_then(|id| sync::local_set_checked(&self.store, &id, !checked));
+        if let Err(e) = res {
+            self.last_error = Some(e.to_string());
+        }
+        self.refresh();
+    }
+
+    /// An image's new width: queues the change. Pushes refuse.
+    pub(crate) fn resize_image(&mut self, id: &str, width: f32) {
+        if self.pushing() || !self.flush() {
+            self.last_error = Some("Can't resize the image right now; try again".into());
+            return;
+        }
+        let res = self
+            .store
+            .resolve_id(id)
+            .and_then(|id| sync::local_set_image_width(&self.store, &id, width));
         if let Err(e) = res {
             self.last_error = Some(e.to_string());
         }
@@ -810,7 +833,10 @@ impl App {
                     }
                 }
             }
-            Action::Open(id) => self.open_or_pull(&id),
+            Action::Open(id) => {
+                self.drag = None;
+                self.open_or_pull(&id)
+            }
             Action::Toggle(i) => {
                 let id = self.rows[i].block_id.clone();
                 if !self.open.remove(&id) {
@@ -819,6 +845,7 @@ impl App {
                 self.shown = outline::shown(&self.rows, &self.open);
             }
             Action::Check(i) => self.step(|s| s.check(i)),
+            Action::ResizeImage { id, width } => self.step(|s| s.resize_image(&id, width)),
             Action::Convert {
                 kind,
                 text,
@@ -879,6 +906,7 @@ impl App {
             Action::InsertBelow(i) if i < self.rows.len() => self.insert_block_after(i),
             Action::InsertBelow(_) => {}
             Action::AppendEnd => self.append_block_at_end(),
+            Action::Drop(id, parent, slot) => self.step(|s| s.drop_block(&id, &parent, &slot)),
         }
     }
 
@@ -887,6 +915,16 @@ impl App {
         let c = theme::colors(ui);
         let title = crate::view::untitled(&self.title).to_string();
         let edited = self.page_edited(crate::comments::now_secs());
+        // a drag ends with the button (the release frame still drops) or Esc
+        if self.drag.is_some() {
+            let (down, released, esc) = ui.input_mut(|i| {
+                let esc = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+                (i.pointer.primary_down(), i.pointer.primary_released(), esc)
+            });
+            if esc || !(down || released) {
+                self.drag = None;
+            }
+        }
         let mut area = egui::ScrollArea::vertical()
             .id_salt("page")
             .auto_shrink(false);
@@ -940,6 +978,12 @@ impl App {
                         });
                     ui.add_space(12.0);
                     let selected = self.sel_rows();
+                    let dragged = self
+                        .drag
+                        .as_ref()
+                        .and_then(|id| self.rows.iter().position(|r| r.block_id == *id))
+                        .map(|i| i..i + 1 + outline::subtree(&self.rows, i).len());
+                    let mut bounds = Vec::new();
                     let mut idx = 0;
                     while idx < self.rows.len() {
                         if !self.shown[idx] {
@@ -949,7 +993,15 @@ impl App {
                         // a column list draws its whole subtree side by side
                         if matches!(self.rows[idx].marker, Marker::ColumnList) {
                             let end = idx + 1 + outline::subtree(&self.rows, idx).len();
+                            let top = ui.cursor().top();
                             acts.extend(self.columns_ui(ui, idx));
+                            bounds.push((
+                                idx,
+                                egui::Rect::from_x_y_ranges(
+                                    ui.max_rect().x_range(),
+                                    top..=ui.cursor().top(),
+                                ),
+                            ));
                             idx = end;
                             continue;
                         }
@@ -984,6 +1036,11 @@ impl App {
                         );
                         for (bg, f) in bgs {
                             ui.painter().set(bg, egui::Shape::rect_filled(r, 3.0, f));
+                        }
+                        bounds.push((idx, r));
+                        if dragged.as_ref().is_some_and(|d| d.contains(&idx)) {
+                            let dim = ui.visuals().panel_fill.gamma_multiply(0.6);
+                            ui.painter().rect_filled(r, 3.0, dim);
                         }
                         // Notion's floating block handles in the left
                         // margin: add-below and the drag grip.
@@ -1026,6 +1083,9 @@ impl App {
                             if d.hovered() {
                                 ui.painter().rect_filled(dots, 4.0, c.hover);
                             }
+                            if d.drag_started() {
+                                self.drag = Some(self.rows[idx].block_id.clone());
+                            }
                             d.on_hover_cursor(egui::CursorIcon::Grab);
                             crate::icons::paint(
                                 ui,
@@ -1045,6 +1105,7 @@ impl App {
                         idx += 1;
                     }
                     self.goto = None;
+                    acts.extend(self.drag_ui(ui, &bounds));
                     let (_, end) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), 200.0),
                         Sense::click(),
@@ -1057,6 +1118,32 @@ impl App {
         });
         self.scroll = out.state.clamped_offset().y;
         acts
+    }
+
+    /// While a block is dragged by its grip: the grabbing cursor and the
+    /// accent line where it would land; the drop on release, Esc cancels.
+    fn drag_ui(&mut self, ui: &mut Ui, bounds: &[(usize, egui::Rect)]) -> Option<Action> {
+        let id = self.drag.clone()?;
+        let from = self.rows.iter().position(|r| r.block_id == id);
+        let (pos, released) =
+            ui.input(|i| (i.pointer.interact_pos(), i.pointer.primary_released()));
+        let at = from
+            .zip(pos)
+            .and_then(|(f, p)| outline::drop_target(&self.rows, bounds, f, p));
+        if released || from.is_none() {
+            self.drag = None;
+            return at.map(|d| Action::Drop(id, d.parent, d.slot));
+        }
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        if let Some(d) = at {
+            let right = ui.max_rect().right();
+            let accent = theme::colors(ui).accent;
+            ui.painter().line_segment(
+                [egui::pos2(d.x, d.y), egui::pos2(right, d.y)],
+                egui::Stroke::new(3.0, accent),
+            );
+        }
+        None
     }
 
     /// A `column_list`: its columns side by side, each with its subtree.
@@ -1352,7 +1439,20 @@ impl App {
                         }
                     } else if let Some(shown) = shown {
                         ui.vertical(|ui| {
-                            crate::media::block_image(ui, &shown, grey);
+                            let saved = self
+                                .store
+                                .get_block(id)
+                                .ok()
+                                .flatten()
+                                .and_then(|b| notion_core::model::image_width(&b.raw));
+                            if let Some(width) =
+                                crate::media::block_image(ui, &shown, grey, id, saved)
+                            {
+                                act = Some(Action::ResizeImage {
+                                    id: id.clone(),
+                                    width,
+                                });
+                            }
                             if !label.is_empty() && label != url {
                                 ui.add_space(2.0);
                                 ui.label(RichText::new(label).small().italics().color(grey));
@@ -1850,7 +1950,7 @@ impl App {
             }
             // Enter is only noted here: text typed in the same frame changes
             // the query, so the pick is resolved after the edit has run
-            enter = take(Key::Enter) > 0;
+            enter = take(Key::Enter) > 0 || std::mem::take(&mut menu.clicked);
         } else {
             // ↑ on the first visual line / ↓ on the last leaves the row; ↑ from
             // the first row goes to the title
@@ -1959,7 +2059,10 @@ impl App {
             }
             None => {}
         }
-        if resp.lost_focus() && act.is_none() && pick.is_none() {
+        if resp.lost_focus() && f.menu.is_some() && menu::pointer_over(&ctx) {
+            // a press on the popup took the focus: give it back, no blur
+            ctx.memory_mut(|m| m.request_focus(id));
+        } else if resp.lost_focus() && act.is_none() && pick.is_none() {
             act = Some(Action::Blur);
         }
         let cur = out.cursor_range.map_or(cur, |r| r.primary.index.0);
@@ -2114,7 +2217,7 @@ impl App {
             });
         }
 
-        if let Some(m) = &f.menu {
+        if let Some(m) = f.menu.as_mut() {
             let q = m.query(&f.text, line, col).unwrap_or_default();
             // under the trigger, or the cursor for Ctrl+/
             let at = if m.kind == Kind::TurnInto {

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
+use futures::{stream, StreamExt};
 use serde_json::{json, Value};
 
 use crate::api::{BlockNode, Client};
@@ -547,26 +548,48 @@ pub async fn pull_all(
             progress(done, total, &title);
         }
     }
-    for ds in data_sources {
-        let title = ds.title.clone();
-        let res = pull_data_source(client, store, &ds.id)
-            .await
-            .map(|_| (false, true));
-        match res {
-            Ok((true, _)) => report.skipped += 1,
-            Ok((false, false)) => report.pages += 1,
-            Ok((false, true)) => report.data_sources += 1,
-            Err(e @ (Error::Api { status: 401, .. } | Error::SessionExpired)) => return Err(e),
-            Err(Error::Http(e)) if e.is_connect() || e.is_timeout() => return Err(Error::Http(e)),
-            Err(e) => report.errors.push(format!("{title}: {e}")),
+    // Notion can't list what left a data source, so only every FULL_EVERY-th
+    // sync (the first of a run included) re-reads whole data sources and
+    // notices trashed rows; the others fetch just the rows edited since.
+    // ponytail: the count is per process, a failed full pull still uses the
+    // slot, and trashed/moved rows can stay cached until the next full pull.
+    static SYNCS: AtomicU64 = AtomicU64::new(0);
+    let full = SYNCS.fetch_add(1, Ordering::Relaxed).is_multiple_of(FULL_EVERY);
+    for chunk in data_sources.chunks(DS_BATCH) {
+        let pulled = join_all(chunk.iter().map(|d| sync_data_source(client, store, &d.id, full))).await;
+        for (ds, res) in chunk.iter().zip(pulled) {
+            let title = ds.title.clone();
+            match res {
+                Ok(()) => report.data_sources += 1,
+                Err(e @ (Error::Api { status: 401, .. } | Error::SessionExpired)) => return Err(e),
+                Err(Error::Http(e)) if e.is_connect() || e.is_timeout() => {
+                    return Err(Error::Http(e))
+                }
+                Err(e) => report.errors.push(format!("{title}: {e}")),
+            }
+            done += 1;
+            progress(done, total, &title);
         }
-        done += 1;
-        progress(done, total, &title);
     }
     Ok(report)
 }
 
+const FULL_EVERY: u64 = 10;
+const DS_BATCH: usize = 4;
+
+/// A full pull, or (`!full`) the schema plus the rows edited since the newest cached one.
+async fn sync_data_source(client: &Client, store: &Store, id: &str, full: bool) -> Result<()> {
+    if full {
+        return pull_data_source(client, store, id).await.map(drop);
+    }
+    store.upsert_data_source(&client.get_data_source(id).await?)?;
+    poll_data_source(client, store, id).await.map(drop)
+}
+
 // ---------------------------------------------------------------- push
+
+/// Conflict GETs in flight at once (the client's rate limiter caps the rest).
+const PUSH_CHECKS: usize = 4;
 
 enum Outcome {
     Applied,
@@ -584,7 +607,33 @@ pub async fn push(client: &Client, store: &Store) -> Result<PushReport> {
     // Anchors of failed creates: a later DeleteBlock of the anchor (a type
     // conversion's replace) must not run, or the original is lost.
     let mut blocked = HashSet::new();
-    for op in store.queued_ops()? {
+    let ops = store.queued_ops()?;
+    // The conflict GETs of Update/Delete ops run up front, a few at a time; the
+    // writes below stay in order. Only for a block no other op in the queue
+    // touches (as target or parent), so no write of this push can make the
+    // early read stale. A failed GET is simply redone in `apply`.
+    let mut targets: HashMap<String, usize> = HashMap::new();
+    for op in &ops {
+        *targets.entry(store.resolve_id(op.kind.target_id())?).or_default() += 1;
+    }
+    let mut early = Vec::new();
+    for op in &ops {
+        if let OpKind::UpdateBlock { block_id, .. } | OpKind::DeleteBlock { block_id } = &op.kind {
+            let id = store.resolve_id(block_id)?;
+            if targets[&id] == 1 && !id.starts_with("local-") {
+                early.push((op.id, id));
+            }
+        }
+    }
+    // ponytail: the conflict check may be up to one push old; a remote edit in
+    // that window is overwritten - re-check right before each PATCH if that matters.
+    let mut early: HashMap<i64, Block> = stream::iter(early)
+        .map(|(op, id)| async move { client.get_block(&id).await.ok().map(|b| (op, b)) })
+        .buffer_unordered(PUSH_CHECKS)
+        .filter_map(|r| async move { r })
+        .collect()
+        .await;
+    for op in ops {
         if let OpKind::DeleteBlock { block_id } = &op.kind {
             if blocked.contains(&store.resolve_id(block_id)?) {
                 store.mark_op(op.id, OpStatus::Failed, Some("anchor's create failed"))?;
@@ -592,7 +641,7 @@ pub async fn push(client: &Client, store: &Store) -> Result<PushReport> {
                 continue;
             }
         }
-        let res = apply(client, store, &op, &mut own).await;
+        let res = apply(client, store, &op, &mut own, early.remove(&op.id)).await;
         if let (
             OpKind::CreateBlock { after: Some(a), .. },
             Ok(Outcome::Failed(_)) | Err(Error::Api { .. }),
@@ -677,8 +726,12 @@ async fn check_block(
     op: &Op,
     id: &str,
     own: &Own,
+    early: Option<Block>,
 ) -> Result<(Block, Option<String>)> {
-    let remote = client.get_block(id).await?;
+    let remote = match early {
+        Some(b) => b,
+        None => client.get_block(id).await?,
+    };
     let c = conflict(op, id, remote.last_edited_time, own, |raw| {
         Ok(same_content(
             &serde_json::from_value::<Block>(raw.clone())?.kind,
@@ -739,11 +792,17 @@ fn first(mut made: Vec<Block>) -> Result<Block> {
     Ok(made.swap_remove(0))
 }
 
-async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result<Outcome> {
+async fn apply(
+    client: &Client,
+    store: &Store,
+    op: &Op,
+    own: &mut Own,
+    early: Option<Block>,
+) -> Result<Outcome> {
     match &op.kind {
         OpKind::UpdateBlock { block_id, body } => {
             let id = store.resolve_id(block_id)?;
-            if let (_, Some(c)) = check_block(client, op, &id, own).await? {
+            if let (_, Some(c)) = check_block(client, op, &id, own, early).await? {
                 return Ok(Outcome::Conflict(c));
             }
             let b = client.update_block(&id, body).await?;
@@ -752,7 +811,7 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
         }
         OpKind::DeleteBlock { block_id } => {
             let id = store.resolve_id(block_id)?;
-            if let (_, Some(c)) = check_block(client, op, &id, own).await? {
+            if let (_, Some(c)) = check_block(client, op, &id, own, early).await? {
                 return Ok(Outcome::Conflict(c));
             }
             client.delete_block(&id).await?;
@@ -1028,7 +1087,7 @@ async fn apply(client: &Client, store: &Store, op: &Op, own: &mut Own) -> Result
             let id = store.resolve_id(block_id)?;
             let new_parent = store.resolve_id(new_parent_id)?;
             let after = after.as_deref().map(|a| store.resolve_id(a)).transpose()?;
-            let (remote, c) = check_block(client, op, &id, own).await?;
+            let (remote, c) = check_block(client, op, &id, own, None).await?;
             if let Some(c) = c {
                 return Ok(Outcome::Conflict(c));
             }
@@ -1554,6 +1613,20 @@ pub fn local_edit_equation(store: &Store, block_id: &str, expression: &str) -> R
         &block,
         json!({ "equation": { "expression": expression } }),
     )
+}
+
+/// Sets a cached media block's display width (px) and queues
+/// `{"<type>":{"_width":w}}`; only the private backend syncs it. Returns the op id.
+pub fn local_set_image_width(store: &Store, block_id: &str, width: f32) -> Result<i64> {
+    let base = cached(store, block_id)?;
+    let mut raw = serde_json::to_value(&base)?;
+    let t = raw["type"].as_str().unwrap_or_default().to_string();
+    if !raw[t.as_str()].is_object() {
+        return Err(Error::Invalid(format!("block {block_id} has no media payload")));
+    }
+    raw[t.as_str()]["_width"] = json!(width);
+    let block: Block = serde_json::from_value(raw)?;
+    enqueue_update(store, &base, &block, json!({ t: { "_width": width } }))
 }
 
 /// Sets a cached to-do's checkbox and queues `{"to_do":{"checked":..}}`.
@@ -4321,6 +4394,27 @@ mod tests {
             .unwrap()
             .rich_text
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_set_image_width_caches_and_queues() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b"]).await;
+        let mut img = blk("i", pp("p"), "", T, false);
+        img["type"] = json!("image");
+        img["image"] = json!({ "type": "external", "external": { "url": "u" }, "caption": [] });
+        store
+            .put_block(&serde_json::from_value(img).unwrap())
+            .unwrap();
+        local_set_image_width(&store, "i", 320.0).unwrap();
+        let b = store.get_block("i").unwrap().unwrap();
+        assert_eq!(crate::model::image_width(&b.raw), Some(320.0));
+        let q = store.queued_ops().unwrap();
+        let OpKind::UpdateBlock { body, .. } = &q[0].kind else {
+            panic!()
+        };
+        assert_eq!(*body, json!({ "image": { "_width": 320.0 } }));
     }
 
     #[tokio::test]
@@ -7503,6 +7597,160 @@ mod tests {
                 .unwrap()
                 .skipped
         );
+    }
+
+    #[tokio::test]
+    async fn sync_all_fetches_only_new_rows_after_the_first_pull() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let c = client(&s);
+        get(&s, "/v1/data_sources/ds", ok(ds_json())).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data_sources/ds/query"))
+            .respond_with(list(vec![row("r1", T)]))
+            .mount(&s)
+            .await;
+        sync_data_source(&c, &store, "ds", true).await.unwrap();
+        s.reset().await;
+        get(&s, "/v1/data_sources/ds", ok(ds_json())).await;
+        let q = json!({ "filter": { "timestamp": "last_edited_time", "last_edited_time": { "on_or_after": T } } });
+        Mock::given(method("POST"))
+            .and(path("/v1/data_sources/ds/query"))
+            .and(body_partial_json(q))
+            .respond_with(list(vec![row("r1", T), row("r2", T2)]))
+            .expect(1)
+            .mount(&s)
+            .await;
+        sync_data_source(&c, &store, "ds", false).await.unwrap();
+        assert_eq!(store.rows("ds").unwrap().len(), 2);
+        s.verify().await;
+    }
+
+    #[tokio::test]
+    async fn push_writes_in_queue_order_and_still_finds_the_conflict() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["a", "b", "c"]).await;
+        for k in ["a", "b", "c"] {
+            local_edit_text(&store, k, &format!("mine-{k}")).unwrap();
+            // b was edited remotely since the base: a conflict
+            let t = if k == "b" { T2 } else { T };
+            get(&s, &format!("/v1/blocks/{k}"), ok(blk(k, pp("p"), k, t, false))).await;
+            Mock::given(method("PATCH"))
+                .and(path(format!("/v1/blocks/{k}")))
+                .respond_with(ok(blk(k, pp("p"), k, T2, false)))
+                .mount(&s)
+                .await;
+        }
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!((r.applied, r.conflicts, r.failed), (2, 1, 0));
+        let patched: Vec<String> = s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "PATCH")
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert_eq!(patched, ["/v1/blocks/a", "/v1/blocks/c"]);
+    }
+
+    #[tokio::test]
+    async fn a_second_op_on_the_same_block_sees_the_first_write_not_a_stale_prefetch() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        seed(&s, &store, &["b", "c"]).await;
+        local_edit_text(&store, "b", "one").unwrap();
+        local_edit_text(&store, "c", "x").unwrap();
+        local_edit_text(&store, "b", "two").unwrap();
+        get(&s, "/v1/blocks/c", ok(blk("c", pp("p"), "c", T, false))).await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/blocks/c"))
+            .respond_with(ok(blk("c", pp("p"), "x", T2, false)))
+            .mount(&s)
+            .await;
+        // b's GETs: the base, then (after our own first write) our own write
+        Mock::given(method("GET"))
+            .and(path("/v1/blocks/b"))
+            .respond_with(ok(blk("b", pp("p"), "b", T, false)))
+            .up_to_n_times(1)
+            .mount(&s)
+            .await;
+        get(&s, "/v1/blocks/b", ok(blk("b", pp("p"), "one", T2, false))).await;
+        for t in ["one", "two"] {
+            Mock::given(method("PATCH"))
+                .and(path("/v1/blocks/b"))
+                .respond_with(ok(blk("b", pp("p"), t, T2, false)))
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&s)
+                .await;
+        }
+        let r = push(&client(&s), &store).await.unwrap();
+        assert_eq!((r.applied, r.conflicts, r.failed), (3, 0, 0), "{r:?}");
+        s.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_prefetch_is_redone_when_the_op_applies() {
+        for status in [404, 500] {
+            let s = MockServer::start().await;
+            let store = Store::open_in_memory().unwrap();
+            seed(&s, &store, &["a", "b"]).await;
+            local_edit_text(&store, "a", "mine-a").unwrap();
+            local_edit_text(&store, "b", "mine-b").unwrap();
+            // a: the early GET fails, the redo in apply succeeds
+            Mock::given(method("GET"))
+                .and(path("/v1/blocks/a"))
+                .respond_with(ResponseTemplate::new(status))
+                .up_to_n_times(1)
+                .mount(&s)
+                .await;
+            get(&s, "/v1/blocks/a", ok(blk("a", pp("p"), "a", T, false))).await;
+            // b: both GETs fail: that op fails, the push goes on
+            get(&s, "/v1/blocks/b", ResponseTemplate::new(status)).await;
+            Mock::given(method("PATCH"))
+                .and(path("/v1/blocks/a"))
+                .respond_with(ok(blk("a", pp("p"), "mine-a", T2, false)))
+                .expect(1)
+                .mount(&s)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path("/v1/blocks/b"))
+                .respond_with(ok(json!({})))
+                .expect(0)
+                .mount(&s)
+                .await;
+            let r = push(&client(&s), &store).await.unwrap();
+            assert_eq!((r.applied, r.conflicts, r.failed), (1, 0, 1), "{status}: {r:?}");
+            s.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_sync_of_a_data_source_notices_trashed_rows_the_incremental_one_cannot() {
+        let s = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let c = client(&s);
+        get(&s, "/v1/data_sources/ds", ok(ds_json())).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data_sources/ds/query"))
+            .respond_with(list(vec![row("r1", T), row("r2", T)]))
+            .up_to_n_times(1)
+            .mount(&s)
+            .await;
+        sync_data_source(&c, &store, "ds", true).await.unwrap();
+        // r2 left the data source; every later query lists only r1
+        Mock::given(method("POST"))
+            .and(path("/v1/data_sources/ds/query"))
+            .respond_with(list(vec![row("r1", T)]))
+            .mount(&s)
+            .await;
+        let trashed = |id: &str| store.get_page(id).unwrap().unwrap().in_trash;
+        sync_data_source(&c, &store, "ds", false).await.unwrap();
+        assert!(!trashed("r2"), "incremental must not trash");
+        sync_data_source(&c, &store, "ds", true).await.unwrap();
+        assert!(trashed("r2") && !trashed("r1"));
     }
 
     #[tokio::test]

@@ -442,11 +442,16 @@ impl Records {
                     .pointer("/properties/caption")
                     .map(rich_text_to_official)
                     .unwrap_or_default();
-                json!({
+                let mut m = json!({
                     "type": "external",
                     "external": { "url": url },
                     "caption": caption,
-                })
+                });
+                // private-only extra: the display width in px (see `image_width`)
+                if let Some(w) = rec.pointer("/format/block_width").filter(|w| w.as_f64().is_some_and(|f| f.is_finite() && f > 0.0)) {
+                    m["_width"] = w.clone();
+                }
+                m
             }
             "bookmark" | "embed" | "tweet" | "figma" | "drive" | "maps" | "codepen"
             | "typeform" | "miro" => json!({
@@ -1584,6 +1589,9 @@ pub fn block_record_from_official(
             if let Some(caption) = payload.get("caption") {
                 props.insert("caption".into(), rich_text_to_private(caption));
             }
+            if let Some(w) = payload.get("_width").filter(|w| w.as_f64().is_some_and(|f| f.is_finite() && f > 0.0)) {
+                format.insert("block_width".into(), w.clone());
+            }
         }
         "bookmark" | "embed" => {
             let url = payload
@@ -1853,6 +1861,47 @@ mod tests {
             "created_time": 1700000000000_i64, "last_edited_time": 1700000000000_i64,
             "last_edited_by_id": "u1", "content": ["b1"],
         })
+    }
+
+    #[test]
+    fn image_record_width_reaches_cached_json() {
+        let mut r = rec("i1", "image");
+        r["format"] = json!({ "display_source": "https://x/a.png", "block_width": 320 });
+        let b = official_block(&r).unwrap();
+        assert_eq!(b["image"]["_width"], 320);
+        assert_eq!(crate::model::image_width(&b), Some(320.0));
+        let upd = block_record_from_official("i1", &json!({ "image": { "_width": 320 } }), "p", "block", "s", None).unwrap();
+        assert_eq!(upd["format"], json!({ "block_width": 320 }));
+        assert_eq!(upd["properties"], json!({}));
+    }
+
+    #[test]
+    fn record_without_or_with_bad_block_width_has_no_image_width() {
+        for fmt in [
+            json!({ "display_source": "https://x/a.png" }),
+            json!({ "display_source": "https://x/a.png", "block_width": "320" }),
+            json!({ "display_source": "https://x/a.png", "block_width": null }),
+            json!({ "display_source": "https://x/a.png", "block_width": -5 }),
+        ] {
+            let mut r = rec("i1", "image");
+            r["format"] = fmt.clone();
+            let b = official_block(&r).unwrap();
+            assert_eq!(crate::model::image_width(&b), None, "{fmt}");
+        }
+    }
+
+    #[test]
+    fn video_and_pdf_widths_round_trip_and_a_bad_update_width_is_dropped() {
+        for ty in ["video", "pdf"] {
+            let mut r = rec("m1", ty);
+            r["format"] = json!({ "display_source": "https://x/a", "block_width": 240 });
+            let b = official_block(&r).unwrap();
+            assert_eq!(crate::model::image_width(&b), Some(240.0), "{ty}");
+            let upd = block_record_from_official("m1", &json!({ ty: { "_width": 240 } }), "p", "block", "s", None).unwrap();
+            assert_eq!(upd["format"], json!({ "block_width": 240 }), "{ty}");
+        }
+        let upd = block_record_from_official("i1", &json!({ "image": { "_width": "wide" } }), "p", "block", "s", None).unwrap();
+        assert!(upd["format"].get("block_width").is_none());
     }
 
     #[test]

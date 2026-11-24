@@ -301,9 +301,23 @@ impl Media {
     }
 }
 
-/// An inline image block: scaled down to the width (never up), a note while
-/// loading, the error if it failed.
-pub(crate) fn block_image(ui: &mut Ui, shown: &Shown, grey: Color32) {
+/// The width after dragging an image's left or right handle by `dx` (the image
+/// is left-aligned: the left handle shrinks it as it moves right), kept
+/// between 64 px and the column.
+pub(crate) fn dragged_width(w: f32, dx: f32, left: bool, column: f32) -> f32 {
+    (w + if left { -dx } else { dx }).clamp(64.0, column.max(64.0))
+}
+
+/// An inline image block: `saved` (Notion px) wide if set, else scaled down to
+/// the column (never up). A note while loading, the error if it failed. Hover
+/// shows two handles; the result is the new width once a drag is released.
+pub(crate) fn block_image(
+    ui: &mut Ui,
+    shown: &Shown,
+    grey: Color32,
+    id: &str,
+    saved: Option<f32>,
+) -> Option<f32> {
     match shown {
         Shown::Loading => {
             ui.label(RichText::new("loading image…").color(grey));
@@ -313,11 +327,50 @@ pub(crate) fn block_image(ui: &mut Ui, shown: &Shown, grey: Color32) {
         }
         Shown::Tex(t) => {
             let s = t.size_vec2();
-            let k = (ui.available_width() / s.x).min(600.0 / s.y).min(1.0);
+            let avail = ui.available_width();
+            let key = egui::Id::unique(("image-width", id));
+            let live: Option<f32> = ui.data(|d| d.get_temp(key));
+            let k = match live.or(saved) {
+                Some(w) => w.min(avail).max(64.0) / s.x,
+                None => (avail / s.x).min(600.0 / s.y).min(1.0),
+            };
             ui.add_space(2.0);
-            ui.add(egui::Image::new((t.id(), s * k)).corner_radius(6.0));
+            let r = ui.add(egui::Image::new((t.id(), s * k)).corner_radius(6.0));
+            if live.is_none() && !ui.rect_contains_pointer(r.rect.expand2(egui::vec2(8.0, 0.0))) {
+                ui.data_mut(|d| d.remove_temp::<f32>(key));
+                return None;
+            }
+            let mut cur = live.unwrap_or(r.rect.width());
+            let mut done = false;
+            for left in [true, false] {
+                let x = if left { r.rect.left() } else { r.rect.right() };
+                let h = Rect::from_center_size(
+                    egui::pos2(x, r.rect.center().y),
+                    egui::vec2(10.0, 36.0),
+                );
+                let hr = ui
+                    .interact(h, egui::Id::unique((key, left)), egui::Sense::drag())
+                    .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                if hr.dragged() {
+                    cur = dragged_width(cur, hr.drag_delta().x, left, avail);
+                    ui.data_mut(|d| d.insert_temp(key, cur));
+                }
+                done |= hr.drag_stopped();
+                ui.painter().rect(
+                    h.shrink2(egui::vec2(1.0, 0.0)),
+                    4.0,
+                    Color32::from_black_alpha(150),
+                    egui::Stroke::new(1.0, Color32::from_white_alpha(200)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if done {
+                ui.data_mut(|d| d.remove_temp::<f32>(key));
+                return Some(cur.round());
+            }
         }
     }
+    None
 }
 
 /// `tex` filling `rect`, cropped to its aspect from the centre.
@@ -341,6 +394,24 @@ pub(crate) fn paint_cover(ui: &Ui, tex: &TextureHandle, rect: Rect, rounding: f3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handle_drag_direction_and_clamp() {
+        assert_eq!(dragged_width(300.0, 20.0, false, 600.0), 320.0);
+        assert_eq!(dragged_width(300.0, 20.0, true, 600.0), 280.0);
+        assert_eq!(dragged_width(300.0, 900.0, false, 600.0), 600.0);
+        assert_eq!(dragged_width(100.0, 900.0, true, 600.0), 64.0);
+        assert_eq!(dragged_width(100.0, 0.0, true, 30.0), 64.0);
+    }
+
+    #[test]
+    fn dragged_width_survives_zero_and_negative_input() {
+        assert_eq!(dragged_width(300.0, 0.0, false, 600.0), 300.0);
+        assert_eq!(dragged_width(300.0, -50.0, false, 600.0), 250.0);
+        assert_eq!(dragged_width(300.0, -50.0, true, 600.0), 350.0);
+        assert_eq!(dragged_width(300.0, -900.0, false, 600.0), 64.0);
+        assert_eq!(dragged_width(300.0, 0.0, true, 0.0), 64.0);
+    }
 
     #[test]
     fn one_request_per_picture_then_one_decode() {
